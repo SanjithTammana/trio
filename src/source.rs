@@ -419,12 +419,30 @@ pub fn fence_step(line: &str, open: Option<(u8, usize)>) -> Option<(u8, usize)> 
     }
 }
 
-/// `@claude`, `@codex`, `@both` and `@<human>` (the room's `me`; empty for none) in `text`, in
-/// the order they first appear, so the first name is the one addressed.
+/// Handles and roles the served room adds to the built-in ones (`add_handles`).
+static HANDLES: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// Make `@<word>` a mention in this process: the room's agent handles and role names. Only the
+/// room this process serves adds its own, as with item prefixes.
+pub fn add_handles(words: &[String]) {
+    let mut h = HANDLES.write().expect("handles");
+    for w in words.iter().map(|w| w.trim().to_ascii_lowercase()) {
+        if !w.is_empty() && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') && !h.contains(&w) {
+            h.push(w);
+        }
+    }
+}
+
+/// `@claude`, `@codex`, `@both`, `@all`, the room's own agent handles and roles, and `@<human>`
+/// (the room's `me`; empty for none) in `text`, in the order they first appear, so the first
+/// name is the one addressed.
 pub fn mentions_in(text: &str, human: &str) -> Vec<String> {
     let lower = text.to_ascii_lowercase();
     let human_l = human.to_ascii_lowercase();
-    let mut found: Vec<(usize, String)> = [("claude", "claude"), ("codex", "codex"), ("both", "both"), (human_l.as_str(), human)]
+    let mut words: Vec<(String, String)> = ["claude", "codex", "both", "all"].iter().map(|w| (w.to_string(), w.to_string())).collect();
+    words.extend(HANDLES.read().expect("handles").iter().map(|w| (w.clone(), w.clone())));
+    words.push((human_l.clone(), human.to_string()));
+    let mut found: Vec<(usize, String)> = words
         .iter()
         .filter(|(w, _)| !w.is_empty())
         .filter_map(|(w, name)| {

@@ -3,7 +3,8 @@
 //!   trio open <room-dir> [--port 8964] [--no-browser] [--web]   native window (trio-app), or the browser with --web
 //!   trio say  --room <room-dir> --as <who> "<summary, 140 chars max>" [--detail "<markdown>"]
 //!   trio init <room-dir>
-//!   trio bind <room-dir> <claude|codex>   create the agent's Trio-owned session and enable it
+//!   trio bind <room-dir> <handle> [--harness claude|codex|antigravity] [--model m] [--roles build,review] [--account a]
+//!                                          create the agent's Trio-owned session and enable it
 //!   trio hook <claude|codex> <prompt|stop|session-start>   attached mode (called by the plugins)
 //!   trio setup [--bin-dir <dir>] [--no-path]   install trio where the plugin hooks can run it
 #![allow(dead_code)] // interface methods kept for implementors and future views
@@ -13,6 +14,7 @@ mod gitwatch;
 mod github;
 mod projects;
 mod graph;
+mod harness;
 mod hook;
 mod oslock;
 mod proctree;
@@ -53,7 +55,7 @@ fn main() {
             }),
             _ => Err("usage: trio hook <claude|codex> <prompt|stop|session-start>".into()),
         },
-        _ => Err("usage: trio open <room-dir> | trio say --room <dir> --as <who> \"<summary>\" [--detail ..] | trio init <room-dir> | trio bind <room-dir> <claude|codex> | trio link <room-dir> <repo-folder|owner/name|github-url> [--name <label>] | trio hook <claude|codex> <event> | trio setup | trio statusline [-- \"<your status line command>\"]".into()),
+        _ => Err("usage: trio open <room-dir> | trio say --room <dir> --as <who> \"<summary>\" [--detail ..] | trio init <room-dir> | trio bind <room-dir> <handle> [--harness h] [--model m] [--roles r,..] [--account a] | trio link <room-dir> <repo-folder|owner/name|github-url> [--name <label>] | trio hook <claude|codex> <event> | trio setup | trio statusline [-- \"<your status line command>\"]".into()),
     };
     if let Err(e) = code {
         eprintln!("trio: {e}");
@@ -212,79 +214,64 @@ fn room_toml(me: &str, imports: &[(String, String)], repo: Option<&std::path::Pa
 fn cmd_bind(args: &[String]) -> Result<(), String> {
     let pos = positional(args);
     let dir = PathBuf::from(pos.first().ok_or("missing room dir")?);
-    let agent = pos.get(1).map(|s| s.to_ascii_lowercase()).ok_or("missing agent: claude or codex")?;
+    let agent = pos.get(1).map(|s| s.to_ascii_lowercase()).ok_or("missing agent handle (claude, codex, or a name of your own with --harness)")?;
+    if agent.is_empty() || !agent.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') || ["both", "all", "trio", "github"].contains(&agent.as_str()) {
+        return Err(format!("{agent}: a handle is letters, digits, - and _, and not both, all, trio or github"));
+    }
     let cfg_path = dir.join(".trio").join("room.toml");
     let text = std::fs::read_to_string(&cfg_path).map_err(|e| format!("{}: {e} (run trio init first)", cfg_path.display()))?;
     let cfg: room::RoomCfg = toml::from_str(&text).map_err(|e| e.to_string())?;
+    let existing = cfg.agents.get(&agent);
+    let harness_name = flag(args, "--harness").or_else(|| existing.and_then(|a| a.harness.clone()));
+    let preset = harness::of(&agent, harness_name.as_deref());
+    if let Some(h) = &harness_name
+        && harness::get(h).is_none()
+    {
+        return Err(format!("unknown harness {h} (one of: {})", harness::names()));
+    }
+    let bind = preset.bind.ok_or_else(|| format!("{agent} runs on `command`: set `wake = [..]` under [agents.{agent}] in room.toml yourself (see docs/agents.md)"))?;
+    let model = flag(args, "--model").or_else(|| existing.and_then(|a| a.model.clone()));
+    let roles: Option<Vec<String>> = flag(args, "--roles").map(|r| r.split(',').map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()).collect());
+    let account = flag(args, "--account");
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from).ok_or("no home dir")?;
     let cwd = home.join(".trio").join("sessions").join(room_key(&dir)).join(&agent);
     std::fs::create_dir_all(&cwd).map_err(|e| e.to_string())?;
-    let context = cfg.repo.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| dir.display().to_string());
+    // The repo the agent reads: `repo` (relative to the room), else the room folder. `repo = ""`
+    // turns git off; the agent still reads the room folder.
+    let context = match &cfg.repo {
+        Some(p) if !p.as_os_str().is_empty() => dir.join(p),
+        _ => dir.clone(),
+    };
+    let context = context.canonicalize().unwrap_or(context).display().to_string();
+    let context = context.strip_prefix(r"\\?\").unwrap_or(&context).to_string();
+    let mut others: Vec<String> = cfg.agents.keys().filter(|n| **n != agent).map(|n| work::cap(n)).collect();
+    others.sort();
+    let with = if others.is_empty() { String::new() } else { format!(" and {}", others.join(", ")) };
     let intro = format!(
-        "You are {agent}, a participant in a Trio group chat with {human} (the human) and {other}. The room \
+        "You are {agent}, a participant in a Trio group chat with {human} (the human){with}. The room \
          discusses the project at {room}; the repository is {context}. Each turn you get the newest chat \
          lines. Your final answer becomes your chat message: line 1 is a summary of at most 140 \
          characters, then optional short detail. You are read-only in this chat, and a chat message \
          is never approval for merges, deploys, deletes or sends. Reply with one line: ready.",
         human = room::human(&cfg),
-        other = if agent == "claude" { "Codex" } else { "Claude" },
         room = dir.display()
     );
-    let (session, wake): (String, Vec<String>) = match agent.as_str() {
-        "claude" => {
-            let id = uuid_v4();
-            let base = ["claude", "-p", "--model", "opus", "--permission-mode", "default", "--add-dir", context.as_str()];
-            let mut first: Vec<String> = base.iter().map(|s| s.to_string()).collect();
-            first.extend(["--session-id".into(), id.clone()]);
-            run_with_stdin(&first, &cwd, &intro)?;
-            let mut wake: Vec<String> = base.iter().map(|s| s.to_string()).collect();
-            // JSON output carries the reply, total_cost_usd and is_error (usage.rs).
-            wake.extend(["--output-format".into(), "json".into(), "--resume".into(), "{session}".into()]);
-            (id, wake)
-        }
-        "codex" => {
-            let model = ["-m", "gpt-6.2-sol", "-c", "model_reasoning_effort=\"medium\""];
-            let mut first: Vec<String> = vec!["@codex".into(), "exec".into(), "--json".into()];
-            first.extend(model.iter().map(|s| s.to_string()));
-            first.extend(["-s", "read-only", "--skip-git-repo-check", "-"].iter().map(|s| s.to_string()));
-            let out = run_with_stdin(&first, &cwd, &intro)?;
-            let id = out
-                .lines()
-                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-                .find_map(|v| v.get("thread_id").and_then(|t| t.as_str()).map(str::to_string))
-                .ok_or("codex printed no thread_id")?;
-            // --json: turn.completed carries token usage, priced in usage.rs.
-            let mut wake: Vec<String> = vec!["@codex".into(), "exec".into(), "resume".into(), "--json".into(), "{session}".into()];
-            wake.extend(model.iter().map(|s| s.to_string()));
-            wake.extend(["-c", "sandbox_mode=\"read-only\"", "--skip-git-repo-check", "-o", "{out}", "-"].iter().map(|s| s.to_string()));
-            (id, wake)
-        }
-        other => return Err(format!("unknown agent {other}")),
-    };
-    set_agent(&cfg_path, &agent, &session, &cwd.display().to_string(), &wake)?;
-    println!("bound {agent} to session {session} (cwd {})", cwd.display());
+    let (session, wake) = bind(&harness::Bind { agent: &agent, model: model.as_deref(), cwd: &cwd, context: &context, intro: &intro })?;
+    let extra = AgentExtra { harness: harness_name.as_deref(), model: model.as_deref(), roles: roles.as_deref(), account: account.as_deref() };
+    set_agent(&cfg_path, &agent, &session, &cwd.display().to_string(), &wake, &extra)?;
+    println!("bound {agent} ({}{}) to session {session} (cwd {})", preset.label, model.map(|m| format!(", {m}")).unwrap_or_default(), cwd.display());
     Ok(())
 }
 
-/// Run argv with `stdin` as input; Ok(stdout) on exit 0.
-fn run_with_stdin(argv: &[String], cwd: &std::path::Path, stdin: &str) -> Result<String, String> {
-    use std::io::Write;
-    let bin = agent::resolve_bin(&argv[0])?;
-    let mut child = std::process::Command::new(&bin)
-        .args(&argv[1..])
-        .current_dir(cwd)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("{}: {e}", bin.display()))?;
-    child.stdin.take().expect("stdin").write_all(stdin.as_bytes()).map_err(|e| e.to_string())?;
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("{} exited {:?}: {}", argv[0], out.status.code(), err.lines().rev().take(3).collect::<Vec<_>>().join(" | ")));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+#[cfg(test)]
+const NONE: AgentExtra<'static> = AgentExtra { harness: None, model: None, roles: None, account: None };
+
+/// Settings `trio bind` writes besides the session, when given.
+struct AgentExtra<'a> {
+    harness: Option<&'a str>,
+    model: Option<&'a str>,
+    roles: Option<&'a [String]>,
+    account: Option<&'a str>,
 }
 
 /// Session dir key for a room: its folder name plus a hash of its full canonical path, so two
@@ -371,10 +358,10 @@ fn with_links(text: &str, repo: Option<&std::path::Path>, github: Option<&str>, 
     Ok(doc.to_string())
 }
 
-fn set_agent(path: &std::path::Path, agent: &str, session: &str, cwd: &str, wake: &[String]) -> Result<(), String> {
+fn set_agent(path: &std::path::Path, agent: &str, session: &str, cwd: &str, wake: &[String], extra: &AgentExtra) -> Result<(), String> {
     let _lock = oslock::hold(&path.with_extension("toml.lock"), Duration::from_secs(5))?;
     let before = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let after = with_agent(&before, agent, session, cwd, wake).map_err(|e| format!("{}: {e}", path.display()))?;
+    let after = with_agent(&before, agent, session, cwd, wake, extra).map_err(|e| format!("{}: {e}", path.display()))?;
     let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
     std::fs::write(&tmp, after).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, path).map_err(|e| {
@@ -383,7 +370,7 @@ fn set_agent(path: &std::path::Path, agent: &str, session: &str, cwd: &str, wake
     })
 }
 
-fn with_agent(text: &str, agent: &str, session: &str, cwd: &str, wake: &[String]) -> Result<String, String> {
+fn with_agent(text: &str, agent: &str, session: &str, cwd: &str, wake: &[String], extra: &AgentExtra) -> Result<String, String> {
     use toml_edit::{table, value, Array, DocumentMut};
     let mut doc: DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| e.to_string())?;
     let agents = doc.entry("agents").or_insert(table()).as_table_mut().ok_or("`agents` is not a table")?;
@@ -393,6 +380,14 @@ fn with_agent(text: &str, agent: &str, session: &str, cwd: &str, wake: &[String]
     t["session"] = value(session);
     t["cwd"] = value(cwd);
     t["wake"] = value(wake.iter().map(String::as_str).collect::<Array>());
+    for (k, v) in [("harness", extra.harness), ("model", extra.model), ("account", extra.account)] {
+        if let Some(v) = v {
+            t[k] = value(v);
+        }
+    }
+    if let Some(r) = extra.roles {
+        t["roles"] = value(r.iter().map(String::as_str).collect::<Array>());
+    }
     Ok(doc.to_string())
 }
 
@@ -574,7 +569,7 @@ mod tests {
     #[test]
     fn bind_edit_keeps_other_settings_and_comments() {
         let before = "# my room\nhop_budget = 5\nrepo = \"C:/r\"\n\n[agents.claude]\nenabled = false\nsession = \"\"\ntranscript = \"C:/t.jsonl\" # keep me\nwake = []\n\n[agents.codex]\nenabled = true\nsession = \"x\"\nwake = [\"codex\"]\n";
-        let after = with_agent(before, "claude", "s-1", "C:/w", &["claude".into(), "--resume".into(), "{session}".into()]).unwrap();
+        let after = with_agent(before, "claude", "s-1", "C:/w", &["claude".into(), "--resume".into(), "{session}".into()], &NONE).unwrap();
         assert!(after.starts_with("# my room\nhop_budget = 5\nrepo = \"C:/r\""), "{after}");
         assert!(after.contains("transcript = \"C:/t.jsonl\" # keep me"));
         assert!(after.contains("session = \"x\"\nwake = [\"codex\"]"), "codex untouched: {after}");
@@ -583,7 +578,7 @@ mod tests {
         assert!(c.enabled && c.session == "s-1" && c.wake == ["claude", "--resume", "{session}"]);
         assert_eq!(c.transcript.as_deref(), Some(std::path::Path::new("C:/t.jsonl")));
         // A room with no agents table yet.
-        let fresh = with_agent("hop_budget = 3\n", "codex", "t", "C:/w", &[]).unwrap();
+        let fresh = with_agent("hop_budget = 3\n", "codex", "t", "C:/w", &[], &NONE).unwrap();
         assert!(toml::from_str::<room::RoomCfg>(&fresh).unwrap().agents["codex"].enabled);
     }
 
@@ -599,7 +594,7 @@ mod tests {
                 .into_iter()
                 .map(|agent| {
                     let path = path.clone();
-                    std::thread::spawn(move || set_agent(&path, agent, &format!("{agent}-{round}"), "C:/w", &[]).unwrap())
+                    std::thread::spawn(move || set_agent(&path, agent, &format!("{agent}-{round}"), "C:/w", &[], &NONE).unwrap())
                 })
                 .collect();
             for h in handles {

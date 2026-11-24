@@ -74,9 +74,9 @@ pub fn work(it: &WorkItem, branches: &[&str], g: &Graph, me: &str) -> Work {
     let live: Vec<&WorkItem> = branches.iter().filter_map(|b| g.items.get(*b)).collect();
     let Reading { lane, verdict, ask, all_merged } = reading(it);
     let waiting_on = match lane {
-        "review" => ask.and_then(|r| reviewer(r, author(it, &live).as_deref())),
-        "changes" => verdict.and_then(|v| agent_of(&v.on)).or_else(|| author(it, &live)),
-        "progress" => it.claimed_by.clone().or_else(|| author(it, &live)),
+        "review" => ask.and_then(|r| reviewer(g, r, author(g, it, &live).as_deref())),
+        "changes" => verdict.and_then(|v| agent_of(g, &v.on)).or_else(|| author(g, it, &live)),
+        "progress" => it.claimed_by.clone().or_else(|| author(g, it, &live)),
         _ => None,
     };
     let last = live.iter().map(|b| b.last.as_str()).chain(it.merged_gone.iter().map(|b| b.last.as_str())).max().unwrap_or(&it.last).max(&it.last);
@@ -86,13 +86,13 @@ pub fn work(it: &WorkItem, branches: &[&str], g: &Graph, me: &str) -> Work {
 /// The Work reading of a branch no item names. The same order as items: a request after the
 /// last verdict is review; a merge after the last verdict is done; else the verdict decides;
 /// else it is in progress. It waits on its agent (by prefix) when it has one.
-fn branch_work(b: &WorkItem, me: &str) -> Work {
+fn branch_work(b: &WorkItem, g: &Graph, me: &str) -> Work {
     let verdict = b.verdicts.iter().max_by_key(|v| v.key());
     let ask = b.latest_request().filter(|r| verdict.is_none_or(|v| r.key() > v.key()));
     let merged = b.merged_at.as_ref().filter(|(at, seq)| verdict.is_none_or(|v| (at.as_str(), *seq) > v.key()));
-    let author = agent_of(&b.id);
+    let author = agent_of(g, &b.id);
     let (lane, waiting_on) = match (ask, merged, verdict.map(|v| v.outcome.as_str())) {
-        (Some(r), _, _) => ("review", reviewer(r, author.as_deref())),
+        (Some(r), _, _) => ("review", reviewer(g, r, author.as_deref())),
         (None, Some(_), _) | (None, None, Some("pass")) => ("done", None),
         (None, None, Some("changes" | "blocked")) => ("changes", author.clone()),
         (None, None, Some(_)) => ("review", None),
@@ -111,20 +111,20 @@ fn branch_work(b: &WorkItem, me: &str) -> Work {
 }
 
 /// The agent a branch belongs to, from its prefix (`claude/hooks-p0a` -> claude).
-fn agent_of(node: &str) -> Option<String> {
-    node.contains('/').then(|| crate::model::branch_prefix(node)).filter(|o| AGENTS.contains(o)).map(str::to_string)
+fn agent_of(g: &Graph, node: &str) -> Option<String> {
+    node.contains('/').then(|| crate::model::branch_prefix(node)).filter(|o| g.is_agent(o)).map(str::to_string)
 }
 
 /// Who wrote item `id`, by the same rule as the Work lens.
 pub fn author_of(g: &Graph, id: &str) -> Option<String> {
     let it = g.items.get(id)?;
     let live: Vec<&WorkItem> = g.edges.iter().filter(|e| e.kind == "implements" && e.to == id).filter_map(|e| g.items.get(&e.from)).collect();
-    author(it, &live)
+    author(g, it, &live)
 }
 
 /// Who wrote the work: the one agent whose branches implement it, else whoever claimed it.
-fn author(it: &WorkItem, live: &[&WorkItem]) -> Option<String> {
-    let mut owners: Vec<String> = live.iter().map(|b| b.id.as_str()).chain(it.merged_gone.iter().map(|m| m.branch.as_str())).filter_map(agent_of).collect();
+fn author(g: &Graph, it: &WorkItem, live: &[&WorkItem]) -> Option<String> {
+    let mut owners: Vec<String> = live.iter().map(|b| b.id.as_str()).chain(it.merged_gone.iter().map(|m| m.branch.as_str())).filter_map(|b| agent_of(g, b)).collect();
     owners.sort();
     owners.dedup();
     match owners.as_slice() {
@@ -133,17 +133,17 @@ fn author(it: &WorkItem, live: &[&WorkItem]) -> Option<String> {
     }
 }
 
-/// Who a review request waits on. A named participant other than the asker is taken as asked;
-/// "both" or no name means the agent that neither wrote the work nor asked, when exactly one is.
-fn reviewer(r: &ReviewAsk, author: Option<&str>) -> Option<String> {
-    if let Some(n) = r.of.iter().find(|m| *m != "both" && **m != r.by) {
+/// Who a review request waits on. A named participant other than the asker is taken as asked
+/// (a role name stands for its holders). "both", "all" or no name means the reviewer that
+/// neither wrote the work nor asked, when exactly one is.
+fn reviewer(g: &Graph, r: &ReviewAsk, author: Option<&str>) -> Option<String> {
+    if let Some(n) = r.of.iter().find(|m| !["both", "all"].contains(&m.as_str()) && **m != r.by && !g.is_role(m)) {
         return Some(n.clone());
     }
-    let c: Vec<&str> = AGENTS.iter().copied().filter(|a| *a != r.by && Some(*a) != author).collect();
-    (c.len() == 1).then(|| c[0].to_string())
+    let role = r.of.iter().find(|m| g.is_role(m)).map_or("review", String::as_str);
+    let c: Vec<String> = g.holders(role).into_iter().filter(|a| *a != r.by && Some(a.as_str()) != author).collect();
+    (c.len() == 1).then(|| c[0].clone())
 }
-
-const AGENTS: [&str; 2] = ["claude", "codex"];
 
 fn who(name: &str, me: &str) -> String {
     if name == me || name.is_empty() {
@@ -225,7 +225,7 @@ pub fn all(g: &Graph, me: &str) -> HashMap<String, Work> {
             } else if !linked.contains(it.id.as_str()) && (!it.tip_sha.is_empty() || it.latest_request().is_some() || !it.verdicts.is_empty()) {
                 // A branch no item names is its own card: in an existing repo most work is
                 // branches and commits, not posts that name items.
-                Some((it.id.clone(), branch_work(it, me)))
+                Some((it.id.clone(), branch_work(it, g, me)))
             } else {
                 None
             }

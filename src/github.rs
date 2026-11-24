@@ -84,6 +84,8 @@ pub struct Link {
     /// The room's human, and their GitHub login when `gh` knows it.
     pub me: String,
     pub my_login: Option<String>,
+    /// The room's agent handles (branch prefixes that name an agent). Empty: claude, codex.
+    pub agents: Vec<String>,
 }
 
 impl Link {
@@ -94,13 +96,20 @@ impl Link {
     /// The room participant for a GitHub login: the room's human for their own login, an agent
     /// for its branch prefix (PRs Claude or Codex opened), else the login itself.
     fn who(&self, login: &str, head: Option<&str>) -> String {
-        if let Some(agent) = head.map(crate::model::branch_prefix).filter(|p| ["claude", "codex"].contains(p)) {
+        if let Some(agent) = head.map(crate::model::branch_prefix).filter(|p| self.is_agent(p)) {
             return agent.to_string();
         }
-        if login.is_empty() || self.my_login.as_deref().is_some_and(|m| m.eq_ignore_ascii_case(login)) {
+        if login.is_empty() {
+            return "github".into(); // a deleted account or an app: never taken for you
+        }
+        if self.my_login.as_deref().is_some_and(|m| m.eq_ignore_ascii_case(login)) {
             return self.me.clone();
         }
         login.to_ascii_lowercase()
+    }
+
+    fn is_agent(&self, name: &str) -> bool {
+        if self.agents.is_empty() { ["claude", "codex"].contains(&name) } else { self.agents.iter().any(|a| a == name) }
     }
 
     /// The events one pull request stands for. Pure: the same PR always gives the same events.
@@ -138,7 +147,7 @@ impl Link {
             body: Body::Message {
                 summary,
                 detail: (!detail.trim().is_empty()).then(|| detail.trim().to_string()),
-                mentions: if asks { pr.review_requests.iter().filter_map(|r| r.login.as_deref()).map(|l| self.who(l, None)).filter(|w| !["claude", "codex"].contains(&w.as_str())).collect() } else { Vec::new() },
+                mentions: if asks { pr.review_requests.iter().filter_map(|r| r.login.as_deref()).map(|l| self.who(l, None)).filter(|w| !self.is_agent(w)).collect() } else { Vec::new() },
                 items: if asks { vec![branch.clone()] } else { Vec::new() },
             },
         }];
@@ -288,7 +297,7 @@ mod tests {
     }
 
     fn link(remote_only: bool) -> Link {
-        Link { repo: "o/r".into(), label: Some("web".into()), remote_only, me: "sanjith".into(), my_login: Some("sanjith".into()) }
+        Link { repo: "o/r".into(), label: Some("web".into()), remote_only, me: "sanjith".into(), my_login: Some("sanjith".into()), agents: Vec::new() }
     }
 
     #[test]

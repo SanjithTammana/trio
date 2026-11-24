@@ -260,6 +260,10 @@ pub struct Graph {
     pub git_serials: HashMap<String, u64>,
     /// Latest status line per participant.
     pub now: HashMap<String, Status>,
+    /// The room's agents and their roles, in room.toml order. Empty: Claude and Codex, each
+    /// holding both roles (a room with no agents configured).
+    #[serde(skip)]
+    pub agents: Vec<(String, Vec<String>)>,
     #[serde(skip)]
     status_lines: HashMap<String, StatusLines>,
     #[serde(skip)]
@@ -320,6 +324,35 @@ struct ReviewFact {
 }
 
 impl Graph {
+    /// An empty graph for a room whose agents are `agents` (handle, roles), in list order.
+    pub fn with_agents(agents: Vec<(String, Vec<String>)>) -> Self {
+        Self { agents, ..Self::default() }
+    }
+
+    fn roster(&self) -> Vec<(String, Vec<String>)> {
+        if self.agents.is_empty() {
+            let both = vec!["build".to_string(), "review".to_string()];
+            vec![("claude".into(), both.clone()), ("codex".into(), both)]
+        } else {
+            self.agents.clone()
+        }
+    }
+
+    /// True for a handle of one of the room's agents.
+    pub fn is_agent(&self, name: &str) -> bool {
+        self.roster().iter().any(|(n, _)| n == name)
+    }
+
+    /// True for a role some agent holds.
+    pub fn is_role(&self, name: &str) -> bool {
+        self.roster().iter().any(|(_, r)| r.iter().any(|x| x == name))
+    }
+
+    /// The agents holding `role`, in list order.
+    pub fn holders(&self, role: &str) -> Vec<String> {
+        self.roster().into_iter().filter(|(_, r)| r.iter().any(|x| x == role)).map(|(n, _)| n).collect()
+    }
+
     fn item(&mut self, id: &str, at: &str, who: &str) -> &mut WorkItem {
         self.dirty.push(id.to_string());
         let it = self.items.entry(id.to_string()).or_insert_with(|| WorkItem {
@@ -760,7 +793,8 @@ impl Deriver for BranchDeriver {
             g.merged.remove(branch);
             g.touches.insert(branch.clone(), touches.clone());
         }
-        let owner = Some(crate::model::branch_prefix(branch)).filter(|p| ["claude", "codex"].contains(p)).map_or_else(|| e.from.clone(), str::to_string);
+        let prefix = crate::model::branch_prefix(branch);
+        let owner = if g.is_agent(prefix) { prefix.to_string() } else { e.from.clone() };
         let seq = g.seq;
         let it = g.item(branch, &e.at, &owner);
         it.tip_sha.clone_from(sha);

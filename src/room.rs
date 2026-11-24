@@ -68,8 +68,8 @@ pub struct Budget {
 }
 
 impl Budget {
-    pub fn of(&self, agent: &str) -> Option<f64> {
-        match agent {
+    pub fn of(&self, harness: &str) -> Option<f64> {
+        match harness {
             "claude" => self.claude_usd_day,
             "codex" => self.codex_usd_day,
             _ => None,
@@ -110,12 +110,19 @@ fn default_budget() -> u32 {
 }
 
 /// The other agent, for rerouting.
-fn other_agent(a: &str) -> Option<&'static str> {
-    match a {
-        "claude" => Some("codex"),
-        "codex" => Some("claude"),
-        _ => None,
-    }
+/// The agents' handles in the order room.toml lists them (toml tables carry no order once
+/// parsed into a map, so it is read off the document itself). Handles it cannot place go last.
+fn agent_order(text: &str, cfg: &RoomCfg) -> Vec<String> {
+    let mut order: Vec<String> = text
+        .parse::<toml_edit::DocumentMut>()
+        .ok()
+        .and_then(|d| d.get("agents").and_then(|a| a.as_table_like()).map(|t| t.iter().map(|(k, _)| k.to_string()).collect()))
+        .unwrap_or_default();
+    order.retain(|n| cfg.agents.contains_key(n));
+    let mut rest: Vec<String> = cfg.agents.keys().filter(|k| !order.contains(k)).cloned().collect();
+    rest.sort();
+    order.extend(rest);
+    order
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -182,6 +189,7 @@ pub fn github_links(cfg: &RoomCfg, root: &Path) -> Vec<crate::github::Link> {
                 remote_only: clone.is_none(),
                 me: human(cfg),
                 my_login: None,
+                agents: cfg.agents.keys().cloned().collect(),
             }
         })
         .collect()
@@ -322,6 +330,8 @@ pub struct Room {
     /// Which sessions hold the agents, as last seen; a change is published like an event.
     presence: String,
     pub agents: HashMap<String, CliAgent>,
+    /// Agent handles in room.toml order: ties in routing go to the one listed first.
+    order: Vec<String>,
     started: HashMap<String, Instant>,
     hop: u32,
     live: bool,
@@ -397,11 +407,21 @@ impl Room {
     fn open_with(root: &Path, watch: bool) -> io::Result<Self> {
         let root = root.canonicalize()?;
         let dir = root.join(".trio");
-        let cfg: RoomCfg = match std::fs::read_to_string(dir.join("room.toml")) {
-            Ok(t) => toml::from_str(&t).map_err(io::Error::other)?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => RoomCfg { hop_budget: 3, ..Default::default() },
+        let (cfg, order): (RoomCfg, Vec<String>) = match std::fs::read_to_string(dir.join("room.toml")) {
+            Ok(t) => {
+                let cfg: RoomCfg = toml::from_str(&t).map_err(io::Error::other)?;
+                let order = agent_order(&t, &cfg);
+                (cfg, order)
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (RoomCfg { hop_budget: 3, ..Default::default() }, Vec::new()),
             Err(e) => return Err(e),
         };
+        if watch {
+            // `@<handle>` and `@<role>` are mentions in the room this process serves.
+            let mut words = order.clone();
+            words.extend(order.iter().flat_map(|n| cfg.agents[n].roles()));
+            crate::source::add_handles(&words);
+        }
         // Prefixes are process-wide: only the room this process serves adds its own. A read-only
         // replay (the project list) must not change which ids the served room recognises.
         if watch {
@@ -422,6 +442,7 @@ impl Room {
                 (name.clone(), CliAgent::new(name, hue, c.clone()))
             })
             .collect();
+        let roster: Vec<(String, Vec<String>)> = order.iter().map(|n| (n.clone(), cfg.agents[n].roles())).collect();
         let trio_exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "trio".into());
         let named = repos_named(&cfg, &root);
         let relabel = named.first().map(|(main, _, _)| Relabel { main: main.clone(), many: named.len() > 1 });
@@ -448,11 +469,12 @@ impl Room {
             chat: Window::default(),
             git_events: Window::default(),
             arrival: 0,
-            graph: Graph::default(),
+            graph: Graph::with_agents(roster),
             derivers: derivers(),
             rev: 0,
             presence: String::new(),
             agents,
+            order,
             started: HashMap::new(),
             hop: 0,
             live: false,
@@ -925,27 +947,47 @@ impl Room {
     fn route(&mut self, e: &Event) {
         let Body::Message { mentions, .. } = &e.body else { return };
         let me = self.me();
-        if e.from == me {
-            self.hop = 0;
-        } else if !e.id.starts_with("gh:") {
-            self.hop += 1;
+        // GitHub rows are read back from a poll: neither a human turn nor an agent hop.
+        if !e.id.starts_with("gh:") {
+            if e.from == me {
+                self.hop = 0;
+            } else {
+                self.hop += 1;
+            }
         }
-        let mut targets: Vec<String> = mentions.iter().filter(|m| m.as_str() != "both" && m.as_str() != me).cloned().collect();
-        if mentions.iter().any(|m| m == "both") {
-            // "Both" asks for review from whoever did not write the work: never its author.
-            for a in ["claude", "codex"] {
-                if targets.iter().any(|t| t == a) || a == e.from {
-                    continue;
+        let mut targets: Vec<String> = Vec::new();
+        for m in mentions {
+            if m == &me {
+                continue;
+            }
+            if m == "both" || m == "all" {
+                // Everyone but whoever wrote the work: an agent never reviews its own.
+                for a in self.order.clone() {
+                    if a == e.from || targets.contains(&a) || !self.enabled(&a) {
+                        continue;
+                    }
+                    if self.reviews_own_work(e, &a) {
+                        self.record("trio", Body::Status { text: format!("{} wrote it, so @{m} leaves it out of the review", cap(&a)) });
+                        continue;
+                    }
+                    targets.push(a);
                 }
-                if self.reviews_own_work(e, a) {
-                    self.record("trio", Body::Status { text: format!("{} wrote it, so @both asks only the other agent to review", cap(a)) });
-                    continue;
-                }
-                targets.push(a.to_string());
+            } else if self.agents.contains_key(m) || m == "claude" || m == "codex" {
+                targets.push(m.clone());
+            } else if self.is_role(m)
+                && let Some(a) = self.pick(m, e)
+            {
+                self.record("trio", Body::Status { text: format!("@{m}: {} takes it", cap(&a)) });
+                targets.push(a);
             }
         }
         targets.retain(|t| t != &e.from);
-        targets.dedup();
+        let mut seen: Vec<String> = Vec::new();
+        targets.retain(|t| {
+            let first = !seen.contains(t);
+            seen.push(t.clone());
+            first
+        });
         let recent: Vec<String> = self
             .chat.events()
             .rev()
@@ -961,14 +1003,82 @@ impl Room {
             _ => None,
         };
         for t in &targets {
-            // Attached agents are pull-on-turn: the mention reaches them with their next message.
-            if let Some(a) = crate::hook::attached(&self.root, t) {
-                self.record("trio", Body::Status { text: format!("{t} is attached: waiting on you in {}", a.surface.label()) });
-                self.deliver(&e.id, t);
-                continue;
-            }
             self.dispatch(t, e, &recent, detail);
         }
+    }
+
+    fn enabled(&self, a: &str) -> bool {
+        self.agents.get(a).is_some_and(|x| x.cfg.enabled)
+    }
+
+    fn roles_of(&self, a: &str) -> Vec<String> {
+        self.agents.get(a).map(|x| x.cfg.roles()).unwrap_or_default()
+    }
+
+    fn is_role(&self, w: &str) -> bool {
+        self.agents.values().any(|a| a.cfg.roles().iter().any(|r| r == w))
+    }
+
+    /// The usage pool `a` draws on: agents on one account are out together.
+    fn account_of(&self, a: &str) -> String {
+        self.agents.get(a).map(|x| x.cfg.account(a)).unwrap_or_else(|| a.to_string())
+    }
+
+    /// The attached session `a` is, if any. A harness's one attached session (its plugin hooks
+    /// write `attached/<harness>.json`) stands for the first agent listed on that harness.
+    fn attached_to(&self, a: &str) -> Option<crate::hook::Attachment> {
+        let h = self.agents.get(a).map(|x| x.cfg.harness(a)).unwrap_or_else(|| crate::harness::of(a, None));
+        if !h.attach {
+            return None;
+        }
+        let first = self.order.iter().find(|n| self.agents[n.as_str()].cfg.harness(n).name == h.name).map(String::as_str).unwrap_or(a);
+        if first != a {
+            return None;
+        }
+        crate::hook::attached(&self.root, h.name)
+    }
+
+    /// Lower is better: available before out, idle before busy, ok before low, then list order.
+    fn rank(&self, a: &str) -> (u8, u8, u8, usize) {
+        let u = self.usage(a);
+        let idle = self.agents.get(a).is_some_and(|x| x.ready());
+        (u8::from(u.out()), u8::from(!idle), u8::from(u.state == "low"), self.order.iter().position(|n| n == a).unwrap_or(usize::MAX))
+    }
+
+    /// The agent `@<role>` reaches: the best-ranked enabled holder of it that did not write the
+    /// message or the work it asks about.
+    fn pick(&mut self, role: &str, e: &Event) -> Option<String> {
+        let holders: Vec<String> = self.order.iter().filter(|a| self.enabled(a) && self.roles_of(a).iter().any(|r| r == role) && **a != e.from).cloned().collect();
+        let mut fit: Vec<String> = holders.iter().filter(|a| !self.reviews_own_work(e, a)).cloned().collect();
+        fit.sort_by_key(|a| self.rank(a));
+        if fit.is_empty() {
+            let why = if holders.is_empty() { "nobody holds it" } else { "its only holders wrote the work" };
+            self.record("trio", Body::Status { text: format!("@{role} reaches no one: {why}") });
+        }
+        fit.into_iter().next()
+    }
+
+    /// Who could take `e` in `t`'s place, best first: enabled, available, not attached, not its
+    /// author or the author of the work it asks about, and sharing a role with `t` when any
+    /// such agent does.
+    fn stand_ins(&self, t: &str, e: &Event) -> Vec<String> {
+        let mut c: Vec<String> = self
+            .order
+            .iter()
+            .filter(|o| *o != t && **o != e.from && self.enabled(o) && !self.usage(o).out() && self.attached_to(o).is_none() && !self.reviews_own_work(e, o))
+            .cloned()
+            .collect();
+        let mine = self.roles_of(t);
+        if c.iter().any(|o| self.roles_of(o).iter().any(|r| mine.contains(r))) {
+            c.retain(|o| self.roles_of(o).iter().any(|r| mine.contains(r)));
+        }
+        c.sort_by_key(|o| self.rank(o));
+        c
+    }
+
+    /// True when no agent but `t` could ever take `e`: every other one wrote it or its work.
+    fn only(&self, t: &str, e: &Event) -> bool {
+        !self.order.iter().any(|o| o != t && *o != e.from && !self.reviews_own_work(e, o))
     }
 
     /// Wake `t` for `e`, by its usage. Out (limit, used-up window or spent budget): the other
@@ -1001,6 +1111,12 @@ impl Room {
         if self.has(&e.id, t) {
             return; // it reached `t` already (a reroute earlier in this route, or held)
         }
+        // Attached agents are pull-on-turn: the mention reaches them with their next message.
+        if let Some(a) = self.attached_to(t) {
+            self.record("trio", Body::Status { text: format!("{t} is attached: waiting on you in {}", a.surface.label()) });
+            self.deliver(&e.id, t);
+            return;
+        }
         let u = self.usage(t);
         if !u.out() {
             if u.state == "low" {
@@ -1014,12 +1130,14 @@ impl Room {
             self.record("trio", Body::Status { text: clip(&format!("{t} is {}; not held: over the hop budget ({}/{})", u.why(), self.hop, self.cfg.hop_budget), 120) });
             return;
         }
-        let other = other_agent(t).filter(|o| *o != e.from && self.agents.get(*o).is_some_and(|a| a.cfg.enabled) && !self.usage(o).out());
-        match other {
-            Some(o) if self.has(&e.id, o) => {
-                self.record("trio", Body::Status { text: clip(&format!("{t} is {}; {} already has this", u.why(), cap(o)), 120) });
+        let all = self.stand_ins(t, e);
+        let other = all.iter().find(|o| !self.has(&e.id, o)).cloned();
+        let author = self.order.iter().find(|o| *o != t && **o != e.from && self.enabled(o) && !self.usage(o).out() && self.reviews_own_work(e, o)).cloned();
+        match (other.as_deref(), author.as_deref()) {
+            (None, _) if !all.is_empty() => {
+                self.record("trio", Body::Status { text: clip(&format!("{t} is {}; {} already has this", u.why(), cap(&all[0])), 120) });
             }
-            Some(o) if !self.reviews_own_work(e, o) => {
+            (Some(o), _) => {
                 self.record("trio", Body::Status { text: clip(&format!("routed to {}: {} is {}", cap(o), cap(t), u.why()), 120) });
                 let note = self.handoff(t, &u, e);
                 let d = self.wake(o, e, recent, detail, &note);
@@ -1031,11 +1149,11 @@ impl Room {
                     self.record("trio", Body::Status { text: clip(&format!("held for {}: {} could not take it", cap(t), cap(o)), 120) });
                 }
             }
-            Some(o) => {
+            (None, Some(o)) => {
                 self.hold(t, e, &[]);
                 self.record("trio", Body::Status { text: clip(&format!("held for {}: {} wrote it, so its review waits until {} is back ({})", cap(t), cap(o), cap(t), u.why()), 120) });
             }
-            None => {
+            (None, None) => {
                 self.hold(t, e, &[]);
                 self.record("trio", Body::Status { text: clip(&format!("held for {}: {} is {}", cap(t), cap(t), u.why()), 120) });
             }
@@ -1049,7 +1167,8 @@ impl Room {
         let guard = Guard { paused: self.cfg.paused, hop: self.hop, budget: self.cfg.hop_budget, from_human: e.from == me };
         let mut since = handoff.to_vec();
         since.extend(crate::seen::digest(self.activity(), t));
-        let prompt = wake_prompt(t, &me, &room, recent, &since, detail);
+        let others: Vec<String> = self.order.iter().filter(|o| *o != t).cloned().collect();
+        let prompt = wake_prompt(t, &me, &room, &others, recent, &since, detail);
         let decision = match self.agents.get_mut(t) {
             Some(a) => a.wake_if_allowed(&prompt, &guard),
             None => WakeDecision::Disabled,
@@ -1080,7 +1199,7 @@ impl Room {
     fn hold(&mut self, t: &str, e: &Event, handoff: &[String]) {
         self.deliver(&e.id, t);
         if !self.held.iter().any(|h| h.agent == t && h.event.id == e.id) {
-            let stay = other_agent(t).is_some_and(|o| o == e.from || self.reviews_own_work(e, o));
+            let stay = self.only(t, e);
             self.held.push(Held { agent: t.to_string(), event: e.clone(), handoff: handoff.to_vec(), stay, tried: false });
             if self.held.len() > HELD_MAX {
                 let old = self.held.remove(0);
@@ -1099,11 +1218,13 @@ impl Room {
             return false;
         }
         let over = h.event.from != self.me() && self.hop > self.cfg.hop_budget;
-        let Some(o) = other_agent(&h.agent).filter(|o| {
-            *o != h.event.from && !over && self.agents.get(*o).is_some_and(|a| a.ready()) && !self.usage(o).out() && !self.has(&h.event.id, o) && !self.reviews_own_work(&h.event, o)
-        }) else {
+        if over {
+            return false;
+        }
+        let Some(o) = self.stand_ins(&h.agent, &h.event).into_iter().find(|o| self.agents.get(o.as_str()).is_some_and(|a| a.ready()) && !self.has(&h.event.id, o)) else {
             return false;
         };
+        let o = o.as_str();
         let u = self.usage(&h.agent);
         self.record("trio", Body::Status { text: clip(&format!("routed to {}: {} is {}", cap(o), cap(&h.agent), u.why()), 120) });
         // An entry that was itself a reroute goes back to the agent it was for: no note needed.
@@ -1148,8 +1269,24 @@ impl Room {
             return false;
         }
         let mut changed = false;
-        for agent in ["claude", "codex"] {
+        let mut waiting: Vec<String> = Vec::new();
+        for h in &self.held {
+            if !waiting.contains(&h.agent) {
+                waiting.push(h.agent.clone());
+            }
+        }
+        for agent in waiting {
+            let agent = agent.as_str();
             let Some(i) = self.held.iter().position(|h| h.agent == agent) else { continue };
+            if let Some(a) = self.attached_to(agent) {
+                // An attached session pulls unread lines on its next turn: nothing to spawn.
+                let n = self.held.iter().filter(|h| h.agent == agent).count();
+                self.held.retain(|h| h.agent != agent);
+                self.save_held();
+                self.record("trio", Body::Status { text: format!("{} is attached: {n} held message(s) wait for you in {}", cap(agent), a.surface.label()) });
+                changed = true;
+                continue;
+            }
             if !self.agents.get(agent).is_some_and(|a| a.cfg.enabled) {
                 let gone: Vec<String> = self.held.iter().filter(|h| h.agent == agent).map(|h| h.event.id.clone()).collect();
                 for id in &gone {
@@ -1228,12 +1365,18 @@ impl Room {
             return;
         }
         self.read_at = Some(Instant::now());
-        if let Some(r) = crate::usage::claude_file().and_then(|p| crate::usage::claude_reading(&p)) {
-            self.readings.insert("claude".into(), r);
-        }
-        let sessions = crate::usage::home().map(|h| h.join(".codex").join("sessions"));
-        if let Some(r) = sessions.and_then(|s| crate::usage::codex_latest_log(&s)).and_then(|l| crate::usage::codex_reading(&l)) {
-            self.readings.insert("codex".into(), r);
+        // Each harness reads its own account's windows; an agent on a named account of its own
+        // (another subscription or key) has no reading, only the limits its runs report.
+        let mut read: Vec<&'static str> = Vec::new();
+        let harnesses: Vec<&'static crate::harness::Preset> = self.order.iter().map(|n| self.agents[n.as_str()].cfg.harness(n)).collect();
+        for h in harnesses {
+            if read.contains(&h.name) {
+                continue;
+            }
+            read.push(h.name);
+            if let Some(r) = h.usage.and_then(|f| f()) {
+                self.readings.insert(h.name.to_string(), r);
+            }
         }
     }
 
@@ -1245,7 +1388,15 @@ impl Room {
 
     /// `agent`'s availability now: ok, low or out, with why and until when.
     pub fn usage(&self, agent: &str) -> crate::usage::Usage {
-        crate::usage::assess(self.readings.get(agent), self.stops.get(agent), self.spent_today(agent), self.cfg.budget.of(agent), crate::usage::epoch_now())
+        let account = self.account_of(agent);
+        let cfg = self.agents.get(agent).map(|a| &a.cfg);
+        let budget = cfg.and_then(|c| c.usd_day).or_else(|| self.cfg.budget.of(cfg.map(|c| c.harness(agent).name).unwrap_or(agent)));
+        crate::usage::assess(self.readings.get(&account), self.stops.get(&account), self.spent_today(agent), budget, crate::usage::epoch_now())
+    }
+
+    /// The room's agents in room.toml order.
+    pub fn agent_names(&self) -> &[String] {
+        &self.order
     }
 
     /// Wakes held, per agent, for the snapshot.
@@ -1273,7 +1424,8 @@ impl Room {
                 // A usage limit: the agent is out until its reset, and the message it was woken
                 // for goes on by the same rules as a fresh one (rerouted or held).
                 if let Some(stop) = r.stop.clone() {
-                    self.stops.insert(n.clone(), stop);
+                    let account = self.account_of(&n);
+                    self.stops.insert(account, stop);
                     let u = self.usage(&n);
                     self.record("trio", Body::Status { text: clip(&format!("{n} hit a usage limit: {}", u.why()), 120) });
                     if let Some(e) = trigger {
@@ -1389,7 +1541,8 @@ pub fn git_root(dir: &Path) -> Option<PathBuf> {
 pub fn human(cfg: &RoomCfg) -> String {
     let clean = |s: &str| -> Option<String> {
         let s: String = s.trim().to_ascii_lowercase().chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
-        (!s.is_empty() && !["claude", "codex", "both", "trio"].contains(&s.as_str())).then_some(s)
+        let taken = cfg.agents.contains_key(&s) || cfg.agents.values().any(|a| a.roles().contains(&s));
+        (!s.is_empty() && !taken && !["claude", "codex", "both", "all", "trio", "github"].contains(&s.as_str())).then_some(s)
     };
     clean(&cfg.me)
         .or_else(|| std::env::var("USERNAME").ok().or_else(|| std::env::var("USER").ok()).and_then(|u| clean(&u)))
@@ -1637,7 +1790,7 @@ mod tests {
         use crate::github::{Link, Login, Pr, Requested, Review};
         let root = temp_room("pull");
         std::fs::write(root.join(".trio/room.toml"), "me = 'sanjith'\nrepo = ''\n").unwrap();
-        let link = Link { repo: "o/r".into(), label: None, remote_only: true, me: "sanjith".into(), my_login: Some("ana".into()) };
+        let link = Link { repo: "o/r".into(), label: None, remote_only: true, me: "sanjith".into(), my_login: Some("ana".into()), agents: Vec::new() };
         let mut pr = Pr {
             number: 7, title: "Rate limit the login".into(), head_ref_name: "feature/limit".into(), head_ref_oid: "abc".into(),
             state: "OPEN".into(), is_draft: false, created_at: "2026-11-24T15:00:00Z".into(), updated_at: "2026-11-24T15:00:00Z".into(),
@@ -1784,7 +1937,7 @@ mod tests {
         use crate::github::{Link, Login, Pr};
         let root = temp_room("pr-linked");
         std::fs::write(root.join(".trio/room.toml"), "me = 'sanjith'\nrepo = ''\n").unwrap();
-        let link = Link { repo: "o/r".into(), label: None, remote_only: false, me: "sanjith".into(), my_login: None };
+        let link = Link { repo: "o/r".into(), label: None, remote_only: false, me: "sanjith".into(), my_login: None, agents: Vec::new() };
         let mut pr = Pr {
             number: 3, title: "Ready for review: the login".into(), head_ref_name: "claude/x".into(), head_ref_oid: "abc".into(),
             state: "OPEN".into(), is_draft: false, created_at: "2026-11-23T15:00:00Z".into(), updated_at: "2026-11-23T15:00:00Z".into(),
@@ -2033,7 +2186,7 @@ mod tests {
         use crate::github::{Link, Login, Pr};
         let root = temp_room("pr-life");
         std::fs::write(root.join(".trio/room.toml"), "me = 'sanjith'\nrepo = ''\n").unwrap();
-        let link = Link { repo: "o/r".into(), label: None, remote_only: false, me: "sanjith".into(), my_login: None };
+        let link = Link { repo: "o/r".into(), label: None, remote_only: false, me: "sanjith".into(), my_login: None, agents: Vec::new() };
         let mut pr = Pr {
             number: 4, title: "Login".into(), head_ref_name: "claude/y".into(), head_ref_oid: "def".into(),
             state: "OPEN".into(), is_draft: false, created_at: "2026-11-23T15:00:00Z".into(), updated_at: "2026-11-23T15:00:00Z".into(),
@@ -2269,18 +2422,24 @@ mod tests {
 
     /// A room with both agents as shell commands: (name, printed reply, exit code).
     fn room_with(name: &str, agents: &[(&str, &str, i32)]) -> (PathBuf, Room) {
+        let with: Vec<(&str, &str, i32, &str)> = agents.iter().map(|(a, r, c)| (*a, *r, *c, "")).collect();
+        room_with_cfg(name, &with)
+    }
+
+    /// As `room_with`, with extra room.toml lines per agent (`roles = [..]`, `account = ..`).
+    fn room_with_cfg(name: &str, agents: &[(&str, &str, i32, &str)]) -> (PathBuf, Room) {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let root = std::env::temp_dir().join(format!("trio-room-{name}-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(root.join(".trio")).unwrap();
         let q = |s: &str| toml::Value::String(s.into()).to_string();
         let mut cfg = "hop_budget = 3\n".to_string();
-        for (agent, reply, code) in agents {
+        for (agent, reply, code, extra) in agents {
             #[cfg(windows)]
             let wake = ["cmd".to_string(), "/C".into(), format!("echo {reply}& exit {code}")];
             #[cfg(unix)]
             let wake = ["sh".to_string(), "-c".into(), format!("echo '{reply}'; exit {code}")];
             cfg.push_str(&format!(
-                "[agents.{agent}]\nenabled = true\nsession = \"s\"\ncwd = {}\nwake = [{}]\n",
+                "[agents.{agent}]\nenabled = true\nsession = \"s\"\ncwd = {}\nwake = [{}]\n{extra}\n",
                 q(&root.join(format!("cw-{agent}")).display().to_string()),
                 wake.iter().map(|a| q(a)).collect::<Vec<_>>().join(", ")
             ));
@@ -2433,6 +2592,96 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    fn woken(root: &Path) -> Vec<String> {
+        let ledger = std::fs::read_to_string(root.join(".trio").join("room.jsonl")).unwrap();
+        ledger
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["kind"] == "run_started")
+            .filter_map(|v| v["agent"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    fn three() -> [(&'static str, &'static str, i32, &'static str); 3] {
+        [
+            ("claude", "Done.", 0, "roles = ['build']"),
+            ("gemini", "Looked.", 0, "harness = 'command'\nroles = ['review']"),
+            ("codex", "On it.", 0, "roles = ['build', 'review']"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_role_mention_wakes_one_holder_the_first_listed_when_all_are_free() {
+        let (root, mut room) = room_with_cfg("role-one", &three());
+        room.tick();
+        assert_eq!(room.agent_names(), ["claude", "gemini", "codex"], "room.toml order");
+        room.say(&room.me(), "@review look at XF1", None).unwrap();
+        room.tick();
+        settle(&mut room).await;
+        assert_eq!(woken(&root), ["gemini"]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_role_mention_skips_a_holder_that_is_out() {
+        let (root, mut room) = room_with_cfg("role-out", &three());
+        room.tick();
+        room.stops.insert("gemini".into(), stop());
+        room.say(&room.me(), "@review look at XF1", None).unwrap();
+        room.tick();
+        settle(&mut room).await;
+        assert_eq!(woken(&root), ["codex"]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn an_out_agent_hands_off_to_one_that_shares_its_role() {
+        let (root, mut room) = room_with_cfg("share-role", &three());
+        room.tick();
+        room.stops.insert("claude".into(), stop());
+        room.say(&room.me(), "@claude fix XF2", None).unwrap();
+        room.tick();
+        settle(&mut room).await;
+        assert_eq!(woken(&root), ["codex"], "Gemini only reviews; Codex also builds");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn all_wakes_every_agent_but_the_author() {
+        let (root, mut room) = room_with_cfg("all", &three());
+        room.tick();
+        append(&room.ledger, &said("2026-11-24T09:00", "codex", "@all have a look at XF3")).unwrap();
+        room.tick();
+        settle(&mut room).await;
+        let mut w = woken(&root);
+        w.sort();
+        assert_eq!(w, ["claude", "gemini"]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn agents_on_one_account_run_out_together() {
+        let (root, mut room) = room_with_cfg("account", &[("claude", "Done.", 0, ""), ("sonnet", "Done.", 0, "harness = 'claude'"), ("codex", "On it.", 0, "")]);
+        room.tick();
+        room.stops.insert("claude".into(), stop());
+        assert!(room.usage("sonnet").out(), "Sonnet draws on the same Claude account");
+        assert!(!room.usage("codex").out());
+        room.say(&room.me(), "@sonnet fix XF4", None).unwrap();
+        room.tick();
+        settle(&mut room).await;
+        assert_eq!(woken(&root), ["codex"]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn two_command_agents_do_not_share_limits() {
+        let (root, mut room) = room_with_cfg("cmd-accounts", &[("bot1", "a", 0, ""), ("bot2", "b", 0, "")]);
+        room.tick();
+        room.stops.insert("bot1".into(), stop());
+        assert!(room.usage("bot1").out() && !room.usage("bot2").out());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn both_never_asks_the_author_to_review_its_own_work() {
         let (root, mut room) = room_with("both-author", &[("claude", "x", 0), ("codex", "y", 0)]);
@@ -2443,7 +2692,7 @@ mod tests {
         room.say(&room.me(), "@both please review XF1", None).unwrap();
         room.tick();
         let ledger = std::fs::read_to_string(root.join(".trio").join("room.jsonl")).unwrap();
-        assert!(ledger.contains("Codex wrote it, so @both asks only the other agent"), "{ledger}");
+        assert!(ledger.contains("Codex wrote it, so @both leaves it out of the review"), "{ledger}");
         assert!(!ledger.contains("\"agent\":\"codex\",\"hop\""), "{ledger}");
         assert!(ledger.contains("\"agent\":\"claude\",\"hop\""), "{ledger}");
         let _ = std::fs::remove_dir_all(root);

@@ -392,7 +392,7 @@ fn render_lines(room: &str, agent: &str, msgs: &[Event]) -> String {
     }
     for e in &msgs[skipped..] {
         let Body::Message { summary, detail, mentions, .. } = &e.body else { continue };
-        let to_me = mentions.iter().any(|m| m == agent || m == "both");
+        let to_me = mentions.iter().any(|m| m == agent || m == "both" || m == "all");
         let time = e.at.split('T').nth(1).unwrap_or(&e.at);
         out.push_str(&format!("{time} {}{}: {summary}\n", e.from, if to_me { " -> you" } else { "" }));
         if let Some(d) = detail.as_deref().filter(|d| to_me && d.trim() != summary.trim()) {

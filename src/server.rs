@@ -162,9 +162,9 @@ fn snapshot(room: &Room, token: &str, room_id: &str) -> serde_json::Value {
     let work = crate::work::all(&room.graph, &room.me());
     obj.insert("graph".into(), graph_snapshot(room, &work));
     // Each agent's availability for the island bars and for "held until" on cards.
-    let usage: serde_json::Map<String, serde_json::Value> = ["claude", "codex"]
+    let usage: serde_json::Map<String, serde_json::Value> = room
+        .agent_names()
         .iter()
-        .filter(|a| room.agents.contains_key(**a))
         .map(|a| {
             let mut u = serde_json::json!(room.usage(a));
             u["held"] = serde_json::json!(room.held_for(a));

@@ -299,6 +299,22 @@ pub fn model_of(wake: &[String]) -> Option<String> {
 
 pub fn parse_output(stdout: &str, rates: Option<(f64, f64, f64)>) -> RunOut {
     let t = stdout.trim();
+    // Antigravity (`agy -p --output-format json`): one object with `status` and `response`.
+    if t.starts_with('{')
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(t)
+        && v.get("conversation_id").is_some()
+        && let Some(status) = v.get("status").and_then(|x| x.as_str())
+    {
+        let error = status != "SUCCESS";
+        let response = v.get("response").and_then(|x| x.as_str()).map(str::to_string);
+        let error_text = if error {
+            let detail = v.get("error").map(|e| e.as_str().map(str::to_string).unwrap_or_else(|| e.to_string())).unwrap_or_default();
+            format!("{status} {detail} {}", response.clone().unwrap_or_default())
+        } else {
+            String::new()
+        };
+        return RunOut { structured: true, reply: response.filter(|r| !error && !r.trim().is_empty()), cost: None, error, error_text };
+    }
     // Claude: one JSON object (JSON lines fail to parse as one value and fall through).
     if t.starts_with('{')
         && let Ok(v) = serde_json::from_str::<serde_json::Value>(t)
@@ -359,7 +375,7 @@ pub fn parse_output(stdout: &str, rates: Option<(f64, f64, f64)>) -> RunOut {
 /// lasts COOLDOWN_MIN minutes.
 pub fn limit_stop(text: &str, now: DateTime<Local>) -> Option<Stop> {
     let lower = text.to_ascii_lowercase();
-    let hit = lower.contains("usage limit") || (lower.contains("hit your") && lower.contains("limit")) || lower.contains("limit reached") || lower.contains("rate_limit_exceeded") || lower.contains("quota exceeded");
+    let hit = lower.contains("usage limit") || (lower.contains("hit your") && lower.contains("limit")) || lower.contains("limit reached") || lower.contains("rate_limit_exceeded") || lower.contains("quota exceeded") || lower.contains("resource_exhausted") || lower.contains("resource has been exhausted");
     if !hit {
         return None;
     }

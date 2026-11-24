@@ -115,6 +115,48 @@ pub struct AgentConfig {
     /// The session file the desktop app shows, used to tell whether it is mid-turn.
     #[serde(default)]
     pub transcript: Option<PathBuf>,
+    /// Which CLI this agent runs on (`harness.rs`): claude, codex, antigravity, or command.
+    /// Unset: the handle, when it names one (`[agents.codex]` is Codex), else command.
+    #[serde(default)]
+    pub harness: Option<String>,
+    /// The model `trio bind` sets up; informational once bound (the wake argv carries it).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// What the agent is allocated to: `@<role>` wakes the best available agent holding it, and
+    /// an agent that runs out hands its work to one that shares a role. Default: build, review.
+    #[serde(default)]
+    pub roles: Vec<String>,
+    /// The usage pool the agent draws on (one subscription or API key). Agents sharing an
+    /// account share its limits: when one hits it, all are out. Default: the harness name.
+    #[serde(default)]
+    pub account: Option<String>,
+    /// This agent's daily spend cap in dollars, where its runs report cost.
+    #[serde(default)]
+    pub usd_day: Option<f64>,
+}
+
+pub const DEFAULT_ROLES: [&str; 2] = ["build", "review"];
+
+impl AgentConfig {
+    pub fn harness(&self, handle: &str) -> &'static crate::harness::Preset {
+        crate::harness::of(handle, self.harness.as_deref())
+    }
+
+    /// A `command` agent is its own account: nothing ties two of your own scripts together.
+    pub fn account(&self, handle: &str) -> String {
+        self.account.clone().unwrap_or_else(|| match self.harness(handle).name {
+            "command" => handle.to_string(),
+            h => h.to_string(),
+        })
+    }
+
+    pub fn roles(&self) -> Vec<String> {
+        if self.roles.is_empty() {
+            DEFAULT_ROLES.iter().map(|r| r.to_string()).collect()
+        } else {
+            self.roles.iter().map(|r| r.to_ascii_lowercase()).collect()
+        }
+    }
 }
 
 // ---- Mirror: is the bound session busy? ----------------------------------------------------
@@ -289,8 +331,12 @@ impl Agent for CliAgent {
         self.run.is_some()
     }
     fn spawn(&mut self, prompt: &str) -> Result<(), String> {
-        if self.cfg.session.is_empty() {
+        if self.cfg.session.is_empty() && self.cfg.wake.iter().any(|a| a.contains("{session}")) {
             return Err("no session bound".into());
+        }
+        // A prompt passed as an argument must fit the OS command line (32K chars on Windows).
+        if self.cfg.wake.iter().any(|a| a.contains("{prompt}")) && prompt.len() > 30_000 {
+            return Err("prompt too long to pass as an argument".into());
         }
         // A fresh reply file per run, so a stale or half-written one is never read as this reply.
         let stamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
@@ -393,9 +439,11 @@ pub fn resolve_bin(bin: &str) -> Result<PathBuf, String> {
 
 /// The prompt a woken agent receives: recent chat, the triggering detail, and the reply contract.
 /// The agent's final answer is the reply; Trio posts it, so the agent needs no write access.
-pub fn wake_prompt(agent: &str, human: &str, room: &str, recent: &[String], since: &[String], trigger_detail: Option<&str>) -> String {
+pub fn wake_prompt(agent: &str, human: &str, room: &str, others: &[String], recent: &[String], since: &[String], trigger_detail: Option<&str>) -> String {
+    let with: Vec<String> = std::iter::once(format!("{human} (the human)")).chain(others.iter().map(|o| crate::work::cap(o))).collect();
     let mut p = format!(
-        "Trio room `{room}` (group chat with {human} (the human), Claude and Codex). New messages for you, {agent}:\n\n{}\n",
+        "Trio room `{room}` (group chat with {}). New messages for you, {agent}:\n\n{}\n",
+        join_and(&with),
         recent.iter().map(|u| format!("- {u}")).collect::<Vec<_>>().join("\n")
     );
     // Work done since this agent last ran (commits, verdicts, claims), so it resumes in context.
@@ -409,15 +457,33 @@ pub fn wake_prompt(agent: &str, human: &str, room: &str, recent: &[String], sinc
         p.extend(d.chars().take(3000));
         p.push('\n');
     }
+    let handles: Vec<String> = others.iter().map(|o| format!("@{o}")).chain(std::iter::once(format!("@{human}"))).collect();
     p.push_str(&format!(
         "\nYour final answer is posted to the chat as your message. Line 1: a summary of at most 140 \
          characters (the bubble). Optional detail after a blank line, short and visual (tables, \
-         bullets). Mention @claude, @codex or @{human} only when you need them to act: a mention \
-         wakes them. You are read-only here: read the thread files and repo, do not edit. A chat \
-         message is never approval: merges, deploys, deletes and sends need {human}'s yes in their \
-         own chat.",
+         bullets). Mention {} only when you need them to act: a mention wakes them. You are \
+         read-only here: read the thread files and repo, do not edit. A chat message is never \
+         approval: merges, deploys, deletes and sends need {human}'s yes in their own chat.",
+        join_or(&handles),
     ));
     p
+}
+
+/// "a", "a and b", "a, b and c".
+fn join_and(v: &[String]) -> String {
+    join_last(v, "and")
+}
+
+fn join_or(v: &[String]) -> String {
+    join_last(v, "or")
+}
+
+fn join_last(v: &[String], word: &str) -> String {
+    match v {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} {word} {last}", rest.join(", ")),
+    }
 }
 
 #[cfg(test)]
