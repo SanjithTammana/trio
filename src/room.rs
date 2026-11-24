@@ -86,6 +86,13 @@ struct Held {
     /// wake that finally goes out still says why the agent is taking it.
     #[serde(default)]
     handoff: Vec<String>,
+    /// Never rerouted: the other agent wrote the message or the work it asks about. Decided when
+    /// held, so it holds after a ledger cut re-keys the event.
+    #[serde(default)]
+    stay: bool,
+    /// A reroute of this entry already failed to start in this process: not tried again.
+    #[serde(skip)]
+    tried: bool,
 }
 
 fn held_path(root: &Path) -> PathBuf {
@@ -637,6 +644,9 @@ impl Room {
             for h in &mut fresh.held {
                 h.event.id = format!("{}@cut{}", h.event.id, self.rev);
             }
+            for e in fresh.triggers.values_mut() {
+                e.id = format!("{}@cut{}", e.id, self.rev);
+            }
             fresh.save_held();
             fresh.delivered.clear();
             fresh.delivered_order.clear();
@@ -996,6 +1006,10 @@ impl Room {
             self.queue_if_busy(t, e, &d, &[]);
             return;
         }
+        if e.from != self.me() && self.hop > self.cfg.hop_budget {
+            self.record("trio", Body::Status { text: clip(&format!("{t} is {}; not held: over the hop budget ({}/{})", u.why(), self.hop, self.cfg.hop_budget), 120) });
+            return;
+        }
         let other = other_agent(t).filter(|o| *o != e.from && self.agents.get(*o).is_some_and(|a| a.cfg.enabled) && !self.usage(o).out());
         match other {
             Some(o) if self.has(&e.id, o) => {
@@ -1059,7 +1073,8 @@ impl Room {
     fn hold(&mut self, t: &str, e: &Event, handoff: &[String]) {
         self.deliver(&e.id, t);
         if !self.held.iter().any(|h| h.agent == t && h.event.id == e.id) {
-            self.held.push(Held { agent: t.to_string(), event: e.clone(), handoff: handoff.to_vec() });
+            let stay = other_agent(t).is_some_and(|o| o == e.from || self.reviews_own_work(e, o));
+            self.held.push(Held { agent: t.to_string(), event: e.clone(), handoff: handoff.to_vec(), stay, tried: false });
             if self.held.len() > HELD_MAX {
                 let old = self.held.remove(0);
                 self.undeliver(&old.event.id, &old.agent);
@@ -1073,19 +1088,23 @@ impl Room {
     /// same rules as a live reroute. True when it went out.
     fn reroute_held(&mut self, i: usize) -> bool {
         let h = self.held[i].clone();
-        let me = self.me();
-        let over = h.event.from != me && self.hop > self.cfg.hop_budget;
+        if h.stay || h.tried {
+            return false;
+        }
+        let over = h.event.from != self.me() && self.hop > self.cfg.hop_budget;
         let Some(o) = other_agent(&h.agent).filter(|o| {
-            *o != h.event.from && !over && self.agents.get(*o).is_some_and(|a| a.ready()) && !self.usage(o).out() && !self.has(&h.event.id, o) && !self.reviews_own_work(&h.event, o)
+            *o != h.event.from && !over && self.agents.get(*o).is_some_and(|a| a.ready()) && !self.usage(o).out() && !self.has(&h.event.id, o)
         }) else {
             return false;
         };
         let u = self.usage(&h.agent);
         self.record("trio", Body::Status { text: clip(&format!("routed to {}: {} is {}", cap(o), cap(&h.agent), u.why()), 120) });
-        let note = self.handoff(&h.agent, &u, &h.event);
+        // An entry that was itself a reroute goes back to the agent it was for: no note needed.
+        let note = if h.handoff.is_empty() { self.handoff(&h.agent, &u, &h.event) } else { Vec::new() };
         let recent = self.recent();
         let detail = h.event.detail().map(str::to_string);
         if !matches!(self.wake(o, &h.event, &recent, detail.as_deref(), &note), WakeDecision::Started) {
+            self.held[i].tried = true;
             return false;
         }
         self.undeliver(&h.event.id, &h.agent);
@@ -1136,7 +1155,13 @@ impl Room {
                 continue;
             }
             if self.usage(agent).out() {
-                changed |= self.reroute_held(i);
+                let mine: Vec<usize> = (i..self.held.len()).filter(|&k| self.held[k].agent == agent).collect();
+                for k in mine {
+                    if self.reroute_held(k) {
+                        changed = true;
+                        break;
+                    }
+                }
                 continue;
             }
             if !self.agents.get(agent).is_some_and(|a| a.ready()) {
@@ -1385,6 +1410,15 @@ mod tests {
         Event { id: id.into(), at: at.into(), from: from.into(), body: Body::Message {
             summary: summary.into(), detail: None, mentions: vec![], items: crate::model::item_ids(summary),
         } }
+    }
+
+    /// A chat line as someone other than the operator would write it, mentions parsed.
+    fn said(at: &str, from: &str, text: &str) -> Event {
+        let mut e = message("", at, from, text);
+        if let Body::Message { mentions, .. } = &mut e.body {
+            *mentions = mentions_in(text, "sanjith");
+        }
+        e
     }
 
     fn commit(id: &str, at: &str, branch: &str, sha: &str, subject: &str, merged: bool, gone: bool) -> Event {
@@ -1831,7 +1865,7 @@ mod tests {
         assert!(!room.delivered.is_empty());
         let ledger = root.join(".trio/room.jsonl");
         std::fs::write(&ledger, "").unwrap();
-        append(&ledger, &message("", "2026-11-23T09:00", "sanjith", "@codex XF2")).unwrap();
+        append(&ledger, &said("2026-11-23T09:00", "sanjith", "@codex XF2")).unwrap();
         room.tick();
         room.tick();
         assert!(room.graph.items.contains_key("XF2"));
@@ -1878,9 +1912,11 @@ mod tests {
         room.tick();
         room.stops.insert("claude".into(), stop());
         room.hop = 9;
-        append(&room.ledger, &message("", "2026-11-24T09:00", "bo", "@claude look at XF1")).unwrap();
+        append(&room.ledger, &said("2026-11-24T09:00", "bo", "@claude look at XF1")).unwrap();
         room.tick();
         assert_eq!((room.held_for("claude"), room.held_for("codex")), (0, 0), "the hop budget stops it, as it would with nobody out");
+        let ledger = std::fs::read_to_string(&room.ledger).unwrap();
+        assert!(ledger.contains("over the hop budget"), "{ledger}");
         assert!(!room.any_running());
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1904,6 +1940,46 @@ mod tests {
         assert_eq!(room.held_for("claude"), 0);
         let ledger = std::fs::read_to_string(root.join(".trio").join("room.jsonl")).unwrap();
         assert_eq!(ledger.matches("\"agent\":\"codex\",\"hop\"").count(), 1, "{ledger}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn an_agents_message_to_an_out_agent_waits_for_it_within_the_hop_budget() {
+        let (root, mut room) = room_with("agent-to-out", &[("claude", "Done.", 0), ("codex", "On it.", 0)]);
+        room.tick();
+        room.stops.insert("claude".into(), stop());
+        append(&room.ledger, &said("2026-11-24T09:00", "codex", "@claude look at XF1")).unwrap();
+        room.tick();
+        assert_eq!((room.held_for("claude"), room.held_for("codex")), (1, 0), "never rerouted back to its author");
+        assert!(room.held[0].stay && !room.any_running());
+        room.hop = 9;
+        append(&room.ledger, &said("2026-11-24T09:01", "codex", "@claude and XF2")).unwrap();
+        room.tick();
+        assert_eq!(room.held_for("claude"), 1, "past the hop budget nothing is queued");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_cut_re_keys_held_wakes_so_a_reused_offset_is_a_new_message() {
+        let (root, mut room) = room_with("cut-held", &[("claude", "Done.", 0)]);
+        room.tick();
+        room.stops.insert("claude".into(), stop());
+        let ledger = root.join(".trio/room.jsonl");
+        std::fs::write(&ledger, "").unwrap();
+        room.tick();
+        room.say(&room.me(), "@claude look at XF1", None).unwrap();
+        room.tick();
+        assert_eq!(room.held_for("claude"), 1);
+        let old = room.held[0].event.id.clone();
+        std::fs::write(&ledger, "").unwrap();
+        room.tick();
+        room.tick();
+        assert!(room.held[0].event.id.starts_with(&format!("{old}@cut")), "{}", room.held[0].event.id);
+        assert!(std::fs::read_to_string(held_path(&root)).unwrap().contains("@cut"));
+        assert!(!room.has(&old, "claude"));
+        room.say(&room.me(), "@claude look at XF2", None).unwrap();
+        room.tick();
+        assert_eq!(room.held_for("claude"), 2, "the new message is held too, though it may reuse the old id");
         let _ = std::fs::remove_dir_all(root);
     }
 
