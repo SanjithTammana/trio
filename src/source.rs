@@ -173,7 +173,7 @@ impl PostsFile {
             id: id.clone(),
             at: at.clone(),
             from: self.from.clone(),
-            body: Body::Message { summary: title.to_string(), detail: Some(detail.clone()), mentions: mentions(&detail), items },
+            body: Body::Message { summary: title.to_string(), detail: Some(detail.clone()), mentions: mentions(&format!("{title}\n{detail}")), items },
         }];
         let mut fence: Option<(u8, usize)> = None;
         let mut last_text = "";

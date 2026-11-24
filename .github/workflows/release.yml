@@ -69,7 +69,7 @@ jobs:
           ext=""; [[ "${{ matrix.target }}" == *windows* ]] && ext=".exe"
           mkdir -p "dist/$name"
           for bin in trio trio-start trio-app; do cp "target/${{ matrix.target }}/release/$bin$ext" "dist/$name/"; done
-          cp README.md LICENSE "dist/$name/"
+          cp README.md LICENSE THIRD_PARTY_NOTICES.md "dist/$name/"
           cp -R adapters "dist/$name/adapters"
           mkdir -p "dist/$name/docs" && cp docs/codex.md "dist/$name/docs/"
           cd dist

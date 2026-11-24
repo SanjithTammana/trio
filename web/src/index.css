@@ -269,8 +269,11 @@ button.bar:hover .lbl { text-decoration: underline; text-decoration-color: var(-
 .card.you { box-shadow: inset 3px 0 0 var(--accent); }
 .card-t { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .card-t b { font-size: 12px; }
+.id-tag { display: inline-block; padding: 0 4px; border: 1px solid var(--line); border-radius: 4px; font-size: 10.5px; color: var(--ink-3); line-height: 1.5; }
 .card-m { display: flex; justify-content: space-between; gap: 8px; color: var(--ink-3); font-size: 11.5px; }
 .card-m > span { display: inline-flex; align-items: center; gap: 5px; min-width: 0; }
+.card-m > span:first-child { overflow: hidden; white-space: nowrap; }
+.card-m > span:last-child { flex: none; white-space: nowrap; }
 .card.you .card-m > span:first-child { color: var(--accent); }
 .work-story { font-size: 13px; line-height: 1.5; color: var(--ink); background: var(--sunk); border-radius: 8px; padding: 9px 11px; margin: 10px 0 4px; }
 @media (max-width: 760px) { .work { grid-template-columns: repeat(5, 78vw); overflow-x: auto; scroll-snap-type: x mandatory; } .work-lane { scroll-snap-align: start; } }

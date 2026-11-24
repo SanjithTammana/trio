@@ -247,9 +247,19 @@ pub fn show(ui: &mut Ui, app: &mut TrioApp, snap: &Snapshot, panel: &Panel, t: &
                 let hot_parts: HashSet<String> = components(touches, &open_branches).into_iter().filter(|x| x.hot).map(|x| x.part).collect();
                 let state = if is_branch && merged.contains(n.id.as_str()) { "merged" } else { n.state.as_str() };
                 let updates = format!("{} update{}", n.touches, if n.touches == 1 { "" } else { "s" });
-                eyebrow(&mut c, t, &[(Some((state, true)), format!("{} ·", state_label(state))), (Some((n.lane.as_str(), false)), format!("{} · {updates}", name_of(&n.lane, me)))], me);
-                heading(&mut c, &n.id, true, t);
-                if !n.summary.is_empty() {
+                // An item leads with what it is; its id is in the eyebrow. A branch name is its title.
+                let titled = !is_branch && !n.summary.is_empty();
+                let mut brow = vec![(Some((state, true)), format!("{} ·", state_label(state))), (Some((n.lane.as_str(), false)), format!("{} · {updates}", name_of(&n.lane, me)))];
+                if titled {
+                    brow.insert(0, (None, format!("{} ·", n.id)));
+                }
+                eyebrow(&mut c, t, &brow, me);
+                if titled {
+                    heading(&mut c, &n.summary, false, t);
+                } else {
+                    heading(&mut c, &n.id, true, t);
+                }
+                if !titled && !n.summary.is_empty() {
                     c.text(LayoutJob::single_section(n.summary.clone(), paint::fmt(theme::sans(14.0), t.ink2)));
                     c.gap(14.0);
                 }

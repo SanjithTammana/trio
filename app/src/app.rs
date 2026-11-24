@@ -151,7 +151,9 @@ impl TrioApp {
     }
 
     fn keys(&mut self, ctx: &egui::Context, now: f64) {
-        let typing = ctx.egui_wants_keyboard_input();
+        // Shortcuts are text keys: only a focused text field swallows them (a focused button
+        // or lens segment does not).
+        let typing = ctx.text_edit_focused();
         let (esc, slash, g, c, ask) = ctx.input(|i| {
             let plain = !i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.command;
             let text = |s: &str| i.events.iter().any(|e| matches!(e, egui::Event::Text(t) if t == s));

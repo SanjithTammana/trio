@@ -4,7 +4,7 @@
 //! graph incrementally, so applying an event costs O(1) amortized (hash lookups) and the whole
 //! graph is O(V + E) memory with per-item step lists capped at `STEPS_MAX`.
 
-use crate::model::{clip, Body, Entity, Event, Summarized, Timed, Touch};
+use crate::model::{clip, definition, Body, Entity, Event, Summarized, Timed, Touch};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -37,17 +37,52 @@ pub struct WorkItem {
     /// The latest message that asked for a review of this item: when, by whom, and of whom.
     #[serde(skip)]
     pub review_asked: Option<ReviewAsk>,
-    /// Time of the latest verdict, so a later review request reads as "in review" again.
+    /// Every verdict on this node (newest kept, at most VERDICTS_MAX), with who gave it and when.
     #[serde(skip)]
-    pub verdict_at: String,
+    pub verdicts: Vec<Verdict>,
+    /// Who first named it; `owner` moves to whoever claims it.
+    #[serde(skip)]
+    pub raised_by: String,
+    #[serde(skip)]
+    pub claimed_by: Option<String>,
+    /// Branches: when the branch was first seen merged.
+    #[serde(skip)]
+    pub merged_at: String,
+    /// Items: implementing branches that merged and were later deleted, so Done survives cleanup.
+    #[serde(skip)]
+    pub merged_gone: Vec<Gone>,
+    /// The title came from a definition ("XF32 \u{2014} Limit the clean claim"); later mentions keep it.
+    #[serde(skip)]
+    pub defined: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct ReviewAsk {
     pub at: String,
+    /// Arrival order, which breaks ties between events stamped in the same minute.
+    pub seq: u64,
     pub by: String,
     pub of: Vec<String>,
 }
+
+#[derive(Debug, Clone)]
+pub struct Verdict {
+    pub at: String,
+    pub seq: u64,
+    pub by: String,
+    /// pass | changes | blocked | review
+    pub outcome: String,
+    /// The node the verdict named (an item or a branch).
+    pub on: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Gone {
+    pub branch: String,
+    pub at: String,
+}
+
+const VERDICTS_MAX: usize = 32;
 
 impl Entity for WorkItem {
     fn id(&self) -> &str {
@@ -98,6 +133,9 @@ pub struct Graph {
     /// Events already applied, so a re-emitted post does not double-count steps.
     #[serde(skip)]
     seen: HashSet<String>,
+    /// Arrival counter for `apply`, the tie-break between same-minute events.
+    #[serde(skip)]
+    pub seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -119,12 +157,29 @@ impl Graph {
             touches: 0,
             steps: Vec::new(),
             review_asked: None,
-            verdict_at: String::new(),
+            verdicts: Vec::new(),
+            raised_by: who.to_string(),
+            claimed_by: None,
+            merged_at: String::new(),
+            merged_gone: Vec::new(),
+            defined: false,
         })
     }
 
-    /// Forget an item and its edges (a deleted branch).
+    /// Forget an item and its edges (a deleted branch). A merged branch hands its merge and its
+    /// verdicts to the items it implemented first, so their Done and story survive the cleanup.
     fn drop_item(&mut self, id: &str) {
+        if self.merged.contains(id)
+            && let Some(b) = self.items.get(id).cloned()
+        {
+            let targets: Vec<String> = self.edges.iter().filter(|e| e.kind == "implements" && e.from == id).map(|e| e.to.clone()).collect();
+            for t in targets {
+                if let Some(it) = self.items.get_mut(&t) {
+                    it.merged_gone.push(Gone { branch: id.to_string(), at: b.merged_at.clone() });
+                    it.verdicts.extend(b.verdicts.iter().cloned());
+                }
+            }
+        }
         self.items.remove(id);
         self.touches.remove(id);
         self.merged.remove(id);
@@ -161,6 +216,7 @@ impl Graph {
     /// Apply one event through every deriver.
     pub fn apply(&mut self, e: &Event, derivers: &[Box<dyn Deriver>]) {
         let first_time = self.seen.insert(e.id.clone());
+        self.seq += 1;
         for d in derivers {
             d.apply(e, first_time, self);
         }
@@ -174,29 +230,50 @@ pub trait Deriver: Send + Sync {
 /// Phrases that ask for a review even without an @mention.
 const REVIEW_ASKS: &[&str] = &["please review", "please re-review", "ready for review", "up for review", "for your review", "fixed: re-review", "design for review"];
 
+/// `p` occurs in `s` as whole words: "review" matches "re-review" but not "preview" or "reviewers".
+fn has_phrase(s: &str, p: &str) -> bool {
+    s.match_indices(p).any(|(i, _)| {
+        let before = s[..i].chars().next_back().is_none_or(|c| !c.is_alphanumeric());
+        let after = s[i + p.len()..].chars().next().is_none_or(|c| !c.is_alphanumeric());
+        before && after
+    })
+}
+
+/// A message that reports a verdict (a line starting `verdict `) answers a review, never asks one.
+fn reports_verdict(text: &str) -> bool {
+    text.lines().any(|l| l.trim_start().trim_start_matches(['-', '*', ' ']).to_ascii_lowercase().starts_with("verdict "))
+}
+
 /// Messages create items for the ids they mention and record a step on each.
 pub struct ItemDeriver;
 impl Deriver for ItemDeriver {
     fn apply(&self, e: &Event, _first: bool, g: &mut Graph) {
-        let Body::Message { items, mentions, .. } = &e.body else { return };
+        let Body::Message { items, mentions, detail, .. } = &e.body else { return };
         let summary = e.summary();
         // "@codex please review P0a" asks for a review of every item it names.
         let mut of: Vec<String> = mentions.iter().filter(|m| **m != e.from).cloned().collect();
         // A message that reports a verdict is an answer, not a request. Posts files often ask
         // without an @mention ("A1-A4 ready for review"): that request goes to the other agent.
         let lower = summary.to_ascii_lowercase();
-        let phrased = REVIEW_ASKS.iter().any(|p| lower.contains(p));
-        let asks_review = !lower.contains("verdict") && ((!of.is_empty() && lower.contains("review")) || phrased);
+        let phrased = REVIEW_ASKS.iter().any(|p| has_phrase(&lower, p));
+        let answer = reports_verdict(&summary) || detail.as_deref().is_some_and(reports_verdict);
+        let asks_review = !answer && ((!of.is_empty() && has_phrase(&lower, "review")) || phrased);
         if asks_review && of.is_empty() {
             of.push("both".into());
         }
+        let seq = g.seq;
         for id in items {
             let it = g.item(id, &e.at, &e.from);
-            if it.title.is_empty() || summary.contains(id.as_str()) {
+            // A definition wins and sticks; until one arrives, the latest message naming the id.
+            let def = if it.defined { None } else { definition(&summary, id).or_else(|| detail.as_deref().and_then(|d| definition(d, id))) };
+            if let Some(d) = def {
+                it.title = d;
+                it.defined = true;
+            } else if !it.defined && (it.title.is_empty() || summary.contains(id.as_str())) {
                 it.title = clip(&summary, 90);
             }
             if asks_review && it.review_asked.as_ref().is_none_or(|r| r.at <= e.at) {
-                it.review_asked = Some(ReviewAsk { at: e.at.clone(), by: e.from.clone(), of: of.clone() });
+                it.review_asked = Some(ReviewAsk { at: e.at.clone(), seq, by: e.from.clone(), of: of.clone() });
             }
             g.step(id, e, summary.clone());
             g.edge(&e.from, id, "touched");
@@ -211,6 +288,7 @@ impl Deriver for ClaimDeriver {
         let Body::Claim { item } = &e.body else { return };
         let it = g.item(item, &e.at, &e.from);
         it.owner = e.from.clone();
+        it.claimed_by = Some(e.from.clone());
         if it.state == "open" {
             it.state = "claimed".into();
         }
@@ -230,20 +308,28 @@ impl Deriver for ReviewDeriver {
             "fail" | "blocked" => "blocked",
             _ => "review",
         };
+        let seq = g.seq;
         let it = g.item(item, &e.at, &e.from);
-        if e.at.as_str() >= it.last.as_str() || matches!(it.state.as_str(), "open" | "claimed" | "branch") {
+        let newest = it.verdicts.iter().all(|v| (v.at.as_str(), v.seq) < (e.at.as_str(), seq));
+        if newest {
             it.state = state.into();
         }
-        if e.at > it.verdict_at {
-            it.verdict_at = e.at.clone();
+        if !it.verdicts.iter().any(|v| v.at == e.at && v.by == e.from && v.outcome == state) {
+            it.verdicts.push(Verdict { at: e.at.clone(), seq, by: e.from.clone(), outcome: state.into(), on: item.clone() });
+            if it.verdicts.len() > VERDICTS_MAX {
+                it.verdicts.remove(0);
+            }
         }
         g.step(item, e, format!("{} review: {state}", e.from));
         g.edge(&e.from, item, &format!("review:{state}"));
-        // A verdict on a branch carries to the items that branch implements (rare event, O(E)).
-        if state == "pass" {
+        // A newest pass on a branch carries to the items it implements, unless one of them has a
+        // later verdict of its own (rare event, O(E)).
+        if state == "pass" && newest {
             let targets: Vec<String> = g.edges.iter().filter(|x| x.kind == "implements" && &x.from == item).map(|x| x.to.clone()).collect();
             for t in targets {
-                inherit_pass(g, &t);
+                if g.items.get(&t).is_some_and(|it| it.verdicts.iter().all(|v| (v.at.as_str(), v.seq) < (e.at.as_str(), seq))) {
+                    inherit_pass(g, &t);
+                }
             }
         }
     }
@@ -302,6 +388,11 @@ impl Deriver for BranchDeriver {
         let owner = branch.split('/').next().unwrap_or("").to_string();
         let it = g.item(branch, &e.at, &owner);
         it.title = clip(subject, 90);
+        if !*merged {
+            it.merged_at.clear();
+        } else if it.merged_at.is_empty() {
+            it.merged_at = e.at.clone();
+        }
         if it.state == "open" {
             it.state = "branch".into(); // a reviewed branch keeps its verdict colour
         }

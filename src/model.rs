@@ -196,6 +196,81 @@ pub fn split_reply(text: &str) -> Option<(String, Option<String>)> {
     Some((summary, detail))
 }
 
+/// What a message says an item *is*, for a readable title instead of a bare id. Recognizes
+/// `XF32 — Limit the clean claim`, `P0a: hook trigger matrix`, `**XF22.** Each CLI run loses…`
+/// and `P0b (a separately approved staged redeploy)`. None when the text only mentions the id.
+/// O(n) per id: one scan for its occurrences.
+pub fn definition(text: &str, id: &str) -> Option<String> {
+    let mut from = 0;
+    while let Some(k) = text[from..].find(id) {
+        let (s, e) = (from + k, from + k + id.len());
+        from = e;
+        let before = text[..s].chars().next_back();
+        let rest = &text[e..];
+        let mut after = rest.chars();
+        let next = after.next();
+        // A whole id: not inside a word, and not a prefix of a longer id (P1 in P1.2, XF2 in XF29).
+        let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        if before.is_some_and(|c| word(c) || c == '-' || c == '/') || next.is_some_and(word) || (next == Some('.') && after.next().is_some_and(|c| c.is_ascii_digit())) {
+            continue;
+        }
+        let bold = text[..s].ends_with("**");
+        if let Some(d) = defined_by(rest, bold) {
+            return Some(d);
+        }
+    }
+    None
+}
+
+fn defined_by(rest: &str, bold: bool) -> Option<String> {
+    let r = rest.trim_start_matches('*').trim_start();
+    for sep in ["\u{2014}", "\u{2013}", ":", "- "] {
+        if let Some(x) = r.strip_prefix(sep) {
+            return title_text(x);
+        }
+    }
+    if let Some(x) = r.strip_prefix('(') {
+        return x.split(')').next().and_then(title_text);
+    }
+    if bold {
+        // `**XF22.** Each CLI run …`: the sentence after the bold id, past an optional `(file)`.
+        let x = rest.strip_prefix('.').unwrap_or(rest).strip_prefix("**")?.trim_start();
+        let x = match x.strip_prefix('(') {
+            Some(p) => p.split_once(')').map_or("", |(_, tail)| tail),
+            None => x,
+        };
+        return title_text(x.trim_start().trim_start_matches(':'));
+    }
+    None
+}
+
+/// The leading phrase of `x`, cleaned of markdown, if it reads as words (not code or hashes).
+fn title_text(x: &str) -> Option<String> {
+    // A leading bullet or dash ("XF28: - All file I/O …") is punctuation, not title.
+    let x = x.trim_start().trim_start_matches(['-', '*', '\u{2013}', '\u{2014}', ' ']);
+    let end = ["**", "\n", ". ", "; ", " \u{2014} "].iter().filter_map(|m| x.find(m)).min().unwrap_or(x.len());
+    let t: String = x[..end].chars().filter(|c| *c != '`' && *c != '*').collect();
+    let t = t.trim().trim_end_matches(['.', ':', ',']).trim();
+    let words = t.split_whitespace().filter(|w| w.chars().all(|c| c.is_alphabetic() || "'-,".contains(c)) && w.chars().any(char::is_alphabetic)).count();
+    if words < 3 || t.len() < 10 {
+        return None;
+    }
+    let mut out: String = t.chars().take(80).collect();
+    if t.chars().count() > 80 {
+        if let Some(cut) = out.rfind(' ') {
+            out.truncate(cut);
+        }
+        out.push('…');
+    }
+    // Sentence case, unless the first word is a name from code (artifact_dir.mjs, hasOwn).
+    let first = out.split_whitespace().next().unwrap_or("");
+    if !first.chars().all(char::is_alphabetic) || first.chars().skip(1).any(char::is_uppercase) {
+        return Some(out);
+    }
+    let mut c = out.chars();
+    Some(c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default())
+}
+
 /// Work-item ids in free text: `P0a`, `P1`, `XF29`, `H3`, `A3`, `L5`, `item 16`, `#tag`.
 /// One pass over the bytes, O(n).
 pub fn item_ids(text: &str) -> Vec<String> {
@@ -250,6 +325,21 @@ fn is_code_id(w: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn definitions_give_items_readable_titles() {
+        let d = |t: &str, id: &str| definition(t, id);
+        assert_eq!(d("- **XF32 \u{2014} Limit the clean claim to the sources checked** (`hook-drift.mjs:4`)", "XF32").as_deref(), Some("Limit the clean claim to the sources checked"));
+        assert_eq!(d("P0 splits into P0a (an agreed per-surface trigger matrix plus a read-only drift receipt) and P0b (a separately approved staged redeploy with rollback).", "P0b").as_deref(), Some("A separately approved staged redeploy with rollback"));
+        assert_eq!(d("**XF22.** Each CLI run loses its failure log when the hook exits early. More text.", "XF22").as_deref(), Some("Each CLI run loses its failure log when the hook exits early"));
+        // Mentions, hashes, code and longer ids are not definitions.
+        assert_eq!(d("P0a (d44201ba) is merged", "P0a"), None);
+        assert_eq!(d("**A3.** `_meta/tools/artifact_dir.mjs <project|os> <task>`:", "A3"), None);
+        assert_eq!(d("**P1.2** capability routing for metered models", "P1"), None);
+        assert_eq!(d("XF29 is still waiting on Codex", "XF29"), None);
+        assert_eq!(d("XF28: - All file I/O goes through io, so a test can stub it", "XF28").as_deref(), Some("All file I/O goes through io, so a test can stub it"));
+        assert_eq!(d("XF2 vs XF29: two separate things here", "XF2").as_deref(), None);
+    }
 
     #[test]
     fn reply_splits_into_bubble_and_detail() {

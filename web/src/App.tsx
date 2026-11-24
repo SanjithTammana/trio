@@ -213,11 +213,13 @@ function PanelBody({ snap, panel, me, go, openMessage }: {
   const max = Math.max(...ts.map((t) => t.lines), 1);
   const hotParts = new Set([...components(touches, snap.graph.items.filter((x) => x.kind === 'branch' && !merged.has(x.id)).map((x) => x.id)).values()].filter((c) => c.hot).map((c) => c.part));
   const state = isBranch && merged.has(n.id) ? 'merged' : n.state;
+  const titled = n.kind === 'item' && !!n.summary;
   return (
     <>
-      <div className="eyebrow"><State state={state} />{STATE_LABEL[state] ?? state} · <Who who={n.lane} me={me} />{nameOf(n.lane, me)} · {n.touches} update{n.touches === 1 ? '' : 's'}</div>
-      <h3><span className="mono">{n.id}</span></h3>
-      {n.summary && <p className="lede">{n.summary}</p>}
+      {/* An item leads with what it is; its id (XF29, P0a) is a tag. A branch name is its title. */}
+      <div className="eyebrow">{titled && <><span className="id-tag mono">{n.id}</span>{' '}</>}<State state={state} />{STATE_LABEL[state] ?? state} · <Who who={n.lane} me={me} />{nameOf(n.lane, me)} · {n.touches} update{n.touches === 1 ? '' : 's'}</div>
+      <h3>{titled ? n.summary : <span className="mono">{n.id}</span>}</h3>
+      {!titled && n.summary && <p className="lede">{n.summary}</p>}
       {n.work && <p className="work-story">{n.work.story}</p>}
       {linked.length > 0 && (
         <>

@@ -275,6 +275,9 @@ function WorkLens({ snap, scope, explain, selected, onSelect, onHover }: { snap:
     return out;
   }, [snap.graph.items, scope, me]);
   const total = [...byLane.values()].reduce((a, l) => a + l.length, 0);
+  if (total === 0 && snap.graph.items.some((n) => n.kind === 'item') && !snap.graph.items.some((n) => n.work)) {
+    return <p className="empty">This server predates the Work lens. Update Trio, or use the Code lens.</p>;
+  }
   if (total === 0) {
     return <p className="empty">No work yet. When a message names an item (P0a, XF29), it shows here in its stage: asked, in progress, in review, changes or done.</p>;
   }
@@ -293,9 +296,9 @@ function WorkLens({ snap, scope, explain, selected, onSelect, onHover }: { snap:
                 <button key={n.id} className={`card ${w.waiting_on === me ? 'you' : ''} ${selected === key ? 'on' : ''}`} data-morph={key} title={w.story}
                   onClick={(e) => onSelect({ kind: 'item', id: n.id }, e.currentTarget, e.detail > 0)}
                   onMouseEnter={() => onHover(key)} onMouseLeave={() => onHover(null)} onFocus={() => onHover(key)} onBlur={() => onHover(null)}>
-                  <span className="card-t"><b className="mono">{n.id}</b> {n.summary}</span>
+                  <span className="card-t">{n.summary || <b className="mono">{n.id}</b>}</span>
                   <span className="card-m">
-                    <span>{w.waiting_on ? <><Who who={w.waiting_on} me={me} />{w.waiting_on === me ? 'waiting on you' : nameOf(w.waiting_on, me)}</> : w.lane === 'done' ? <><State state="pass" />done</> : <><State state={n.state} />{n.state}</>}</span>
+                    <span>{n.summary && <span className="id-tag mono">{n.id}</span>}{w.waiting_on ? <><Who who={w.waiting_on} me={me} />{w.waiting_on === me ? 'waiting on you' : nameOf(w.waiting_on, me)}</> : w.lane === 'done' ? <><State state="pass" />done</> : <><State state={n.state} />{n.state}</>}</span>
                     <span>{timeLabel(n.last)}</span>
                   </span>
                 </button>
@@ -317,7 +320,9 @@ function TimeStrip({ snap, nodes, lit, tall = false, explain = false }: { snap: 
   const ticks = nodes.flatMap((n) => n.steps.map((s) => ({ t: ms(s.at), row: Math.max(0, rows.indexOf(s.who)), on: lit.has(`i:${n.id}`) || lit.has(`b:${n.id}`), key: `${n.id}-${s.event}` })));
   const ts = ticks.map((x) => x.t).filter(Boolean);
   if (ts.length < 2) return null;
-  const lo = Math.min(...ts), hi = Math.max(...ts);
+  // A loop, not Math.min(...ts): spreading a large room's ticks overflows the argument limit.
+  let lo = Infinity, hi = -Infinity;
+  for (const t of ts) { if (t < lo) lo = t; if (t > hi) hi = t; }
   const RH = tall ? 40 : 14;
   const W = 1000, H = rows.length * RH;
   const x = (t: number) => (hi === lo ? W / 2 : ((t - lo) / (hi - lo)) * W);

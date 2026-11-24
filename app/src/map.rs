@@ -532,7 +532,8 @@ fn italic(size: f32) -> egui::FontId {
     theme::sans(size)
 }
 
-/// Lens switch, ported from Astryx's SegmentedControl (MIT, Meta; see web/src/astryx/LICENSE):
+/// Lens switch, ported from Astryx's SegmentedControl (MIT, Copyright (c) 2026 Meta Platforms, Inc.;
+/// see THIRD_PARTY_NOTICES.md):
 /// a radio group whose selection indicator slides between segments, Arrow keys / Home / End move
 /// the selection while a segment has focus, and the ends wrap.
 fn segmented(ui: &mut egui::Ui, p: &egui::Painter, at: Pos2, lens: Lens, t: &Tokens) -> (Rect, Option<Lens>) {
@@ -603,7 +604,11 @@ fn segmented(ui: &mut egui::Ui, p: &egui::Painter, at: Pos2, lens: Lens, t: &Tok
         });
         if let Some(to) = to {
             out = Some(LENSES[to].0);
-            ui.memory_mut(|m| m.request_focus(ids[to]));
+            // Cancel egui's own arrow navigation for this pass, or it can move focus elsewhere.
+            ui.memory_mut(|m| {
+                m.move_focus(egui::FocusDirection::None);
+                m.request_focus(ids[to]);
+            });
         }
     }
     (outer, out)
@@ -640,9 +645,13 @@ fn work(ui: &mut egui::Ui, body: Rect, app: &mut TrioApp, snap: &Snapshot, t: &T
                 list.iter()
                     .take(if scope == Scope::All { usize::MAX } else { LANE_CAP })
                     .map(|n| {
+                        // What it is leads; the id (XF29, P0a) is a tag in the meta row.
                         let mut job = egui::text::LayoutJob::default();
-                        job.append(&n.id, 0.0, paint::fmt(theme::mono(12.0), t.ink));
-                        job.append(&n.summary, 6.0, paint::fmt(theme::sans(12.5), t.ink));
+                        if n.summary.is_empty() {
+                            job.append(&n.id, 0.0, paint::fmt(theme::mono(12.0), t.ink));
+                        } else {
+                            job.append(&n.summary, 0.0, paint::fmt(theme::sans(12.5), t.ink));
+                        }
                         job.wrap.max_width = inner;
                         job.wrap.max_rows = 2;
                         job.wrap.overflow_character = Some('…');
@@ -690,7 +699,15 @@ fn work(ui: &mut egui::Ui, body: Rect, app: &mut TrioApp, snap: &Snapshot, t: &T
                 p.galley(pos2(rect.left() + 10.0, rect.top() + 8.0), g.clone(), t.ink);
                 // Meta row: who it waits on (or its state), and when it last moved.
                 let my = rect.bottom() - 8.0 - 8.0;
-                let mark = Rect::from_min_size(pos2(rect.left() + 10.0, my - 5.0), vec2(10.0, 10.0));
+                let mut mx = rect.left() + 10.0;
+                if !n.summary.is_empty() {
+                    let ig = paint::line(ui, &n.id, theme::mono(10.5), t.ink3, 90.0);
+                    let tag = Rect::from_min_size(pos2(mx, my - ig.size().y / 2.0 - 1.0), ig.size() + vec2(8.0, 2.0));
+                    p.rect_stroke(tag, 4.0, Stroke::new(1.0, t.line), StrokeKind::Inside);
+                    p.galley(tag.min + vec2(4.0, 1.0), ig, t.ink3);
+                    mx = tag.right() + 6.0;
+                }
+                let mark = Rect::from_min_size(pos2(mx, my - 5.0), vec2(10.0, 10.0));
                 let tg = paint::line(ui, &time_label(&n.last, day), theme::sans(11.5), t.ink3, 120.0);
                 let meta_c = if you { t.accent } else { t.ink3 };
                 let text = match (&w.waiting_on, w.lane.as_str()) {
@@ -707,7 +724,7 @@ fn work(ui: &mut egui::Ui, body: Rect, app: &mut TrioApp, snap: &Snapshot, t: &T
                         n.state.clone()
                     }
                 };
-                let mg = paint::line(ui, &text, theme::sans(11.5), meta_c, inner - tg.size().x - 24.0);
+                let mg = paint::line(ui, &text, theme::sans(11.5), meta_c, (rect.right() - 10.0 - tg.size().x - 8.0 - (mark.right() + 5.0)).max(20.0));
                 p.galley(pos2(mark.right() + 5.0, my - mg.size().y / 2.0), mg, meta_c);
                 p.galley(pos2(rect.right() - 10.0 - tg.size().x, my - tg.size().y / 2.0), tg, t.ink3);
                 paint::focus_ring(&p, &hit.resp, t, 8.0);
@@ -731,7 +748,8 @@ fn work(ui: &mut egui::Ui, body: Rect, app: &mut TrioApp, snap: &Snapshot, t: &T
 /// Items per Work lane, filtered by scope (old done and old asked items leave In flight) and
 /// sorted with cards waiting on `me` first, then newest. O(n log n).
 fn work_lanes<'a>(all: &'a [Node], me: &str, scope: Scope) -> Vec<Vec<&'a Node>> {
-    let newest = all.iter().map(|n| ms(&n.last)).max().unwrap_or(0);
+    // Age is measured from the newest item, as on the web (branches do not count).
+    let newest = all.iter().filter(|n| n.kind == "item").map(|n| ms(&n.last)).max().unwrap_or(0);
     let mut lanes: Vec<Vec<&Node>> = vec![Vec::new(); WORK_LANES.len()];
     for n in all.iter().filter(|n| n.kind == "item") {
         let Some(w) = &n.work else { continue };
