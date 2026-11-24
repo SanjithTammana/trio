@@ -70,7 +70,13 @@ pub struct Room {
     live: bool,
     /// Branch tips for the map, read off the room lock (None without `repo`).
     git: Option<crate::gitwatch::GitWatch>,
+    /// The first git listing was compared with the replayed ledger.
+    git_listed: bool,
+    /// Per source (then git): how many events it has yielded, for stable positions.
+    counts: Vec<u64>,
     trio_exe: String,
+    /// When the human was last here, for the catch-up (`seen.rs`).
+    pub seen: Option<crate::seen::Seen>,
 }
 
 #[derive(Serialize)]
@@ -99,7 +105,7 @@ impl Room {
         let ledger = dir.join("room.jsonl");
         let mut sources: Vec<Box<dyn Source + Send>> = Vec::new();
         for imp in &cfg.import {
-            sources.push(Box::new(PostsFile::new(root.join(&imp.file), &imp.from)));
+            sources.push(Box::new(PostsFile::new(root.join(&imp.file), &imp.from, &human(&cfg))));
         }
         sources.push(Box::new(RoomLedger::new(ledger.clone())));
         let hues = [("claude", "clay"), ("codex", "moss")];
@@ -113,6 +119,7 @@ impl Room {
             .collect();
         let trio_exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "trio".into());
         let git = cfg.repo.clone().map(|r| crate::gitwatch::GitWatch::start(r, cfg.base.clone()));
+        let seen = crate::seen::load(&root);
         Ok(Self {
             root,
             ledger,
@@ -129,8 +136,25 @@ impl Room {
             hop: 0,
             live: false,
             git,
+            git_listed: false,
+            counts: Vec::new(),
             trio_exe,
+            seen,
         })
+    }
+
+    pub fn events(&self) -> &[Event] {
+        &self.events
+    }
+
+    /// Move the seen mark to now, with every item's current lane, and publish the change.
+    pub fn mark_seen(&mut self) {
+        let s = crate::seen::mark(&now(), &crate::work::all(&self.graph, &self.me()));
+        if let Err(e) = crate::seen::save(&self.root, &s) {
+            eprintln!("trio: could not save the seen mark: {e}");
+        }
+        self.seen = Some(s);
+        self.rev += 1;
     }
 
     /// The human's handle: `me` from room.toml when usable, else the OS user name.
@@ -170,23 +194,53 @@ impl Room {
         changed
     }
 
+    /// Stable position for the next event from source `i` (git is `sources.len()`): sources in
+    /// config order, then each source's own order. Same-minute events from different sources
+    /// therefore order the same way live and on replay; within a file, file order decides.
+    fn position(&mut self, i: usize) -> u64 {
+        if self.counts.len() <= i {
+            self.counts.resize(i + 1, 0);
+        }
+        self.counts[i] += 1;
+        ((i as u64 + 1) << 40) | self.counts[i]
+    }
+
     /// Poll every source, apply new events and route new ledger messages.
     fn ingest(&mut self) -> bool {
-        let mut fresh: Vec<(Event, bool)> = Vec::new();
-        for i in 0..self.sources.len() {
-            let from_ledger = i == self.sources.len() - 1;
-            if let Ok(evs) = self.sources[i].poll() {
-                fresh.extend(evs.into_iter().map(|e| (e, from_ledger)));
+        let mut fresh: Vec<(Event, bool, u64)> = Vec::new();
+        let n = self.sources.len();
+        for i in 0..n {
+            self.poll_source(i, &mut fresh);
+        }
+        let polls = self.git.as_mut().map(|g| g.take()).unwrap_or_default();
+        for p in polls {
+            for e in p.tips {
+                let pos = self.position(n);
+                fresh.push((e, false, pos));
+            }
+            let mut durable = p.durable;
+            if !self.git_listed {
+                // Branches the ledger says merged but git no longer lists were deleted while the
+                // room was closed: retire them, so their items keep Done through the archive.
+                self.git_listed = true;
+                for b in self.graph.merged.iter().filter(|b| !p.listed.contains(b)) {
+                    durable.push(crate::gitwatch::gone_event(b, ""));
+                }
+            }
+            if !durable.is_empty() {
+                for e in &durable {
+                    if let Err(err) = append(&self.ledger, e) {
+                        eprintln!("trio: could not record {}: {err}", e.id);
+                    }
+                }
+                self.poll_source(n - 1, &mut fresh);
             }
         }
-        if let Some(g) = &mut self.git {
-            fresh.extend(g.take().into_iter().map(|e| (e, false)));
-        }
         let changed = !fresh.is_empty();
-        fresh.sort_by(|a, b| a.0.at.cmp(&b.0.at));
-        for (e, from_ledger) in fresh {
+        fresh.sort_by(|a, b| a.0.at.cmp(&b.0.at).then(a.2.cmp(&b.2)));
+        for (e, from_ledger, pos) in fresh {
             let route = self.live && from_ledger && matches!(e.body, Body::Message { .. }) && !self.index.contains_key(&e.id);
-            self.apply(e.clone());
+            self.apply(e.clone(), pos);
             if route {
                 self.route(&e);
             }
@@ -194,8 +248,18 @@ impl Room {
         changed
     }
 
-    fn apply(&mut self, e: Event) {
-        self.graph.apply(&e, &self.derivers);
+    fn poll_source(&mut self, i: usize, fresh: &mut Vec<(Event, bool, u64)>) {
+        let from_ledger = i == self.sources.len() - 1;
+        if let Ok(evs) = self.sources[i].poll() {
+            for e in evs {
+                let pos = self.position(i);
+                fresh.push((e, from_ledger, pos));
+            }
+        }
+    }
+
+    fn apply(&mut self, e: Event, pos: u64) {
+        self.graph.apply_at(&e, Some(pos), &self.derivers);
         if let Some(&i) = self.index.get(&e.id) {
             self.events[i] = e;
             return;
@@ -269,7 +333,8 @@ impl Room {
                 continue;
             }
             let guard = Guard { paused: self.cfg.paused, hop: self.hop, budget: self.cfg.hop_budget, from_human: e.from == me };
-            let prompt = wake_prompt(&t, &me, &room, &recent, detail);
+            let since = crate::seen::digest(&self.events, &t);
+            let prompt = wake_prompt(&t, &me, &room, &recent, &since, detail);
             let decision = match self.agents.get_mut(&t) {
                 Some(a) => a.wake_if_allowed(&prompt, &guard),
                 None => WakeDecision::Disabled,

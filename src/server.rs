@@ -103,6 +103,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/say", post(say))
         .route("/api/pause", post(pause))
         .route("/api/poke", post(poke))
+        .route("/api/seen", post(seen))
         .fallback(get(asset))
         .layer(middleware::from_fn_with_state(app.clone(), guard))
         .with_state(app)
@@ -158,6 +159,12 @@ fn snapshot(room: &Room, token: &str, room_id: &str) -> serde_json::Value {
         obj.extend(chat);
     }
     obj.insert("graph".into(), GraphView.snapshot(room));
+    if let Some(seen) = &room.seen {
+        let work = crate::work::all(&room.graph, &room.me());
+        if let Some(c) = crate::seen::catchup(seen, &room.graph, &work, room.events(), &room.me()) {
+            obj.insert("catchup".into(), serde_json::json!(c));
+        }
+    }
     v
 }
 
@@ -224,6 +231,25 @@ async fn pause(State(app): State<Arc<App>>, headers: HeaderMap, Json(r): Json<Pa
     };
     let _ = app.tx.send(rev);
     app.wake.notify_one();
+    StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(Deserialize)]
+struct SeenReq {
+    token: String,
+}
+
+/// "Dismiss" on the catch-up: move the seen mark to now.
+async fn seen(State(app): State<Arc<App>>, headers: HeaderMap, Json(r): Json<SeenReq>) -> Response {
+    if r.token != app.token || !same_origin(&app, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let rev = {
+        let mut room = app.room.lock().expect("room lock");
+        room.mark_seen();
+        room.rev
+    };
+    let _ = app.tx.send(rev);
     StatusCode::NO_CONTENT.into_response()
 }
 

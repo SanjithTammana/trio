@@ -331,7 +331,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut TrioApp, snap: &Snapshot, t: &Tokens, d
     let strip_h = strip(ui, area, &strip_nodes, &lit, snap, t, day, false, explain);
     let body = Rect::from_min_max(pos2(area.left(), below), pos2(area.right(), area.bottom() - strip_h));
     if lens == Lens::Work {
-        let open = work(ui, body, app, snap, t, day, explain, selected, &mut hover_now);
+        let (used, caught) = match &snap.catchup {
+            Some(c) => catchup(ui, body, app, snap, c, t, day),
+            None => (0.0, None),
+        };
+        let body = Rect::from_min_max(pos2(body.left(), body.top() + used), body.max);
+        let open = work(ui, body, app, snap, t, day, explain, selected, &mut hover_now).or(caught);
         return finish(ui, app, hover_now, open);
     }
 
@@ -708,7 +713,7 @@ fn work(ui: &mut egui::Ui, body: Rect, app: &mut TrioApp, snap: &Snapshot, t: &T
                     mx = tag.right() + 6.0;
                 }
                 let mark = Rect::from_min_size(pos2(mx, my - 5.0), vec2(10.0, 10.0));
-                let tg = paint::line(ui, &time_label(&n.last, day), theme::sans(11.5), t.ink3, 120.0);
+                let tg = paint::line(ui, &time_label(moved(n), day), theme::sans(11.5), t.ink3, 120.0);
                 let meta_c = if you { t.accent } else { t.ink3 };
                 let text = match (&w.waiting_on, w.lane.as_str()) {
                     (Some(who), _) => {
@@ -745,6 +750,79 @@ fn work(ui: &mut egui::Ui, body: Rect, app: &mut TrioApp, snap: &Snapshot, t: &T
     open
 }
 
+/// "Since you left": what moved while the human was away, above the Work lanes. Returns the
+/// height used and a picked item. Dismiss moves the room's seen mark to now.
+fn catchup(ui: &mut egui::Ui, body: Rect, app: &mut TrioApp, snap: &Snapshot, c: &crate::model::Catchup, t: &Tokens, day: &str) -> (f32, Option<Open>) {
+    const ROW: f32 = 24.0;
+    let w = body.width() - 32.0;
+    let cols = ((w / 300.0).floor() as usize).clamp(1, 3);
+    let rows = c.moved.len().div_ceil(cols) + usize::from(c.more > 0);
+    let h = 12.0 + 22.0 + if rows > 0 { 6.0 + rows as f32 * ROW } else { 0.0 } + 10.0;
+    let rect = Rect::from_min_size(pos2(body.left() + 16.0, body.top() + 12.0), vec2(w, h));
+    let p = ui.painter().clone();
+    p.rect_filled(rect, 8.0, t.sunk);
+    p.rect_stroke(rect, 8.0, Stroke::new(1.0, t.line2), StrokeKind::Inside);
+    let mut x = rect.left() + 12.0;
+    let hy = rect.top() + 12.0 + 11.0;
+    let since = paint::line(ui, &format!("Since {}", time_label(&c.since, day)), theme::bold(12.5), t.ink, 200.0);
+    p.galley(pos2(x, hy - since.size().y / 2.0), since.clone(), t.ink);
+    x += since.size().x + 10.0;
+    // Dismiss, right-aligned; its label is its accessible name.
+    let dg = paint::line(ui, "Dismiss", theme::sans(12.0), t.ink3, 80.0);
+    let dr = Rect::from_center_size(pos2(rect.right() - 12.0 - (dg.size().x + 20.0) / 2.0, hy), vec2(dg.size().x + 20.0, 22.0));
+    let facts = paint::line(ui, &c.facts(), theme::sans(12.5), t.ink2, (dr.left() - 10.0 - x).max(20.0));
+    p.galley(pos2(x, hy - facts.size().y / 2.0), facts, t.ink2);
+    let dh = Hit::new(ui, dr, Id::unique("catchup-dismiss"), "Dismiss");
+    p.rect_stroke(dr, 11.0, Stroke::new(1.0, if dh.hot() { t.line2 } else { t.line }), StrokeKind::Inside);
+    p.galley(dr.center() - dg.size() / 2.0, dg, if dh.hot() { t.ink } else { t.ink3 });
+    paint::focus_ring(&p, &dh.resp, t, 11.0);
+    if dh.clicked() {
+        let client = app.client().clone();
+        let token = snap.token.clone();
+        crate::net::background(move || client.seen(&token), |_| ());
+    }
+    let lane_title = |l: &str| WORK_LANES.iter().find(|x| x.0 == l).map_or(l.to_string(), |x| x.1.to_string());
+    let cw = (w - 24.0 - (cols - 1) as f32 * 16.0) / cols as f32;
+    let top = rect.top() + 12.0 + 22.0 + 6.0;
+    let mut open = None;
+    for (i, m) in c.moved.iter().enumerate() {
+        let r = Rect::from_min_size(pos2(rect.left() + 12.0 + (i % cols) as f32 * (cw + 16.0), top + (i / cols) as f32 * ROW), vec2(cw, ROW - 2.0));
+        let label = format!("{} {}", m.id, if m.title.is_empty() { &m.id } else { &m.title });
+        let hit = Hit::new(ui, r, Id::unique(("catchup", &m.id)), &label);
+        if hit.hot() {
+            p.rect_filled(r, 6.0, t.surface);
+        }
+        let mut mx = r.left() + 4.0;
+        if m.yours {
+            p.rect_filled(Rect::from_min_size(r.min, vec2(3.0, r.height())), 2.0, t.accent);
+            mx += 4.0;
+        }
+        let cy = r.center().y;
+        let ig = paint::line(ui, &m.id, theme::mono(10.5), t.ink3, 90.0);
+        let tag = Rect::from_min_size(pos2(mx, cy - ig.size().y / 2.0 - 1.0), ig.size() + vec2(8.0, 2.0));
+        p.rect_stroke(tag, 4.0, Stroke::new(1.0, t.line), StrokeKind::Inside);
+        p.galley(tag.min + vec2(4.0, 1.0), ig, t.ink3);
+        let mv = match &m.from {
+            Some(f) => format!("{} \u{2192} {}", lane_title(f), lane_title(&m.to)),
+            None => format!("new \u{b7} {}", lane_title(&m.to)),
+        };
+        let mg = paint::line(ui, &mv, theme::sans(11.5), t.ink3, 160.0);
+        p.galley(pos2(r.right() - 4.0 - mg.size().x, cy - mg.size().y / 2.0), mg.clone(), t.ink3);
+        let tx = tag.right() + 8.0;
+        let tg = paint::line(ui, if m.title.is_empty() { &m.id } else { &m.title }, theme::sans(12.5), t.ink, (r.right() - 4.0 - mg.size().x - 8.0 - tx).max(20.0));
+        p.galley(pos2(tx, cy - tg.size().y / 2.0), tg, t.ink);
+        paint::focus_ring(&p, &hit.resp, t, 6.0);
+        if hit.clicked() {
+            open = Some(Open { panel: Panel::Pick(Pick::Item(m.id.clone())), from: r, pointer: hit.pointer() });
+        }
+    }
+    if c.more > 0 {
+        let g = paint::line(ui, &format!("+{} more", c.more), theme::sans(12.0), t.ink3, 120.0);
+        p.galley(pos2(rect.left() + 16.0, top + (rows - 1) as f32 * ROW + 4.0), g, t.ink3);
+    }
+    (12.0 + h, open)
+}
+
 /// Items per Work lane, filtered by scope (old done and old asked items leave In flight) and
 /// sorted with cards waiting on `me` first, then newest. O(n log n).
 fn work_lanes<'a>(all: &'a [Node], me: &str, scope: Scope) -> Vec<Vec<&'a Node>> {
@@ -754,7 +832,7 @@ fn work_lanes<'a>(all: &'a [Node], me: &str, scope: Scope) -> Vec<Vec<&'a Node>>
     for n in all.iter().filter(|n| n.kind == "item") {
         let Some(w) = &n.work else { continue };
         let Some(k) = WORK_LANES.iter().position(|l| l.0 == w.lane) else { continue };
-        let age = newest - ms(&n.last);
+        let age = newest - ms(moved(n));
         if scope == Scope::Active && ((w.lane == "done" && age > DONE_HOURS * 3_600_000) || (w.lane == "asked" && age > ACTIVE_HOURS * 3_600_000)) {
             continue;
         }
@@ -762,9 +840,14 @@ fn work_lanes<'a>(all: &'a [Node], me: &str, scope: Scope) -> Vec<Vec<&'a Node>>
     }
     let mine = |n: &Node| n.work.as_ref().and_then(|w| w.waiting_on.as_deref()) == Some(me);
     for l in &mut lanes {
-        l.sort_by(|a, b| mine(b).cmp(&mine(a)).then_with(|| b.last.cmp(&a.last)));
+        l.sort_by(|a, b| mine(b).cmp(&mine(a)).then_with(|| moved(b).cmp(moved(a))).then_with(|| a.id.cmp(&b.id)));
     }
     lanes
+}
+
+/// When a card last moved: its Work `last` (branch activity included), else the item's own.
+fn moved(n: &Node) -> &str {
+    n.work.as_ref().map(|w| w.last.as_str()).filter(|l| !l.is_empty()).unwrap_or(&n.last)
 }
 
 fn app_reduce(ctx: &egui::Context) -> bool {

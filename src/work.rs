@@ -16,6 +16,8 @@ pub struct Work {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waiting_on: Option<String>,
     pub story: String,
+    /// When the item or any branch implementing it last moved: what a card's age shows.
+    pub last: String,
 }
 
 /// Branches that implement each item, from the `implements` edges.
@@ -35,18 +37,19 @@ pub fn implementers(g: &Graph) -> HashMap<&str, Vec<&str>> {
 /// Events compare by (time, arrival), so same-minute posts keep their file order.
 pub fn work(it: &WorkItem, branches: &[&str], g: &Graph, me: &str) -> Work {
     let live: Vec<&WorkItem> = branches.iter().filter_map(|b| g.items.get(*b)).collect();
-    let verdict = std::iter::once(it).chain(live.iter().copied()).flat_map(|n| n.verdicts.iter()).max_by(|a, b| key(a).cmp(&key(b)));
-    let ask = it.review_asked.as_ref().filter(|r| verdict.is_none_or(|v| (r.at.as_str(), r.seq) > key(v)));
+    let verdict = std::iter::once(it).chain(live.iter().copied()).flat_map(|n| n.verdicts.iter()).max_by(|a, b| a.key().cmp(&b.key()));
+    let ask = it.review_asked.as_ref().filter(|r| verdict.is_none_or(|v| (r.at.as_str(), r.seq) > v.key()));
     let author = author(it, &live);
     let has_branch = !live.is_empty() || !it.merged_gone.is_empty();
     let all_merged = has_branch && live.iter().all(|b| g.merged.contains(&b.id));
-    let merged_at = live.iter().map(|b| b.merged_at.as_str()).chain(it.merged_gone.iter().map(|m| m.at.as_str())).max().unwrap_or("");
+    // The latest merge, by the same (minute, position) key as verdicts and requests.
+    let merged = live.iter().filter_map(|b| b.merged_at.as_ref()).chain(it.merged_gone.iter().map(|m| &m.merged)).max();
     let (lane, waiting_on) = if let Some(r) = ask {
         ("review", reviewer(r, author.as_deref()))
     } else if let Some(v) = verdict {
         match v.outcome.as_str() {
             "pass" => ("done", None),
-            _ if all_merged && merged_at > v.at.as_str() => ("done", None),
+            _ if all_merged && merged.is_some_and(|(at, s)| (at.as_str(), *s) > v.key()) => ("done", None),
             "changes" | "blocked" => ("changes", agent_of(&v.on).or(author.clone())),
             _ => ("review", None),
         }
@@ -59,11 +62,8 @@ pub fn work(it: &WorkItem, branches: &[&str], g: &Graph, me: &str) -> Work {
     } else {
         ("asked", None)
     };
-    Work { lane, story: story(it, &live, all_merged, ask, lane, waiting_on.as_deref(), me), waiting_on }
-}
-
-fn key(v: &Verdict) -> (&str, u64) {
-    (v.at.as_str(), v.seq)
+    let last = live.iter().map(|b| b.last.as_str()).chain(std::iter::once(it.last.as_str())).max().unwrap_or("").to_string();
+    Work { lane, story: story(it, &live, all_merged, ask, lane, waiting_on.as_deref(), me), waiting_on, last }
 }
 
 /// The agent a branch belongs to, from its prefix (`claude/hooks-p0a` -> claude).
@@ -130,8 +130,9 @@ fn story(it: &WorkItem, live: &[&WorkItem], all_merged: bool, ask: Option<&Revie
     }
     // A verdict naming a branch and its item arrives twice (one event per node): count it once.
     let mut verdicts: Vec<&Verdict> = std::iter::once(it).chain(live.iter().copied()).flat_map(|n| n.verdicts.iter()).collect();
-    verdicts.sort_by(|a, b| key(a).cmp(&key(b)));
-    verdicts.dedup_by(|a, b| a.at == b.at && a.by == b.by && a.outcome == b.outcome);
+    verdicts.sort_by(|a, b| a.key().cmp(&b.key()));
+    let mut lines = std::collections::HashSet::new();
+    verdicts.retain(|v| lines.insert(v.line.as_str()));
     if let Some(first) = verdicts.first() {
         let n = verdicts.len();
         let recent = &verdicts[n.saturating_sub(6)..];
@@ -347,9 +348,130 @@ mod tests {
         let mut g = Graph::default();
         g.apply(&ev("c1", "2026-11-23T09:00", "claude", commit("claude/x", "XF1 work", false, false)), &d);
         g.apply(&ev("c2", "2026-11-23T10:00", "claude", commit("claude/x", "XF1 work", true, false)), &d);
-        g.apply(&ev("c3", "2026-11-23T11:00", "claude", commit("claude/x", "XF1 work", true, true)), &d);
+        // The watcher's deletion event says merged: false; the graph remembers the merge.
+        g.apply(&ev("c3", "2026-11-23T11:00", "claude", commit("claude/x", "", false, true)), &d);
         let w = &all(&g, "sanjith")["XF1"];
         assert_eq!(w.lane, "done", "{}", w.story);
         assert!(w.story.contains("On branch claude/x, merged."), "{}", w.story);
+    }
+
+    fn post(file: &str, from: &str, text: &str) -> Vec<Event> {
+        use crate::source::Source;
+        let p = std::env::temp_dir().join(format!("trio-work-{}-{file}", std::process::id()));
+        std::fs::write(&p, text).unwrap();
+        let evs = crate::source::PostsFile::new(p.clone(), from, "sanjith").poll().unwrap();
+        std::fs::remove_file(p).ok();
+        evs
+    }
+
+    #[test]
+    fn a_growing_ask_post_keeps_its_place_after_a_same_minute_pass() {
+        let d = derivers();
+        let mut g = Graph::default();
+        let ask = ev("claude-posts.md@0", "2026-11-23T10:00", "claude", msg("@codex please review XF1", &["codex"], &["XF1"]));
+        g.apply(&ask, &d);
+        g.apply(&ev("codex-posts.md@0#1:XF1", "2026-11-23T10:00", "codex", verdict("XF1", "pass")), &d);
+        assert_eq!(all(&g, "sanjith")["XF1"].lane, "done");
+        // The ask post grows (same id): still the same request, still answered.
+        let grown = ev("claude-posts.md@0", "2026-11-23T10:00", "claude", msg("@codex please review XF1 (now with notes)", &["codex"], &["XF1"]));
+        g.apply(&grown, &d);
+        assert_eq!(all(&g, "sanjith")["XF1"].lane, "done");
+    }
+
+    #[test]
+    fn live_and_cold_replay_agree_across_two_imports() {
+        // Source 1 (claude-posts) asks, source 2 (codex-posts) passes, in the same minute.
+        let ask = ev("claude-posts.md@9", "2026-11-23T10:00", "claude", msg("@codex please re-review XF1", &["codex"], &["XF1"]));
+        let pass = ev("codex-posts.md@9#2:XF1", "2026-11-23T10:00", "codex", verdict("XF1", "pass"));
+        let (p_ask, p_pass) = ((1u64 << 40) | 1, (2u64 << 40) | 1);
+        let lane = |first: (&Event, u64), second: (&Event, u64)| {
+            let d = derivers();
+            let mut g = Graph::default();
+            g.apply_at(first.0, Some(first.1), &d);
+            g.apply_at(second.0, Some(second.1), &d);
+            all(&g, "sanjith")["XF1"].lane
+        };
+        let live = lane((&pass, p_pass), (&ask, p_ask));
+        let cold = lane((&ask, p_ask), (&pass, p_pass));
+        assert_eq!(live, cold, "arrival order must not decide");
+    }
+
+    #[test]
+    fn a_post_title_names_the_reviewer_and_a_fenced_example_is_not_an_answer() {
+        let d = derivers();
+        let mut g = Graph::default();
+        let text = "# Claude\n\n## 2026-11-23 10:00 @codex XF1 needs review\n\nThanks @claude for implementing it. Reply like:\n\n```\nverdict XF1: pass\n```\n";
+        for e in post("claude-posts.md", "claude", text) {
+            g.apply(&e, &d);
+        }
+        let w = &all(&g, "sanjith")["XF1"];
+        assert_eq!((w.lane, w.waiting_on.as_deref()), ("review", Some("codex")), "{}", w.story);
+        // The human's handle counts as a mention in imported posts too.
+        for e in post("codex-posts.md", "codex", "## 2026-11-23 11:00 @sanjith XF2 needs your review\n") {
+            g.apply(&e, &d);
+        }
+        assert_eq!(all(&g, "sanjith")["XF2"].waiting_on.as_deref(), Some("sanjith"));
+    }
+
+    #[test]
+    fn a_late_branch_link_never_overrides_a_newer_item_verdict() {
+        let d = derivers();
+        let mut g = Graph::default();
+        g.apply(&ev("v0", "2026-11-23T09:30", "codex", verdict("claude/x", "pass")), &d);
+        g.apply(&ev("v1", "2026-11-23T10:00", "codex", verdict("XF1", "review")), &d);
+        // Git links the branch to XF1 afterwards, then refreshes it.
+        g.apply(&ev("git:claude/x", "2026-11-23T10:30", "claude", commit("claude/x", "XF1 work", false, false)), &d);
+        g.apply(&ev("git:claude/x", "2026-11-23T10:40", "claude", commit("claude/x", "XF1 more", false, false)), &d);
+        assert_eq!(g.items["XF1"].state, "review", "exported state");
+        assert_eq!(all(&g, "sanjith")["XF1"].lane, "review");
+    }
+
+    #[test]
+    fn same_minute_verdicts_by_one_reviewer_all_count() {
+        let d = derivers();
+        let mut g = Graph::default();
+        for (i, o) in ["pass", "changes", "pass"].iter().enumerate() {
+            g.apply(&ev(&format!("codex-posts.md@0#{i}:XF1"), "2026-11-23T10:00", "codex", verdict("XF1", o)), &d);
+        }
+        let w = &all(&g, "sanjith")["XF1"];
+        assert_eq!(w.lane, "done", "{}", w.story);
+        assert!(w.story.contains("3 times: pass, changes, pass"), "{}", w.story);
+    }
+
+    #[test]
+    fn the_cap_drops_the_oldest_verdicts_not_the_newest() {
+        let d = derivers();
+        let mut g = Graph::default();
+        g.apply(&ev("vnew", "2026-11-23T12:00", "codex", verdict("XF1", "pass")), &d);
+        for i in 0..40 {
+            g.apply(&ev(&format!("vold{i}"), "2026-11-22T09:00", "codex", verdict("XF1", "changes")), &d);
+        }
+        assert_eq!(g.items["XF1"].verdicts.len(), 32);
+        assert_eq!(all(&g, "sanjith")["XF1"].lane, "done");
+    }
+
+    #[test]
+    fn a_merge_seen_after_changes_finishes_the_item_even_in_the_same_minute() {
+        let d = derivers();
+        let mut g = Graph::default();
+        g.apply(&ev("git:claude/x", "2026-11-23T09:00", "claude", commit("claude/x", "XF1 work", false, false)), &d);
+        g.apply(&ev("v1", "2026-11-23T10:00", "codex", verdict("claude/x", "changes")), &d);
+        assert_eq!(all(&g, "sanjith")["XF1"].lane, "changes");
+        // The watcher stamps the merge when it sees it, in the verdict's minute, after it.
+        g.apply(&ev("git:claude/x:merged:abc", "2026-11-23T10:00", "claude", commit("claude/x", "XF1 work", true, false)), &d);
+        assert_eq!(all(&g, "sanjith")["XF1"].lane, "done");
+    }
+
+    #[test]
+    fn a_restart_replays_a_merge_whose_branch_is_gone() {
+        // What the ledger holds after the watcher saw claude/x merge and then disappear.
+        let d = derivers();
+        let mut g = Graph::default();
+        g.apply(&ev("m1", "2026-11-23T08:00", "sanjith", msg("XF1: fix the hook drift on startup", &[], &["XF1"])), &d);
+        g.apply(&ev("git:claude/x:merged:abc", "2026-11-23T11:00", "claude", commit("claude/x", "XF1 work", true, false)), &d);
+        g.apply(&ev("git:claude/x:gone:abc", "2026-11-23T12:00", "claude", commit("claude/x", "", false, true)), &d);
+        let w = &all(&g, "sanjith")["XF1"];
+        assert_eq!(w.lane, "done", "{}", w.story);
+        assert!(!g.items.contains_key("claude/x"));
     }
 }

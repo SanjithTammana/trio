@@ -32,7 +32,8 @@ export interface GraphNode {
 }
 
 export type WorkLane = 'asked' | 'progress' | 'review' | 'changes' | 'done';
-export interface Work { lane: WorkLane; waiting_on?: string; story: string }
+/** `last`: when the item or a branch implementing it last moved (absent on older servers). */
+export interface Work { lane: WorkLane; waiting_on?: string; story: string; last?: string }
 
 /** The Work lens columns, in board order, with what each one means. */
 export const WORK_LANES: { lane: WorkLane; title: string; explain: string }[] = [
@@ -50,7 +51,20 @@ export interface Touch { part: string; lines: number; files: number }
 
 export interface AgentState { enabled: boolean; running: boolean; hue: string; attached?: string | null }
 
+/** What changed since the human was last here (server `seen.rs`). */
+export interface Catchup {
+  since: string;
+  moved: { id: string; title: string; from?: WorkLane; to: WorkLane; yours: boolean }[];
+  more: number;
+  waiting_on_you: number;
+  commits: number;
+  branches: number;
+  verdicts: number;
+  messages: number;
+}
+
 export interface Snapshot {
+  catchup?: Catchup;
   room: string;
   rev: number;
   paused: boolean;
@@ -126,6 +140,11 @@ export async function send(token: string, text: string): Promise<string | null> 
   const body = { token, ...splitForSend(text) };
   const r = await fetch('/api/say', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
   return r.ok ? null : (await r.text()) || `error ${r.status}`;
+}
+
+/** Dismiss the catch-up: the seen mark moves to now. */
+export async function markSeen(token: string) {
+  await fetch('/api/seen', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token }) });
 }
 
 export async function setPaused(token: string, paused: boolean) {

@@ -147,6 +147,8 @@ pub fn append(path: &Path, event: &Event) -> io::Result<()> {
 pub struct PostsFile {
     path: PathBuf,
     from: String,
+    /// The room's human handle, so `@sanjith` in a post is a mention like any other.
+    human: String,
     tail: Tail,
     fence: Option<(u8, usize)>,
     /// The post being read: (offset of its header, header text, body lines).
@@ -154,8 +156,8 @@ pub struct PostsFile {
 }
 
 impl PostsFile {
-    pub fn new(path: PathBuf, from: &str) -> Self {
-        Self { path, from: from.to_string(), tail: Tail::default(), fence: None, open: None }
+    pub fn new(path: PathBuf, from: &str, human: &str) -> Self {
+        Self { path, from: from.to_string(), human: human.to_string(), tail: Tail::default(), fence: None, open: None }
     }
 
     fn close(&self, off: u64, head: &str, body: &[String]) -> Vec<Event> {
@@ -169,11 +171,18 @@ impl PostsFile {
                 items.push(i);
             }
         }
+        // Title mentions come first: they say who the post is for; the body may only thank someone.
+        let mut named = mentions_in(title, &self.human);
+        for m in mentions_in(&detail, &self.human) {
+            if !named.contains(&m) {
+                named.push(m);
+            }
+        }
         let mut out = vec![Event {
             id: id.clone(),
             at: at.clone(),
             from: self.from.clone(),
-            body: Body::Message { summary: title.to_string(), detail: Some(detail.clone()), mentions: mentions(&format!("{title}\n{detail}")), items },
+            body: Body::Message { summary: title.to_string(), detail: Some(detail.clone()), mentions: named, items },
         }];
         let mut fence: Option<(u8, usize)> = None;
         let mut last_text = "";
@@ -291,14 +300,23 @@ pub fn fence_step(line: &str, open: Option<(u8, usize)>) -> Option<(u8, usize)> 
     }
 }
 
-fn mentions(text: &str) -> Vec<String> {
-    mentions_in(text, "")
-}
-
-/// `@claude`, `@codex`, `@both` and `@<human>` (the room's `me`; empty for none) in `text`.
+/// `@claude`, `@codex`, `@both` and `@<human>` (the room's `me`; empty for none) in `text`, in
+/// the order they first appear, so the first name is the one addressed.
 pub fn mentions_in(text: &str, human: &str) -> Vec<String> {
     let lower = text.to_ascii_lowercase();
-    ["claude", "codex", "both", human].iter().filter(|w| !w.is_empty() && lower.contains(&format!("@{w}"))).map(|w| w.to_string()).collect()
+    let human_l = human.to_ascii_lowercase();
+    let mut found: Vec<(usize, String)> = [("claude", "claude"), ("codex", "codex"), ("both", "both"), (human_l.as_str(), human)]
+        .iter()
+        .filter(|(w, _)| !w.is_empty())
+        .filter_map(|(w, name)| {
+            let tag = format!("@{w}");
+            // A whole handle: `@codex` but not `@codexbot`.
+            lower.match_indices(&tag).find(|(i, _)| !lower[i + tag.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')).map(|(i, _)| (i, name.to_string()))
+        })
+        .collect();
+    found.sort();
+    found.dedup_by(|a, b| a.1 == b.1);
+    found.into_iter().map(|(_, w)| w).collect()
 }
 
 #[cfg(test)]
@@ -334,7 +352,7 @@ mod tests {
     fn posts_parse_heads_fences_marks_and_status() {
         let p = tmp("codex-posts.md");
         std::fs::write(&p, "# Codex\n\n## 2026-11-23 18:30 P0a review\n\nverdict claude/hooks-p0a: changes at d44201ba\n\n- XF29 one\n```\n## 2026-11-23 19:00 not a post\n```\nclaim XF31\n\nStatus: done\n").unwrap();
-        let mut src = PostsFile::new(p.clone(), "codex");
+        let mut src = PostsFile::new(p.clone(), "codex", "sanjith");
         let ev = src.poll().unwrap();
         let msgs: Vec<_> = ev.iter().filter(|e| matches!(e.body, Body::Message { .. })).collect();
         assert_eq!(msgs.len(), 1, "fenced header is not a post");

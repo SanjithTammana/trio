@@ -201,6 +201,9 @@ pub fn split_reply(text: &str) -> Option<(String, Option<String>)> {
 /// and `P0b (a separately approved staged redeploy)`. None when the text only mentions the id.
 /// O(n) per id: one scan for its occurrences.
 pub fn definition(text: &str, id: &str) -> Option<String> {
+    if id.is_empty() {
+        return None;
+    }
     let mut from = 0;
     while let Some(k) = text[from..].find(id) {
         let (s, e) = (from + k, from + k + id.len());
@@ -211,7 +214,14 @@ pub fn definition(text: &str, id: &str) -> Option<String> {
         let next = after.next();
         // A whole id: not inside a word, and not a prefix of a longer id (P1 in P1.2, XF2 in XF29).
         let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
-        if before.is_some_and(|c| word(c) || c == '-' || c == '/') || next.is_some_and(word) || (next == Some('.') && after.next().is_some_and(|c| c.is_ascii_digit())) {
+        // Only free-standing ids define: not inside a URL or path (`?ticket=P0a:x`), not after
+        // other text glued to it.
+        if before.is_some_and(|c| !(c.is_whitespace() || "*([>\"'".contains(c))) || next.is_some_and(word) || (next == Some('.') && after.next().is_some_and(|c| c.is_ascii_digit())) {
+            continue;
+        }
+        // Not inside an inline code span: an odd number of backticks earlier on the line.
+        let line_start = text[..s].rfind('\n').map_or(0, |i| i + 1);
+        if text[line_start..s].matches('`').count() % 2 == 1 {
             continue;
         }
         let bold = text[..s].ends_with("**");
@@ -226,6 +236,10 @@ fn defined_by(rest: &str, bold: bool) -> Option<String> {
     let r = rest.trim_start_matches('*').trim_start();
     for sep in ["\u{2014}", "\u{2013}", ":", "- "] {
         if let Some(x) = r.strip_prefix(sep) {
+            // `P0a:manual` is a token, not a definition: a colon must be followed by a space.
+            if sep == ":" && !x.starts_with(char::is_whitespace) {
+                return None;
+            }
             return title_text(x);
         }
     }
@@ -252,7 +266,8 @@ fn title_text(x: &str) -> Option<String> {
     let t: String = x[..end].chars().filter(|c| *c != '`' && *c != '*').collect();
     let t = t.trim().trim_end_matches(['.', ':', ',']).trim();
     let words = t.split_whitespace().filter(|w| w.chars().all(|c| c.is_alphabetic() || "'-,".contains(c)) && w.chars().any(char::is_alphabetic)).count();
-    if words < 3 || t.len() < 10 {
+    // A list of ids (`item 16, item 17, item 18`) is not a description.
+    if words < 3 || t.len() < 10 || item_ids(t).len() >= 2 {
         return None;
     }
     let mut out: String = t.chars().take(80).collect();
@@ -339,6 +354,11 @@ mod tests {
         assert_eq!(d("XF29 is still waiting on Codex", "XF29"), None);
         assert_eq!(d("XF28: - All file I/O goes through io, so a test can stub it", "XF28").as_deref(), Some("All file I/O goes through io, so a test can stub it"));
         assert_eq!(d("XF2 vs XF29: two separate things here", "XF2").as_deref(), None);
+        // Quoted examples, URL fragments, id lists and an empty id are not definitions.
+        assert_eq!(d("Use `P0a: this is an example` in the docs", "P0a"), None);
+        assert_eq!(d("See https://example.test/?ticket=P0a:manual for the full report", "P0a"), None);
+        assert_eq!(d("P0a: item 16, item 17, item 18", "P0a"), None);
+        assert_eq!(d("anything at all", ""), None);
     }
 
     #[test]

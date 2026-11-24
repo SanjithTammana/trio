@@ -4,6 +4,11 @@
 //! waiting, so a slow `git` call can delay only the map, never chat or routing. A branch becomes
 //! an event only when its tip or the base tip moves, and a branch that disappears (deleted ref)
 //! becomes a `gone` event that removes it from the graph.
+//!
+//! Merges seen happening and deletions are *durable*: the room appends them to its ledger, so a
+//! restart replays when a branch merged even after the branch is gone. A merge is stamped with
+//! the time it was seen, not the commit time: a fast-forward of a 09:00 commit at 11:00 is an
+//! 11:00 merge.
 
 use crate::model::{component_of, Body, Event, Touch};
 use std::collections::HashMap;
@@ -13,9 +18,20 @@ use std::time::{Duration, Instant};
 
 const EVERY: Duration = Duration::from_secs(30);
 
+/// One finished poll.
+#[derive(Debug, Default)]
+pub struct Poll {
+    /// Tip events: applied, not stored (the first poll after a restart reads every tip again).
+    pub tips: Vec<Event>,
+    /// Merges seen happening and deletions, for the ledger.
+    pub durable: Vec<Event>,
+    /// Every branch listed, so the room can retire branches deleted while it was closed.
+    pub listed: Vec<String>,
+}
+
 pub struct GitWatch {
     req: mpsc::Sender<()>,
-    res: mpsc::Receiver<Vec<Event>>,
+    res: mpsc::Receiver<Option<Poll>>,
     busy: bool,
     last: Option<Instant>,
 }
@@ -36,13 +52,13 @@ impl GitWatch {
         Self { req, res, busy: false, last: None }
     }
 
-    /// Events from a finished poll, if one finished; starts the next poll when it is due.
+    /// Finished polls (a failed listing yields none); starts the next poll when it is due.
     /// Never blocks.
-    pub fn take(&mut self) -> Vec<Event> {
+    pub fn take(&mut self) -> Vec<Poll> {
         let mut out = Vec::new();
-        while let Ok(evs) = self.res.try_recv() {
+        while let Ok(p) = self.res.try_recv() {
             self.busy = false;
-            out.extend(evs);
+            out.extend(p);
         }
         if !self.busy && self.last.is_none_or(|t| t.elapsed() >= EVERY) && self.req.send(()).is_ok() {
             self.busy = true;
@@ -53,15 +69,11 @@ impl GitWatch {
 
     /// Wait up to `limit` for a poll to finish (tests only).
     #[cfg(test)]
-    pub fn wait(&mut self, limit: Duration) -> Vec<Event> {
+    pub fn wait(&mut self, limit: Duration) -> Option<Poll> {
         self.take();
-        match self.res.recv_timeout(limit) {
-            Ok(evs) => {
-                self.busy = false;
-                evs
-            }
-            Err(_) => Vec::new(),
-        }
+        let p = self.res.recv_timeout(limit).ok().flatten();
+        self.busy = false;
+        p
     }
 }
 
@@ -70,8 +82,17 @@ pub struct Tips {
     repo: PathBuf,
     configured_base: Option<String>,
     base: Option<String>,
-    /// branch -> `<tip sha>:<base sha>` it was last emitted at.
-    seen: HashMap<String, String>,
+    /// What each branch looked like when it was last emitted.
+    seen: HashMap<String, Tip>,
+}
+
+#[derive(Clone)]
+struct Tip {
+    /// `<tip sha>:<base sha>`
+    key: String,
+    sha: String,
+    subject: String,
+    merged: bool,
 }
 
 impl Tips {
@@ -80,52 +101,77 @@ impl Tips {
     }
 
     /// Events for branches whose tip or base moved, plus `gone` events for branches that no
-    /// longer exist. A failed listing changes nothing.
-    pub fn poll(&mut self) -> Vec<Event> {
+    /// longer exist. A failed listing changes nothing (None).
+    pub fn poll(&mut self) -> Option<Poll> {
         let repo = self.repo.clone();
-        let Some(list) = git(
+        let list = git(
             &repo,
             &["for-each-ref", "--format=%(refname:short)%09%(objectname)%09%(committerdate:format-local:%Y-%m-%dT%H:%M)%09%(subject)", "refs/heads/claude", "refs/heads/codex"],
-        ) else {
-            return Vec::new();
-        };
+        )?;
         if self.base.is_none() {
             self.base = base_branch(&repo, self.configured_base.as_deref());
         }
         // A merge moves the base, not the branch: key on both tips.
         let base_tip = self.base.as_deref().and_then(|b| git(&repo, &["rev-parse", b])).unwrap_or_default();
-        let mut evs = Vec::new();
-        let mut listed = Vec::new();
+        let mut out = Poll::default();
         for l in list.lines() {
             let mut p = l.splitn(4, '\t');
             let (Some(branch), Some(sha), Some(at)) = (p.next(), p.next(), p.next()) else { continue };
             let subject = p.next().unwrap_or("");
-            listed.push(branch.to_string());
+            out.listed.push(branch.to_string());
             let key = format!("{sha}:{base_tip}");
-            if self.seen.get(branch) == Some(&key) {
+            let was = self.seen.get(branch).cloned();
+            if was.as_ref().is_some_and(|w| w.key == key) {
                 continue;
             }
             let (touches, merged) = self.base.as_deref().map(|b| branch_touches(&repo, b, sha)).unwrap_or_default();
-            self.seen.insert(branch.to_string(), key);
-            evs.push(Event {
-                id: format!("git:{branch}"),
-                at: at.to_string(),
-                from: branch.split('/').next().unwrap_or("git").to_string(),
-                body: Body::Commit { branch: branch.into(), sha: sha.into(), subject: subject.into(), touches, merged, gone: false },
-            });
+            self.seen.insert(branch.to_string(), Tip { key, sha: sha.into(), subject: subject.into(), merged });
+            let body = Body::Commit { branch: branch.into(), sha: sha.into(), subject: subject.into(), touches, merged, gone: false };
+            if merged && was.is_some_and(|w| !w.merged) {
+                // Seen merging: durable, stamped now.
+                out.durable.push(merge_event(branch, sha, body));
+            } else {
+                out.tips.push(Event { id: format!("git:{branch}"), at: at.to_string(), from: owner(branch), body });
+            }
         }
-        let gone: Vec<String> = self.seen.keys().filter(|b| !listed.contains(b)).cloned().collect();
+        let gone: Vec<String> = self.seen.keys().filter(|b| !out.listed.contains(b)).cloned().collect();
         for branch in gone {
-            self.seen.remove(&branch);
-            evs.push(Event {
-                id: format!("git:{branch}"),
-                at: crate::room::now(),
-                from: branch.split('/').next().unwrap_or("git").to_string(),
-                body: Body::Commit { branch, sha: String::new(), subject: String::new(), touches: Vec::new(), merged: false, gone: true },
-            });
+            let Some(t) = self.seen.remove(&branch) else { continue };
+            // Merged and deleted between two polls: the old tip is in the base, so record the merge.
+            let in_base = !t.merged && self.base.as_deref().is_some_and(|b| is_ancestor(&repo, &t.sha, b));
+            if in_base {
+                let body = Body::Commit { branch: branch.clone(), sha: t.sha.clone(), subject: t.subject.clone(), touches: Vec::new(), merged: true, gone: false };
+                out.durable.push(merge_event(&branch, &t.sha, body));
+            }
+            out.durable.push(gone_event(&branch, &t.sha));
         }
-        evs
+        Some(out)
     }
+}
+
+fn owner(branch: &str) -> String {
+    branch.split('/').next().unwrap_or("git").to_string()
+}
+
+fn merge_event(branch: &str, sha: &str, body: Body) -> Event {
+    Event { id: format!("git:{branch}:merged:{}", &sha[..sha.len().min(12)]), at: crate::room::now(), from: owner(branch), body }
+}
+
+/// A deleted branch. Durable, so a restart drops a branch its ledger says merged.
+pub fn gone_event(branch: &str, sha: &str) -> Event {
+    Event {
+        id: format!("git:{branch}:gone:{}", &sha[..sha.len().min(12)]),
+        at: crate::room::now(),
+        from: owner(branch),
+        body: Body::Commit { branch: branch.to_string(), sha: String::new(), subject: String::new(), touches: Vec::new(), merged: false, gone: true },
+    }
+}
+
+fn is_ancestor(repo: &Path, sha: &str, base: &str) -> bool {
+    std::process::Command::new("git").arg("-C").arg(repo).args(["merge-base", "--is-ancestor", sha, base]).output().is_ok_and(|o| o.status.success())
+}
+
+impl Tips {
 }
 
 pub fn git(repo: &Path, args: &[&str]) -> Option<String> {
@@ -216,9 +262,12 @@ mod tests {
         assert_eq!(branch_touches(&r.0, "main", &sha), (vec![], true));
     }
 
-    fn summary(evs: &[Event]) -> Vec<(String, bool, bool)> {
-        let mut v: Vec<_> = evs
+    fn summary(p: Option<Poll>) -> Vec<(String, bool, bool)> {
+        let p = p.expect("listing");
+        let mut v: Vec<_> = p
+            .tips
             .iter()
+            .chain(p.durable.iter())
             .filter_map(|e| match &e.body {
                 Body::Commit { branch, merged, gone, .. } => Some((branch.clone(), *merged, *gone)),
                 _ => None,
@@ -239,13 +288,36 @@ mod tests {
         r.run(&["checkout", "-q", "main"]);
 
         let mut tips = Tips::new(r.0.clone(), None);
-        assert_eq!(summary(&tips.poll()), vec![("claude/a".into(), true, false), ("codex/b".into(), false, false)]);
-        assert!(tips.poll().is_empty(), "nothing moved");
+        assert_eq!(summary(tips.poll()), vec![("claude/a".into(), true, false), ("codex/b".into(), false, false)]);
+        assert!(summary(tips.poll()).is_empty(), "nothing moved");
         r.run(&["merge", "-q", "--ff-only", "codex/b"]); // the base moves: both are re-read
-        assert_eq!(summary(&tips.poll()), vec![("claude/a".into(), true, false), ("codex/b".into(), true, false)]);
+        let p = tips.poll().unwrap();
+        assert_eq!(p.durable.len(), 1, "codex/b was seen merging");
+        assert!(p.durable[0].id.starts_with("git:codex/b:merged:") && p.durable[0].at == crate::room::now(), "stamped when seen");
+        assert_eq!(summary(Some(p)), vec![("claude/a".into(), true, false), ("codex/b".into(), true, false)]);
         r.run(&["branch", "-D", "codex/b"]);
-        assert_eq!(summary(&tips.poll()), vec![("codex/b".into(), false, true)]);
-        assert!(tips.poll().is_empty());
+        assert_eq!(summary(tips.poll()), vec![("codex/b".into(), false, true)]);
+        assert!(summary(tips.poll()).is_empty());
+    }
+
+    #[test]
+    fn a_branch_merged_and_deleted_between_polls_still_records_the_merge() {
+        let r = Repo::new();
+        r.run(&["checkout", "-qb", "codex/c"]);
+        std::fs::write(r.0.join("src/main.rs"), "c\n").unwrap();
+        r.run(&["add", "."]);
+        r.run(&["commit", "-qm", "XF7 work"]);
+        r.run(&["checkout", "-q", "main"]);
+        let mut tips = Tips::new(r.0.clone(), None);
+        assert_eq!(summary(tips.poll()), vec![("codex/c".into(), false, false)]);
+        r.run(&["merge", "-q", "--ff-only", "codex/c"]);
+        r.run(&["branch", "-D", "codex/c"]);
+        let p = tips.poll().unwrap();
+        let got: Vec<(String, bool, bool)> = p.durable.iter().map(|e| match &e.body {
+            Body::Commit { branch, merged, gone, .. } => (branch.clone(), *merged, *gone),
+            _ => unreachable!(),
+        }).collect();
+        assert_eq!(got, vec![("codex/c".into(), true, false), ("codex/c".into(), false, true)], "merge first, then the deletion");
     }
 
     #[test]
@@ -253,8 +325,7 @@ mod tests {
         let r = Repo::new();
         r.run(&["branch", "claude/a"]);
         let mut w = GitWatch::start(r.0.clone(), None);
-        let evs = w.wait(Duration::from_secs(20));
-        assert_eq!(summary(&evs), vec![("claude/a".into(), true, false)]);
+        assert_eq!(summary(w.wait(Duration::from_secs(20))), vec![("claude/a".into(), true, false)]);
         assert!(w.take().is_empty(), "the next poll is not due for 30 s");
     }
 }

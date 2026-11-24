@@ -20,6 +20,7 @@ mod roomid;
 mod server;
 mod setup;
 mod source;
+mod seen;
 mod work;
 
 use std::hash::{BuildHasher, RandomState};
@@ -319,7 +320,26 @@ fn cmd_open(args: &[String]) -> Result<(), String> {
         // Idle unless used: poll only while a visible page is connected or an agent run is live;
         // otherwise sleep until a page connects or a message arrives (no stat, no git, no CPU).
         tokio::spawn(async move {
+            // A visit is the time a page or window holds the change stream. When one of at least
+            // a minute ends, the seen mark moves there: the next visit opens on what changed since.
+            let mut visit: Option<std::time::Instant> = None;
             loop {
+                let watching = ticker.tx.receiver_count() > 0;
+                match (watching, visit) {
+                    (true, None) => visit = Some(std::time::Instant::now()),
+                    (false, Some(started)) => {
+                        visit = None;
+                        if started.elapsed().as_secs() >= seen::VISIT_SECS {
+                            let rev = {
+                                let mut r = ticker.room.lock().expect("room lock");
+                                r.mark_seen();
+                                r.rev
+                            };
+                            let _ = ticker.tx.send(rev);
+                        }
+                    }
+                    _ => {}
+                }
                 if ticker.active() {
                     tokio::time::sleep(Duration::from_millis(700)).await;
                 } else {

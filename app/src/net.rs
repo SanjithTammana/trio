@@ -147,6 +147,11 @@ impl Client {
         self.post("/api/say", token, body)
     }
 
+    /// Dismiss the catch-up: the room's seen mark moves to now.
+    pub fn seen(&self, token: &str) -> Result<(), String> {
+        self.post("/api/seen", token, serde_json::json!({ "token": token }))
+    }
+
     pub fn pause(&self, token: &str, paused: bool) -> Result<(), String> {
         let body = serde_json::json!({ "token": token, "paused": paused });
         self.post("/api/pause", token, body)

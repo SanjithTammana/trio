@@ -342,11 +342,17 @@ pub fn resolve_bin(bin: &str) -> Result<PathBuf, String> {
 
 /// The prompt a woken agent receives: recent chat, the triggering detail, and the reply contract.
 /// The agent's final answer is the reply; Trio posts it, so the agent needs no write access.
-pub fn wake_prompt(agent: &str, human: &str, room: &str, recent: &[String], trigger_detail: Option<&str>) -> String {
+pub fn wake_prompt(agent: &str, human: &str, room: &str, recent: &[String], since: &[String], trigger_detail: Option<&str>) -> String {
     let mut p = format!(
         "Trio room `{room}` (group chat with {human} (the human), Claude and Codex). New messages for you, {agent}:\n\n{}\n",
         recent.iter().map(|u| format!("- {u}")).collect::<Vec<_>>().join("\n")
     );
+    // Work done since this agent last ran (commits, verdicts, claims), so it resumes in context.
+    if !since.is_empty() {
+        p.push_str("\nSince your last run:\n");
+        p.push_str(&since.iter().map(|u| format!("- {u}")).collect::<Vec<_>>().join("\n"));
+        p.push('\n');
+    }
     if let Some(d) = trigger_detail.filter(|d| !d.trim().is_empty()) {
         p.push_str("\nDetail of the latest message:\n");
         p.extend(d.chars().take(3000));

@@ -9,7 +9,7 @@
 // that captions every column, glyph and the strip in place.
 import { useEffect, useMemo, useState, type MouseEvent } from 'react';
 import { State, Who } from './glyph';
-import { components, lanes, nameOf, timeLabel, WORK_LANES, type Component, type GraphNode, type Snapshot, type WorkLane } from './api';
+import { components, lanes, markSeen, nameOf, timeLabel, WORK_LANES, type Component, type GraphNode, type Snapshot, type WorkLane } from './api';
 import { Segmented } from './astryx/Segmented';
 
 type Lens = 'work' | 'code' | 'time';
@@ -109,7 +109,7 @@ export function Graph({ snap, selected, onSelect }: { snap: Snapshot; selected: 
       if (d && Number.isFinite(d)) return d;
       if (Number.isFinite(ib(a)) !== Number.isFinite(ib(b))) return Number.isFinite(ib(a)) ? -1 : 1;
       const p = PRIORITY.indexOf(a.state) - PRIORITY.indexOf(b.state);
-      return p || b.last.localeCompare(a.last);
+      return p || b.last.localeCompare(a.last) || a.id.localeCompare(b.id);
     });
 
     const comps = [...components(touches, branches.filter((b) => !merged.has(b.id)).map((b) => b.id)).values()];
@@ -187,6 +187,7 @@ export function Graph({ snap, selected, onSelect }: { snap: Snapshot; selected: 
       </div>
       {explain && <p className="explain lens-explain">{LENS_EXPLAIN[lens]}</p>}
 
+      {lens === 'work' && snap.catchup && <CatchupStrip snap={snap} onSelect={onSelect} />}
       {lens === 'work' && <WorkLens snap={snap} scope={scope} explain={explain} selected={selected} onSelect={onSelect} onHover={setHover} />}
       {lens === 'time' && <div className="time-lens"><TimeStrip snap={snap} nodes={snap.graph.items} lit={lit} tall /></div>}
       {lens === 'code' && <div className="map-scroll">
@@ -256,22 +257,63 @@ const LENS_EXPLAIN: Record<Lens, string> = {
   time: 'Time: one row per participant, one tick per recorded step (a claim, commit, verdict or message). Hover a node in another lens to light its ticks.',
 };
 
+const LANE_TITLE = Object.fromEntries(WORK_LANES.map((l) => [l.lane, l.title])) as Record<WorkLane, string>;
+const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+
+/** Since you left: what moved while you were away (including work done outside Trio). */
+function CatchupStrip({ snap, onSelect }: { snap: Snapshot; onSelect: (p: Pick, el: Element, pointer: boolean) => void }) {
+  const c = snap.catchup!;
+  const facts = [
+    c.moved.length + c.more > 0 && plural(c.moved.length + c.more, 'item moved', 'items moved'),
+    c.waiting_on_you > 0 && `${c.waiting_on_you} wait${c.waiting_on_you === 1 ? 's' : ''} on you`,
+    c.commits > 0 && `${plural(c.commits, 'commit')} on ${plural(c.branches, 'branch', 'branches')}`,
+    c.verdicts > 0 && plural(c.verdicts, 'verdict'),
+    c.messages > 0 && plural(c.messages, 'message'),
+  ].filter(Boolean);
+  return (
+    <section className="catchup" aria-label="Since you left">
+      <div className="catchup-h">
+        <b>Since {timeLabel(c.since)}</b>
+        <span>{facts.join(' · ')}</span>
+        <button className="catchup-x" onClick={() => markSeen(snap.token)}>Dismiss</button>
+      </div>
+      {c.moved.length > 0 && (
+        <ul className="catchup-list">
+          {c.moved.map((m) => (
+            <li key={m.id}>
+              <button className={m.yours ? 'yours' : ''} onClick={(e) => onSelect({ kind: 'item', id: m.id }, e.currentTarget, e.detail > 0)}>
+                <span className="id-tag mono">{m.id}</span>
+                <span className="catchup-t">{m.title || m.id}</span>
+                <span className="catchup-move">{m.from ? `${LANE_TITLE[m.from]} → ` : 'new · '}{LANE_TITLE[m.to]}</span>
+              </button>
+            </li>
+          ))}
+          {c.more > 0 && <li className="muted">+{c.more} more</li>}
+        </ul>
+      )}
+    </section>
+  );
+}
+
+/** When a card last moved: branch activity counts, so a fresh branch verdict is not stale. */
+const moved = (n: GraphNode) => n.work?.last || n.last;
+
 /** Work lens: items in five stage lanes; cards waiting on you sort first. */
 function WorkLens({ snap, scope, explain, selected, onSelect, onHover }: { snap: Snapshot; scope: 'active' | 'all'; explain: boolean; selected: string | null; onSelect: (p: Pick, el: Element, pointer: boolean) => void; onHover: (k: string | null) => void }) {
   const me = snap.me;
   const byLane = useMemo(() => {
     const items = snap.graph.items.filter((n) => n.kind === 'item' && n.work);
-    const newest = items.reduce((m, n) => Math.max(m, ms(n.last)), 0);
+    const newest = items.reduce((m, n) => Math.max(m, ms(moved(n))), 0);
     const out = new Map<WorkLane, GraphNode[]>(WORK_LANES.map((l) => [l.lane, []]));
     for (const n of items) {
       const lane = n.work!.lane;
-      const age = newest - ms(n.last);
+      const age = newest - ms(moved(n));
       if (scope === 'active' && lane === 'done' && age > DONE_HOURS * 3600_000) continue;
       if (scope === 'active' && lane === 'asked' && age > ACTIVE_HOURS * 3600_000) continue;
       out.get(lane)?.push(n);
     }
     const mine = (n: GraphNode) => Number(n.work?.waiting_on === me);
-    for (const list of out.values()) list.sort((a, b) => mine(b) - mine(a) || b.last.localeCompare(a.last));
+    for (const list of out.values()) list.sort((a, b) => mine(b) - mine(a) || moved(b).localeCompare(moved(a)) || a.id.localeCompare(b.id));
     return out;
   }, [snap.graph.items, scope, me]);
   const total = [...byLane.values()].reduce((a, l) => a + l.length, 0);
@@ -299,7 +341,7 @@ function WorkLens({ snap, scope, explain, selected, onSelect, onHover }: { snap:
                   <span className="card-t">{n.summary || <b className="mono">{n.id}</b>}</span>
                   <span className="card-m">
                     <span>{n.summary && <span className="id-tag mono">{n.id}</span>}{w.waiting_on ? <><Who who={w.waiting_on} me={me} />{w.waiting_on === me ? 'waiting on you' : nameOf(w.waiting_on, me)}</> : w.lane === 'done' ? <><State state="pass" />done</> : <><State state={n.state} />{n.state}</>}</span>
-                    <span>{timeLabel(n.last)}</span>
+                    <span>{timeLabel(moved(n))}</span>
                   </span>
                 </button>
               );

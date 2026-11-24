@@ -21,6 +21,65 @@ pub struct Snapshot {
     #[serde(default)]
     pub messages: Vec<Message>,
     pub graph: Graph,
+    /// What moved since the human was last here (server `seen.rs`); absent when nothing did.
+    #[serde(default)]
+    pub catchup: Option<Catchup>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Catchup {
+    pub since: String,
+    #[serde(default)]
+    pub moved: Vec<Moved>,
+    #[serde(default)]
+    pub more: usize,
+    #[serde(default)]
+    pub waiting_on_you: usize,
+    #[serde(default)]
+    pub commits: usize,
+    #[serde(default)]
+    pub branches: usize,
+    #[serde(default)]
+    pub verdicts: usize,
+    #[serde(default)]
+    pub messages: usize,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Moved {
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub from: Option<String>,
+    pub to: String,
+    #[serde(default)]
+    pub yours: bool,
+}
+
+impl Catchup {
+    /// "14 items moved · 4 commits on 4 branches · …", the same facts as the web strip.
+    pub fn facts(&self) -> String {
+        let n = |k: usize, one: &str, many: &str| format!("{k} {}", if k == 1 { one } else { many });
+        let moved = self.moved.len() + self.more;
+        let mut f: Vec<String> = Vec::new();
+        if moved > 0 {
+            f.push(n(moved, "item moved", "items moved"));
+        }
+        if self.waiting_on_you > 0 {
+            f.push(format!("{} wait{} on you", self.waiting_on_you, if self.waiting_on_you == 1 { "s" } else { "" }));
+        }
+        if self.commits > 0 {
+            f.push(format!("{} on {}", n(self.commits, "commit", "commits"), n(self.branches, "branch", "branches")));
+        }
+        if self.verdicts > 0 {
+            f.push(n(self.verdicts, "verdict", "verdicts"));
+        }
+        if self.messages > 0 {
+            f.push(n(self.messages, "message", "messages"));
+        }
+        f.join(" \u{b7} ")
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -82,6 +141,9 @@ pub struct Work {
     pub waiting_on: Option<String>,
     #[serde(default)]
     pub story: String,
+    /// When the item or a branch implementing it last moved (older servers: empty).
+    #[serde(default)]
+    pub last: String,
 }
 
 /// The Work lens stages in order, with the caption explain mode shows under each (web: WORK_LANES).
