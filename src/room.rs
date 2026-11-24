@@ -209,11 +209,6 @@ impl Relabel {
     }
 
     fn apply(&self, e: &mut Event) {
-        // Pull-request rows are named by their link's current label (`github_links`), not by
-        // the local repos' shape.
-        if e.id.starts_with("gh:") {
-            return;
-        }
         match &mut e.body {
             Body::Commit { branch, .. } => {
                 if let Some(n) = self.name(branch) {
@@ -605,8 +600,13 @@ impl Room {
         std::mem::swap(&mut fresh.agents, &mut self.agents);
         std::mem::swap(&mut fresh.started, &mut self.started);
         std::mem::swap(&mut fresh.triggers, &mut self.triggers);
-        std::mem::swap(&mut fresh.delivered, &mut self.delivered);
-        std::mem::swap(&mut fresh.delivered_order, &mut self.delivered_order);
+        let cut = std::mem::take(&mut self.ledger_replaced);
+        // Ledger ids are offsets, so a cut ledger reuses them for new rows: its delivery record
+        // starts again from the held wakes (which `open_with` read back).
+        if !cut {
+            std::mem::swap(&mut fresh.delivered, &mut self.delivered);
+            std::mem::swap(&mut fresh.delivered_order, &mut self.delivered_order);
+        }
         // The operator's pause holds until they lift it, whatever room.toml says.
         fresh.cfg.paused = self.cfg.paused;
         // Arrival numbers keep rising, so a strip drawn before the replay is older than the room.
@@ -618,8 +618,9 @@ impl Room {
         fresh.presence = std::mem::take(&mut self.presence);
         fresh.restored = self.seen.take().or_else(|| self.restored.take());
         // Rows read before were routed then. A ledger that was cut or replaced is a new file
-        // whose rows this process cannot place: none of them is routed now.
-        fresh.route_from = if std::mem::take(&mut self.ledger_replaced) {
+        // whose rows this process cannot place: none of them is routed now, and rows written
+        // after the replay route as usual.
+        fresh.route_from = if cut {
             self.record("trio", Body::Status { text: "room.jsonl was cut or replaced: replayed it without waking anyone".into() });
             u64::MAX
         } else {
@@ -627,6 +628,9 @@ impl Room {
         };
         fresh.live = self.live;
         fresh.ingest();
+        if cut {
+            fresh.route_from = fresh.ledger_read;
+        }
         fresh.rev = self.rev + 1;
         *self = fresh;
         true
@@ -950,7 +954,10 @@ impl Room {
     fn deliver(&mut self, id: &str, agent: &str) {
         if !self.delivered.contains_key(id) {
             self.delivered_order.push_back(id.to_string());
-            if self.delivered_order.len() > 512 && let Some(old) = self.delivered_order.pop_front() {
+            if self.delivered_order.len() > 512
+                && let Some(k) = self.delivered_order.iter().position(|id| !self.held.iter().any(|h| &h.event.id == id))
+                && let Some(old) = self.delivered_order.remove(k)
+            {
                 self.delivered.remove(&old);
             }
         }
@@ -972,7 +979,8 @@ impl Room {
             if u.state == "low" {
                 self.record("trio", Body::Status { text: clip(&format!("{t} is low ({}); woken anyway", u.reason.as_deref().unwrap_or("")), 120) });
             }
-            self.wake(t, e, recent, detail, &[]);
+            let d = self.wake(t, e, recent, detail, &[]);
+            self.queue_if_busy(t, e, &d);
             return;
         }
         let other = other_agent(t).filter(|o| self.agents.get(*o).is_some_and(|a| a.cfg.enabled) && !self.usage(o).out());
@@ -983,7 +991,11 @@ impl Room {
             Some(o) if !self.reviews_own_work(e, o) => {
                 self.record("trio", Body::Status { text: clip(&format!("routed to {}: {} is {}", cap(o), cap(t), u.why()), 120) });
                 let note = self.handoff(t, &u, e);
-                self.wake(o, e, recent, detail, &note);
+                let d = self.wake(o, e, recent, detail, &note);
+                if !self.queue_if_busy(o, e, &d) && !matches!(d, WakeDecision::Started | WakeDecision::Paused) {
+                    self.hold(t, e);
+                    self.record("trio", Body::Status { text: clip(&format!("held for {}: {} could not take it", cap(t), cap(o)), 120) });
+                }
             }
             Some(o) => {
                 self.hold(t, e);
@@ -1018,6 +1030,17 @@ impl Room {
             other => self.record("trio", Body::Status { text: clip(&format!("{t} not woken: {other:?}"), 120) }),
         }
         decision
+    }
+
+    /// A wake that found `t` mid-run (or its own session busy) waits for that to end. True when
+    /// it was queued.
+    fn queue_if_busy(&mut self, t: &str, e: &Event, d: &WakeDecision) -> bool {
+        if !matches!(d, WakeDecision::Running | WakeDecision::Busy) {
+            return false;
+        }
+        self.hold(t, e);
+        self.record("trio", Body::Status { text: format!("held for {} until its current run ends", cap(t)) });
+        true
     }
 
     fn hold(&mut self, t: &str, e: &Event) {
@@ -1061,6 +1084,17 @@ impl Room {
         let mut changed = false;
         for agent in ["claude", "codex"] {
             let Some(i) = self.held.iter().position(|h| h.agent == agent) else { continue };
+            if !self.agents.get(agent).is_some_and(|a| a.cfg.enabled) {
+                let gone: Vec<String> = self.held.iter().filter(|h| h.agent == agent).map(|h| h.event.id.clone()).collect();
+                for id in &gone {
+                    self.undeliver(id, agent);
+                }
+                self.held.retain(|h| h.agent != agent);
+                self.save_held();
+                self.record("trio", Body::Status { text: format!("dropped {} held message(s) for {}: it is turned off", gone.len(), cap(agent)) });
+                changed = true;
+                continue;
+            }
             if self.usage(agent).out() || !self.agents.get(agent).is_some_and(|a| a.ready()) {
                 continue;
             }
@@ -1758,6 +1792,51 @@ mod tests {
         assert!(!room.any_running(), "rows in a replaced ledger are not routed");
         let text = std::fs::read_to_string(&ledger).unwrap();
         assert!(text.contains("cut or replaced"), "{text}");
+        // A message written after the replay routes as usual, though its offset id was used before.
+        room.say(&room.me(), "@codex XF3", None).unwrap();
+        room.tick();
+        assert!(room.any_running(), "rows after the cut are routed");
+        settle(&mut room).await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_reroute_to_a_running_agent_waits_for_its_run() {
+        #[cfg(windows)]
+        let slow = "On it.& ping -n 3 127.0.0.1 >nul";
+        #[cfg(unix)]
+        let slow = "On it.'; sleep 2; echo '";
+        let (root, mut room) = room_with("reroute-busy", &[("claude", "Done.", 0), ("codex", slow, 0)]);
+        room.tick();
+        room.say(&room.me(), "@codex look at XF1", None).unwrap();
+        room.tick();
+        assert!(room.any_running());
+        room.stops.insert("claude".into(), stop());
+        room.say(&room.me(), "@claude look at XF2", None).unwrap();
+        room.tick();
+        assert_eq!(room.held_for("codex"), 1, "Codex is mid-run: the rerouted message waits for it");
+        settle(&mut room).await;
+        room.tick();
+        settle(&mut room).await;
+        assert_eq!(room.held_for("codex"), 0);
+        let ledger = std::fs::read_to_string(root.join(".trio").join("room.jsonl")).unwrap();
+        assert_eq!(ledger.matches("\"agent\":\"codex\",\"hop\"").count(), 2, "{ledger}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn held_wakes_for_a_turned_off_agent_are_dropped() {
+        let (root, mut room) = room_with("held-off", &[("claude", "Done.", 0)]);
+        room.tick();
+        room.stops.insert("claude".into(), stop());
+        room.say(&room.me(), "@claude look at XF1", None).unwrap();
+        room.tick();
+        assert_eq!(room.held_for("claude"), 1);
+        room.agents.get_mut("claude").unwrap().cfg.enabled = false;
+        room.stops.clear();
+        room.tick();
+        assert_eq!(room.held_for("claude"), 0);
+        assert!(!held_path(&root).exists());
         let _ = std::fs::remove_dir_all(root);
     }
 
