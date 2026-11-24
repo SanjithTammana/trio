@@ -63,8 +63,39 @@ export interface Catchup {
   messages: number;
 }
 
+/** One agent's availability (server `usage.rs`): its limit windows, spend and state. */
+export interface UsageWindow { label: string; used: number; resets?: string }
+export interface Usage {
+  state: 'ok' | 'low' | 'out';
+  until?: string;
+  reason?: string;
+  windows: UsageWindow[];
+  source?: string;
+  observed?: string;
+  spent_today: number;
+  budget?: number;
+  held?: number;
+}
+
+/** `2026-11-24T15:00` -> `15:00`. */
+export const hhmm = (at?: string) => (at ? at.split('T')[1] ?? at : '');
+
+/** "out until 15:00 (5h window used up)", the same words the server's status lines use. */
+export function usageWhy(u: Usage): string {
+  const until = u.until ? ` until ${hhmm(u.until)}` : '';
+  return `${u.state}${until}${u.reason ? ` (${u.reason})` : ''}`;
+}
+
+/** A one-line account of where a usage reading came from, for hover text. */
+export function usageSource(u: Usage): string {
+  const parts = [u.source ? `From the ${u.source}${u.observed ? `, read ${timeLabel(u.observed)}` : ''}.` : 'No window reading yet.'];
+  if (u.spent_today > 0 || u.budget) parts.push(`$${u.spent_today.toFixed(2)} today${u.budget ? ` of $${u.budget.toFixed(2)}` : ''}.`);
+  return parts.join(' ');
+}
+
 export interface Snapshot {
   catchup?: Catchup;
+  usage?: Record<string, Usage>;
   room: string;
   rev: number;
   paused: boolean;

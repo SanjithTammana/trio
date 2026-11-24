@@ -70,6 +70,10 @@ pub struct MapState {
     lens: Lens,
     /// None until toggled: explain is then on while the room is empty (where people learn).
     explain: Option<bool>,
+    /// The catch-up on screen: its mark and when it first showed in a focused window.
+    catchup_shown: Option<(String, f64)>,
+    /// The catch-up already marked seen by the timer, so it posts once.
+    catchup_sent: Option<String>,
 }
 
 impl MapState {
@@ -110,7 +114,7 @@ pub fn build(snap: &Snapshot, scope: Scope) -> Model {
     let cutoff = newest - ACTIVE_HOURS * 3_600_000;
 
     let mut branches: Vec<usize> = (0..all.len()).filter(|&i| all[i].kind == "branch" && (scope == Scope::All || !merged.contains(&all[i].id))).collect();
-    branches.sort_by(|&a, &b| all[b].last.cmp(&all[a].last));
+    branches.sort_by(|&a, &b| all[b].last.cmp(&all[a].last).then_with(|| all[a].id.cmp(&all[b].id)));
     let b_index: HashMap<&str, usize> = branches.iter().enumerate().map(|(k, &i)| (all[i].id.as_str(), k)).collect();
 
     let mut items: Vec<usize> = (0..all.len())
@@ -629,6 +633,11 @@ fn work(ui: &mut egui::Ui, body: Rect, app: &mut TrioApp, snap: &Snapshot, t: &T
     let total: usize = lanes.iter().map(Vec::len).sum();
     let mut cu = ui.new_child(UiBuilder::new().max_rect(body).id_salt("work-body"));
     cu.set_clip_rect(body);
+    if total == 0 && scope == Scope::Active && all.iter().any(|n| n.kind == "item" && n.work.is_some()) {
+        let g = paint::wrapped(&cu, "Nothing in flight right now. Everything shows the finished and older work.", theme::sans(14.0), t.ink3, (body.width() - 32.0).min(640.0));
+        cu.painter().galley(pos2(body.center().x - g.size().x / 2.0, body.top() + 48.0), g, t.ink3);
+        return None;
+    }
     if total == 0 {
         let g = paint::wrapped(&cu, "No work yet. When a message names an item (P0a, XF29), it shows here in its stage: asked, in progress, in review, changes or done.", theme::sans(14.0), t.ink3, (body.width() - 32.0).min(640.0));
         cu.painter().galley(pos2(body.center().x - g.size().x / 2.0, body.top() + 48.0), g, t.ink3);
@@ -718,7 +727,9 @@ fn work(ui: &mut egui::Ui, body: Rect, app: &mut TrioApp, snap: &Snapshot, t: &T
                 let text = match (&w.waiting_on, w.lane.as_str()) {
                     (Some(who), _) => {
                         glyph::who(&p, mark, who, me, false, meta_c);
-                        if you { "waiting on you".to_string() } else { name_of(who, me) }
+                        // Waiting on an agent that is out: say when it is back.
+                        let held = snap.usage.get(who.as_str()).filter(|u| u.out()).map(|u| format!("{} out{}", name_of(who, me), u.until.as_deref().map(|b| format!(" \u{b7} back {}", crate::model::hhmm(b))).unwrap_or_default()));
+                        if you { "waiting on you".to_string() } else { held.unwrap_or_else(|| name_of(who, me)) }
                     }
                     (None, "done") => {
                         glyph::state(&p, mark, "pass", false, t.ink3, t.accent);
@@ -758,6 +769,26 @@ fn catchup(ui: &mut egui::Ui, body: Rect, app: &mut TrioApp, snap: &Snapshot, c:
     let cols = ((w / 300.0).floor() as usize).clamp(1, 3);
     let rows = c.moved.len().div_ceil(cols) + usize::from(c.more > 0);
     let h = 12.0 + 22.0 + if rows > 0 { 6.0 + rows as f32 * ROW } else { 0.0 } + 10.0;
+    // Seen once it has been on screen for a minute in a focused window (Dismiss is the fast way).
+    let (time, focused) = ui.ctx().input(|i| (i.time, i.focused));
+    let shown = match &app.map.catchup_shown {
+        Some((since, at)) if *since == c.since && focused => Some(*at),
+        _ => None,
+    };
+    let shown = shown.unwrap_or_else(|| {
+        app.map.catchup_shown = focused.then(|| (c.since.clone(), time));
+        time
+    });
+    if focused && app.map.catchup_sent.as_deref() != Some(c.since.as_str()) {
+        if time - shown >= 60.0 {
+            app.map.catchup_sent = Some(c.since.clone());
+            let client = app.client().clone();
+            let token = snap.token.clone();
+            crate::net::background(move || client.seen(&token), |_| ());
+        } else {
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+        }
+    }
     let rect = Rect::from_min_size(pos2(body.left() + 16.0, body.top() + 12.0), vec2(w, h));
     let p = ui.painter().clone();
     p.rect_filled(rect, 8.0, t.sunk);
@@ -827,7 +858,7 @@ fn catchup(ui: &mut egui::Ui, body: Rect, app: &mut TrioApp, snap: &Snapshot, c:
 /// sorted with cards waiting on `me` first, then newest. O(n log n).
 fn work_lanes<'a>(all: &'a [Node], me: &str, scope: Scope) -> Vec<Vec<&'a Node>> {
     // Age is measured from the newest item, as on the web (branches do not count).
-    let newest = all.iter().filter(|n| n.kind == "item").map(|n| ms(&n.last)).max().unwrap_or(0);
+    let newest = all.iter().filter(|n| n.kind == "item").map(|n| ms(moved(n))).max().unwrap_or(0);
     let mut lanes: Vec<Vec<&Node>> = vec![Vec::new(); WORK_LANES.len()];
     for n in all.iter().filter(|n| n.kind == "item") {
         let Some(w) = &n.work else { continue };

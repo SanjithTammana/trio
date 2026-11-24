@@ -24,6 +24,91 @@ pub struct Snapshot {
     /// What moved since the human was last here (server `seen.rs`); absent when nothing did.
     #[serde(default)]
     pub catchup: Option<Catchup>,
+    /// Each agent's availability (server `usage.rs`).
+    #[serde(default)]
+    pub usage: BTreeMap<String, Usage>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct UsageWindow {
+    pub label: String,
+    pub used: f64,
+    #[serde(default)]
+    pub resets: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Usage {
+    /// ok | low | out
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub until: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub windows: Vec<UsageWindow>,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub observed: Option<String>,
+    #[serde(default)]
+    pub spent_today: f64,
+    #[serde(default)]
+    pub budget: Option<f64>,
+    #[serde(default)]
+    pub held: usize,
+}
+
+/// `2026-11-24T15:00` -> `15:00`.
+pub fn hhmm(at: &str) -> &str {
+    at.split_once('T').map_or(at, |(_, t)| t)
+}
+
+impl Usage {
+    pub fn out(&self) -> bool {
+        self.state == "out"
+    }
+    /// "out until 15:00 (5h window used up)", as the server's status lines say it.
+    pub fn why(&self) -> String {
+        let until = self.until.as_deref().map(|u| format!(" until {}", hhmm(u))).unwrap_or_default();
+        let reason = self.reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default();
+        format!("{}{until}{reason}", self.state)
+    }
+    /// The fullest window, 0 to 100 (100 when out).
+    pub fn fullest(&self) -> f32 {
+        if self.out() {
+            return 100.0;
+        }
+        self.windows.iter().map(|w| w.used as f32).fold(0.0, f32::max)
+    }
+    /// One line for the open island: state, windows with resets, spend, held wakes.
+    pub fn line(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if self.state != "ok" {
+            parts.push(self.why());
+        }
+        for w in &self.windows {
+            parts.push(format!("{} {:.0}%{}", w.label, w.used, w.resets.as_deref().map(|r| format!(" resets {}", hhmm(r))).unwrap_or_default()));
+        }
+        if self.windows.is_empty() {
+            parts.push("no limit reading yet".into());
+        }
+        if self.spent_today > 0.0 || self.budget.is_some() {
+            parts.push(format!("${:.2} today{}", self.spent_today, self.budget.map(|b| format!(" of ${b:.2}")).unwrap_or_default()));
+        }
+        if self.held > 0 {
+            parts.push(format!("{} wake{} held", self.held, if self.held == 1 { "" } else { "s" }));
+        }
+        parts.join(" \u{b7} ")
+    }
+    /// Where the reading came from and how old it is, for hover text.
+    pub fn source_line(&self, today: &str) -> String {
+        if self.source.is_empty() {
+            return "No window reading yet.".into();
+        }
+        format!("From the {}{}.", self.source, self.observed.as_deref().map(|o| format!(", read {}", time_label(o, today))).unwrap_or_default())
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

@@ -8,7 +8,7 @@ import { Graph, type Pick } from './Graph';
 import { Markdown } from './Detail';
 import { State, Who } from './glyph';
 import { morph, unmorph } from './motion';
-import { STATE_LABEL, components, fetchDetail, lanes, nameOf, setPaused, timeLabel, useSnapshot, type Message, type Snapshot } from './api';
+import { STATE_LABEL, components, fetchDetail, hhmm, lanes, nameOf, setPaused, timeLabel, usageSource, usageWhy, useSnapshot, type Message, type Snapshot, type Usage } from './api';
 
 type Panel = { kind: 'message'; m: Message; key: string } | (Pick & { key: string }) | null;
 type View = 'chat' | 'map';
@@ -114,7 +114,8 @@ function Island({ snap, open, onToggle }: { snap: Snapshot; open: boolean; onTog
       <button className="island" onClick={(e) => onToggle(e.detail > 0)} aria-expanded={false} aria-label="Room status">
         {lanes(me).map((w) => {
           const s = status(w);
-          return <span key={w} className={`who ${s.live ? 'live' : ''}`} title={`${nameOf(w, me)}: ${s.text}`}><Who who={w} me={me} /><span className="nm">{nameOf(w, me)}</span></span>;
+          const u = snap.usage?.[w];
+          return <span key={w} className={`who ${s.live ? 'live' : ''}`} title={`${nameOf(w, me)}: ${s.text}${u ? ` \u00b7 ${usageWhy(u)}` : ''}`}><Who who={w} me={me} /><span className="nm">{nameOf(w, me)}</span>{u && <Meter u={u} />}</span>;
         })}
         <span className="sep" />
         <span className={`hop ${snap.paused ? 'paused' : ''}`} title="Agent wakes used of the hop budget">{hop}</span>
@@ -130,6 +131,7 @@ function Island({ snap, open, onToggle }: { snap: Snapshot; open: boolean; onTog
             <Who who={w} me={me} />
             <span className="nm">{nameOf(w, me)}</span>
             <span className="st">{s.text}{snap.graph.now[w]?.at ? ` · ${timeLabel(snap.graph.now[w].at)}` : ''}</span>
+            {snap.usage?.[w] && <UsageRow u={snap.usage[w]} />}
           </div>
         );
       })}
@@ -141,6 +143,31 @@ function Island({ snap, open, onToggle }: { snap: Snapshot; open: boolean; onTog
         </span>
       </div>
     </div>
+  );
+}
+
+/** The fullest limit window as a short bar: grey when fine, bright when low, carmine when out. */
+function Meter({ u }: { u: Usage }) {
+  const used = u.state === 'out' ? 100 : Math.max(0, ...u.windows.map((w) => w.used));
+  return <span className={`meter ${u.state}`} aria-hidden="true"><span style={{ width: `${Math.min(100, used)}%` }} /></span>;
+}
+
+/** Expanded island: each window with its reset, today's spend, and what is held. */
+function UsageRow({ u }: { u: Usage }) {
+  const held = u.held ?? 0;
+  return (
+    <span className={`usage ${u.state}`} title={usageSource(u)}>
+      {u.state !== 'ok' && <b>{usageWhy(u)}</b>}
+      {u.windows.map((w) => (
+        <span key={w.label} className="win">
+          <span className="meter-l" aria-hidden="true"><span style={{ width: `${Math.min(100, w.used)}%` }} /></span>
+          {w.label} {Math.round(w.used)}%{w.resets ? ` · resets ${hhmm(w.resets)}` : ''}
+        </span>
+      ))}
+      {u.windows.length === 0 && <span className="win">no limit reading yet</span>}
+      {(u.spent_today > 0 || u.budget) && <span className="win">${u.spent_today.toFixed(2)} today{u.budget ? ` of $${u.budget.toFixed(2)}` : ''}</span>}
+      {held > 0 && <span className="win">{held} wake{held === 1 ? '' : 's'} held</span>}
+    </span>
   );
 }
 

@@ -9,7 +9,7 @@
 // that captions every column, glyph and the strip in place.
 import { useEffect, useMemo, useState, type MouseEvent } from 'react';
 import { State, Who } from './glyph';
-import { components, lanes, markSeen, nameOf, timeLabel, WORK_LANES, type Component, type GraphNode, type Snapshot, type WorkLane } from './api';
+import { components, hhmm, lanes, markSeen, nameOf, timeLabel, WORK_LANES, type Component, type GraphNode, type Snapshot, type WorkLane } from './api';
 import { Segmented } from './astryx/Segmented';
 
 type Lens = 'work' | 'code' | 'time';
@@ -92,7 +92,7 @@ export function Graph({ snap, selected, onSelect }: { snap: Snapshot; selected: 
 
     const branches = all
       .filter((n) => n.kind === 'branch' && (scope === 'all' || !merged.has(n.id)))
-      .sort((a, b) => b.last.localeCompare(a.last));
+      .sort((a, b) => b.last.localeCompare(a.last) || a.id.localeCompare(b.id));
     const bIndex = new Map(branches.map((b, i) => [b.id, i]));
 
     const items = all.filter((n) => {
@@ -263,6 +263,18 @@ const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? o
 /** Since you left: what moved while you were away (including work done outside Trio). */
 function CatchupStrip({ snap, onSelect }: { snap: Snapshot; onSelect: (p: Pick, el: Element, pointer: boolean) => void }) {
   const c = snap.catchup!;
+  // Seen once it has been on screen for a minute in a visible page (Dismiss is the fast way).
+  const token = snap.token;
+  useEffect(() => {
+    let t: number | undefined;
+    const arm = () => {
+      window.clearTimeout(t);
+      if (document.visibilityState === 'visible') t = window.setTimeout(() => markSeen(token), 60_000);
+    };
+    arm();
+    document.addEventListener('visibilitychange', arm);
+    return () => { window.clearTimeout(t); document.removeEventListener('visibilitychange', arm); };
+  }, [token, c.since]);
   const facts = [
     c.moved.length + c.more > 0 && plural(c.moved.length + c.more, 'item moved', 'items moved'),
     c.waiting_on_you > 0 && `${c.waiting_on_you} wait${c.waiting_on_you === 1 ? 's' : ''} on you`,
@@ -317,8 +329,16 @@ function WorkLens({ snap, scope, explain, selected, onSelect, onHover }: { snap:
     return out;
   }, [snap.graph.items, scope, me]);
   const total = [...byLane.values()].reduce((a, l) => a + l.length, 0);
+  // A card waiting on an agent that is out says when it is back.
+  const heldText = (who: string) => {
+    const u = snap.usage?.[who];
+    return u?.state === 'out' ? `${nameOf(who, me)} out${u.until ? ` · back ${hhmm(u.until)}` : ''}` : null;
+  };
   if (total === 0 && snap.graph.items.some((n) => n.kind === 'item') && !snap.graph.items.some((n) => n.work)) {
     return <p className="empty">This server predates the Work lens. Update Trio, or use the Code lens.</p>;
+  }
+  if (total === 0 && scope === 'active' && snap.graph.items.some((n) => n.kind === 'item' && n.work)) {
+    return <p className="empty">Nothing in flight right now. Everything shows the finished and older work.</p>;
   }
   if (total === 0) {
     return <p className="empty">No work yet. When a message names an item (P0a, XF29), it shows here in its stage: asked, in progress, in review, changes or done.</p>;
@@ -340,7 +360,7 @@ function WorkLens({ snap, scope, explain, selected, onSelect, onHover }: { snap:
                   onMouseEnter={() => onHover(key)} onMouseLeave={() => onHover(null)} onFocus={() => onHover(key)} onBlur={() => onHover(null)}>
                   <span className="card-t">{n.summary || <b className="mono">{n.id}</b>}</span>
                   <span className="card-m">
-                    <span>{n.summary && <span className="id-tag mono">{n.id}</span>}{w.waiting_on ? <><Who who={w.waiting_on} me={me} />{w.waiting_on === me ? 'waiting on you' : nameOf(w.waiting_on, me)}</> : w.lane === 'done' ? <><State state="pass" />done</> : <><State state={n.state} />{n.state}</>}</span>
+                    <span>{n.summary && <span className="id-tag mono">{n.id}</span>}{w.waiting_on ? <><Who who={w.waiting_on} me={me} />{w.waiting_on === me ? 'waiting on you' : heldText(w.waiting_on) ?? nameOf(w.waiting_on, me)}</> : w.lane === 'done' ? <><State state="pass" />done</> : <><State state={n.state} />{n.state}</>}</span>
                     <span>{timeLabel(moved(n))}</span>
                   </span>
                 </button>

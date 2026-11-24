@@ -98,6 +98,15 @@ code, pre { font-family: var(--mono); font-size: 12.5px; }
 .island.open .row { display: grid; grid-template-columns: 14px 58px 1fr; gap: 8px; align-items: baseline; white-space: normal; }
 .island.open .row .g { color: var(--bg); }
 .island.open .row .st { color: color-mix(in srgb, var(--bg) 72%, var(--ink)); overflow-wrap: anywhere; }
+.island .meter { display: inline-block; width: 18px; height: 3px; margin-left: 2px; border-radius: 2px; background: color-mix(in srgb, var(--bg) 22%, var(--ink)); overflow: hidden; }
+.island .meter > span, .island .meter-l > span { display: block; height: 100%; background: color-mix(in srgb, var(--bg) 70%, var(--ink)); }
+.island .meter.low > span, .island .usage.low .meter-l > span { background: var(--bg); }
+.island .meter.out > span, .island .usage.out .meter-l > span { background: var(--accent); }
+.island.open .row .usage { grid-column: 3; display: flex; flex-wrap: wrap; gap: 2px 12px; font-size: 11.5px; color: color-mix(in srgb, var(--bg) 62%, var(--ink)); }
+.island.open .row .usage b { font-weight: 600; color: var(--bg); }
+.island.open .row .usage.out b { color: var(--accent); }
+.island.open .row .usage .win { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.island .meter-l { display: inline-block; width: 28px; height: 3px; border-radius: 2px; background: color-mix(in srgb, var(--bg) 22%, var(--ink)); overflow: hidden; }
 .island.open .actions { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding-top: 8px; border-top: 1px solid color-mix(in srgb, var(--bg) 18%, var(--ink)); color: color-mix(in srgb, var(--bg) 72%, var(--ink)); }
 .island.open .actions button { padding: 3px 11px; border-radius: 999px; border: 1px solid color-mix(in srgb, var(--bg) 35%, var(--ink)); color: var(--bg); }
 .island.open .actions button.on { border-color: var(--accent); color: var(--accent); }

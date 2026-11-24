@@ -416,7 +416,10 @@ impl TrioApp {
         // Closed capsule geometry.
         let names: Vec<_> = lane.iter().map(|w| paint::line(ui, &name_of(w, me), theme::sans(12.5), t.bg, 200.0)).collect();
         let hop_g = paint::line(ui, &hop, theme::mono(12.5), t.bg, 200.0);
-        let parts: f32 = names.iter().map(|g| 10.0 + if narrow { 0.0 } else { 5.0 + g.size().x }).sum::<f32>() + 12.0 * 3.0 + 1.0 + 12.0 + hop_g.size().x;
+        // A short bar after each agent with a usage reading: its fullest window.
+        const METER: f32 = 18.0;
+        let meters = lane.iter().filter(|w| snap.usage.contains_key(w.as_str())).count() as f32;
+        let parts: f32 = names.iter().map(|g| 10.0 + if narrow { 0.0 } else { 5.0 + g.size().x }).sum::<f32>() + meters * (4.0 + METER) + 12.0 * 3.0 + 1.0 + 12.0 + hop_g.size().x;
         let w = parts + 28.0;
         let cx = center_x.unwrap_or(top.left() + 16.0 + w / 2.0);
         let capsule = Rect::from_center_size(pos2(cx, top.center().y), vec2(w, 32.0));
@@ -429,7 +432,11 @@ impl TrioApp {
             .map(|wn| {
                 let (_, text) = status(wn);
                 let at = snap.graph.now.get(wn.as_str()).map(|n| n.at.clone()).unwrap_or_default();
-                if at.is_empty() { text } else { format!("{text} · {}", time_label(&at, day)) }
+                let line = if at.is_empty() { text } else { format!("{text} · {}", time_label(&at, day)) };
+                match snap.usage.get(wn.as_str()) {
+                    Some(u) => format!("{line}\n{}", u.line()),
+                    None => line,
+                }
             })
             .collect();
         let row_w = open_w - 32.0 - 88.0;
@@ -487,9 +494,25 @@ impl TrioApp {
                     p.galley(r.min, g.clone(), t.bg);
                     x += 5.0 + g.size().x;
                 }
+                let usage = snap.usage.get(wn.as_str());
+                if let Some(u) = usage {
+                    let track = Rect::from_min_size(pos2(x + 4.0, capsule.center().y - 1.5), vec2(METER, 3.0));
+                    p.rect_filled(track, 1.5, fade(ink_on(0.22), content_alpha));
+                    let fill = match u.state.as_str() {
+                        "out" => t.accent,
+                        "low" => t.bg,
+                        _ => ink_on(0.7),
+                    };
+                    let fw = METER * (u.fullest() / 100.0).clamp(0.0, 1.0);
+                    if fw > 0.0 {
+                        p.rect_filled(Rect::from_min_size(track.min, vec2(fw, 3.0)), 1.5, fade(fill, content_alpha));
+                    }
+                    x += 4.0 + METER;
+                }
                 let tip_rect = Rect::from_x_y_ranges(gr.left()..=x, capsule.y_range());
                 if iu.rect_contains_pointer(tip_rect) {
-                    hit.resp.clone().on_hover_text(format!("{}: {text}", name_of(wn, me)));
+                    let extra = usage.map(|u| format!(" \u{b7} {}", u.why())).unwrap_or_default();
+                    hit.resp.clone().on_hover_text(format!("{}: {text}{extra}", name_of(wn, me)));
                 }
                 x += if i < 2 { 12.0 } else { 0.0 };
             }
@@ -518,6 +541,11 @@ impl TrioApp {
             let sg = paint::wrapped(&iu, full, theme::sans(12.5), ink_on(0.72), inner.width() - 88.0);
             let h = sg.size().y.max(20.0);
             p.galley(pos2(inner.left() + 88.0, y + 1.0), sg, t.bg);
+            // Hover a row for where its usage reading came from and how old it is.
+            if let Some(u) = snap.usage.get(wn.as_str()) {
+                let row = Rect::from_min_size(pos2(inner.left(), y), vec2(inner.width(), h));
+                iu.interact(row, Id::unique(("island-usage", wn)), egui::Sense::hover()).on_hover_text(u.source_line(day));
+            }
             y += h + 8.0;
         }
         p.line_segment([pos2(inner.left(), y), pos2(inner.right(), y)], Stroke::new(1.0, ink_on(0.18)));

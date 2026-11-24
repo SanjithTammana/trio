@@ -141,8 +141,10 @@ pub fn home() -> Option<PathBuf> {
     std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from)
 }
 
+/// `~/.trio/usage/claude.json`, or under `TRIO_HOME` when set (as the hook store does).
 pub fn claude_file() -> Option<PathBuf> {
-    Some(home()?.join(".trio").join("usage").join("claude.json"))
+    let trio = std::env::var_os("TRIO_HOME").map(PathBuf::from).or_else(|| Some(home()?.join(".trio")))?;
+    Some(trio.join("usage").join("claude.json"))
 }
 
 /// What `trio statusline` stores: the epoch it ran and the status line's `rate_limits` as given.
