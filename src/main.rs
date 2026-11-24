@@ -10,6 +10,7 @@
 
 mod agent;
 mod gitwatch;
+mod github;
 mod graph;
 mod hook;
 mod oslock;
@@ -36,6 +37,7 @@ fn main() {
         Some("say") => cmd_say(&args[1..]),
         Some("init") => cmd_init(&args[1..]),
         Some("bind") => cmd_bind(&args[1..]),
+        Some("link") => cmd_link(&args[1..]),
         Some("setup") => setup::cmd_setup(&args[1..]),
         // Claude Code's status line: never fail it, whatever happens.
         Some("statusline") => {
@@ -50,7 +52,7 @@ fn main() {
             }),
             _ => Err("usage: trio hook <claude|codex> <prompt|stop|session-start>".into()),
         },
-        _ => Err("usage: trio open <room-dir> | trio say --room <dir> --as <who> \"<summary>\" [--detail ..] | trio init <room-dir> | trio bind <room-dir> <claude|codex> | trio hook <claude|codex> <event> | trio setup | trio statusline [-- \"<your status line command>\"]".into()),
+        _ => Err("usage: trio open <room-dir> | trio say --room <dir> --as <who> \"<summary>\" [--detail ..] | trio init <room-dir> | trio bind <room-dir> <claude|codex> | trio link <room-dir> <repo-folder|owner/name|github-url> [--name <label>] | trio hook <claude|codex> <event> | trio setup | trio statusline [-- \"<your status line command>\"]".into()),
     };
     if let Err(e) = code {
         eprintln!("trio: {e}");
@@ -147,12 +149,21 @@ fn cmd_init(args: &[String]) -> Result<(), String> {
 fn init_room(dir: &std::path::Path) -> Result<(), String> {
     let cfg = dir.join(".trio").join("room.toml");
     let me = room::human(&room::RoomCfg::default());
-    let body = room_toml(&me, &posts_files(dir), room::git_root(dir).as_deref());
+    let repo = room::git_root(dir);
+    let mut body = room_toml(&me, &posts_files(dir), repo.as_deref());
+    // Pull requests too, when the repo pushes to GitHub and `gh` is signed in.
+    if let Some(gh) = repo.as_deref().and_then(github::repo_of_clone).filter(|_| gh_signed_in()) {
+        body = with_links(&body, None, Some(&gh), "")?;
+    }
     std::fs::create_dir_all(cfg.parent().expect("parent")).map_err(|e| e.to_string())?;
     std::fs::write(&cfg, body).map_err(|e| e.to_string())?;
     register(dir);
     println!("wrote {}", cfg.display());
     Ok(())
+}
+
+fn gh_signed_in() -> bool {
+    std::process::Command::new("gh").args(["auth", "status"]).output().is_ok_and(|o| o.status.success())
 }
 
 /// `claude-posts.md`, `codex-posts.md`, `sanjith-posts.md`, ...: (file, who), sorted by file.
@@ -281,6 +292,77 @@ fn room_key(dir: &std::path::Path) -> String {
 /// Set enabled/session/cwd/wake under `[agents.<agent>]` in room.toml, keeping every other key,
 /// table and comment. Writers hold an OS lock on `room.toml.lock` for the whole read-edit-rename,
 /// so two binds at once apply one after the other and neither edit is lost.
+/// `trio link <room> <target> [--name <label>]`: add a repo the project spans. A folder is a
+/// local clone (`[[repos]]`; its GitHub origin, if any, is linked too for pull requests); an
+/// `owner/name` or GitHub URL links pull requests alone (`[[github]]`).
+fn cmd_link(args: &[String]) -> Result<(), String> {
+    let pos = positional(args);
+    let dir = PathBuf::from(pos.first().ok_or("missing room dir")?);
+    let target = pos.get(1).ok_or("missing what to link: a repo folder, owner/name, or a GitHub URL")?;
+    let name = flag(args, "--name").unwrap_or_default();
+    let cfg = dir.join(".trio").join("room.toml");
+    if !cfg.exists() {
+        init_room(&dir)?;
+    }
+    let folder = PathBuf::from(target);
+    let (repo, github) = if folder.is_dir() {
+        let top = room::git_root(&folder).ok_or_else(|| format!("{target} is not in a git repo"))?;
+        let gh = github::repo_of_clone(&top);
+        (Some(top), gh)
+    } else {
+        let gh = github::repo_of_url(target).or_else(|| github::repo_of_url(&format!("https://github.com/{target}"))).ok_or_else(|| format!("{target}: not a folder, owner/name, or GitHub URL"))?;
+        (None, Some(gh))
+    };
+    let _lock = oslock::hold(&cfg.with_extension("toml.lock"), Duration::from_secs(5))?;
+    let before = std::fs::read_to_string(&cfg).map_err(|e| format!("{}: {e}", cfg.display()))?;
+    let after = with_links(&before, repo.as_deref(), github.as_deref(), &name)?;
+    if after == before {
+        println!("already linked");
+        return Ok(());
+    }
+    std::fs::write(&cfg, after).map_err(|e| e.to_string())?;
+    if let Some(r) = &repo {
+        println!("linked {}", r.display());
+    }
+    if let Some(g) = &github {
+        println!("linked pull requests of {g} (read with your gh login)");
+    }
+    println!("restart the room's server to pick it up");
+    Ok(())
+}
+
+/// Add `[[repos]]` and `[[github]]` entries, skipping any already there.
+fn with_links(text: &str, repo: Option<&std::path::Path>, github: Option<&str>, name: &str) -> Result<String, String> {
+    use toml_edit::{value, ArrayOfTables, DocumentMut, Table};
+    let mut doc: DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| e.to_string())?;
+    let same = |a: &str, b: &str| a.replace('\\', "/").eq_ignore_ascii_case(&b.replace('\\', "/"));
+    if let Some(r) = repo {
+        let r = r.display().to_string().replace('\\', "/");
+        let current = doc.get("repo").and_then(|v| v.as_str()).map(str::to_string);
+        let list = doc.entry("repos").or_insert(toml_edit::Item::ArrayOfTables(ArrayOfTables::new())).as_array_of_tables_mut().ok_or("`repos` is not a list of tables")?;
+        if !current.is_some_and(|c| same(&c, &r)) && !list.iter().any(|t| t.get("path").and_then(|v| v.as_str()).is_some_and(|p| same(p, &r))) {
+            let mut t = Table::new();
+            t["path"] = value(r);
+            if !name.is_empty() {
+                t["name"] = value(name);
+            }
+            list.push(t);
+        }
+    }
+    if let Some(g) = github {
+        let list = doc.entry("github").or_insert(toml_edit::Item::ArrayOfTables(ArrayOfTables::new())).as_array_of_tables_mut().ok_or("`github` is not a list of tables")?;
+        if !list.iter().any(|t| t.get("repo").and_then(|v| v.as_str()).is_some_and(|p| p.eq_ignore_ascii_case(g))) {
+            let mut t = Table::new();
+            t["repo"] = value(g);
+            if !name.is_empty() && repo.is_none() {
+                t["name"] = value(name);
+            }
+            list.push(t);
+        }
+    }
+    Ok(doc.to_string())
+}
+
 fn set_agent(path: &std::path::Path, agent: &str, session: &str, cwd: &str, wake: &[String]) -> Result<(), String> {
     let _lock = oslock::hold(&path.with_extension("toml.lock"), Duration::from_secs(5))?;
     let before = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -447,6 +529,18 @@ mod tests {
         let none: room::RoomCfg = toml::from_str(&room_toml("sanjith", &[], None)).unwrap();
         assert!(none.repo.is_none() && none.import.is_empty());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn link_adds_repos_and_pull_requests_once() {
+        let base = room_toml("sanjith", &[], Some(std::path::Path::new("C:/work/web")));
+        let one = with_links(&base, Some(std::path::Path::new("C:\\work\\api")), Some("o/api"), "api").unwrap();
+        let cfg: room::RoomCfg = toml::from_str(&one).unwrap();
+        assert_eq!((cfg.repos.len(), cfg.repos[0].name.as_str(), cfg.github.len(), cfg.github[0].repo.as_str()), (1, "api", 1, "o/api"));
+        assert_eq!(cfg.repos[0].path, std::path::Path::new("C:/work/api"));
+        assert_eq!(with_links(&one, Some(std::path::Path::new("c:/work/api")), Some("O/API"), "").unwrap(), one, "linking again changes nothing");
+        assert_eq!(with_links(&one, Some(std::path::Path::new("C:/work/web")), None, "").unwrap(), one, "the room's own repo is already linked");
+        assert!(one.contains("[agents.claude]"), "the rest of the file stays");
     }
 
     #[test]

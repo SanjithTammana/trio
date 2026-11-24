@@ -222,7 +222,7 @@ pub fn all(g: &Graph, me: &str) -> HashMap<String, Work> {
             if it.kind() == "item" {
                 let branches = by.get(it.id.as_str()).map(Vec::as_slice).unwrap_or(&[]);
                 Some((it.id.clone(), work(it, branches, g, me)))
-            } else if !linked.contains(it.id.as_str()) && !it.tip_sha.is_empty() {
+            } else if !linked.contains(it.id.as_str()) && (!it.tip_sha.is_empty() || it.latest_request().is_some() || !it.verdicts.is_empty()) {
                 // A branch no item names is its own card: in an existing repo most work is
                 // branches and commits, not posts that name items.
                 Some((it.id.clone(), branch_work(it, me)))

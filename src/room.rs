@@ -44,6 +44,10 @@ pub struct RoomCfg {
     /// With more than one repo, branches show as `<name>:<branch>`.
     #[serde(default)]
     pub repos: Vec<RepoCfg>,
+    /// GitHub repos whose pull requests appear as review requests and verdicts:
+    /// `[[github]] repo = "owner/name"`. Read with your `gh` login every two minutes.
+    #[serde(default)]
+    pub github: Vec<GitHubCfg>,
     #[serde(default)]
     pub agents: HashMap<String, AgentConfig>,
     /// Daily spend caps in dollars: `[budget] claude_usd_day = 5.0`, `codex_usd_day = 3.0`.
@@ -109,6 +113,36 @@ pub struct RepoCfg {
     pub base: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct GitHubCfg {
+    /// `owner/name`
+    pub repo: String,
+    /// Label for its branches when it has no local clone here (default: the repo's name).
+    #[serde(default)]
+    pub name: String,
+}
+
+/// How each `[[github]]` entry maps into the room: a linked local clone (same `origin`) shares
+/// that clone's branch names; one without a clone stands in for its branches itself.
+pub fn github_links(cfg: &RoomCfg, root: &Path) -> Vec<crate::github::Link> {
+    let local: Vec<(Option<String>, Option<String>)> = repos_of(cfg, root).into_iter().map(|(label, path, _)| (label, crate::github::repo_of_clone(&path))).collect();
+    let many = local.len() + cfg.github.len() > 1;
+    cfg.github
+        .iter()
+        .map(|g| {
+            let clone = local.iter().find(|(_, r)| r.as_deref().is_some_and(|r| r.eq_ignore_ascii_case(&g.repo)));
+            let own = if g.name.is_empty() { g.repo.rsplit('/').next().unwrap_or(&g.repo).to_string() } else { g.name.clone() };
+            crate::github::Link {
+                repo: g.repo.clone(),
+                label: clone.map_or_else(|| many.then_some(own), |(l, _)| l.clone()),
+                remote_only: clone.is_none(),
+                me: human(cfg),
+                my_login: None,
+            }
+        })
+        .collect()
+}
+
 /// One watched repo: its label (None when the room has only one) and its watcher.
 struct GitSource {
     label: Option<String>,
@@ -121,8 +155,7 @@ pub fn repos_of(cfg: &RoomCfg, root: &Path) -> Vec<(Option<String>, PathBuf, Opt
     let first = match &cfg.repo {
         Some(r) if r.as_os_str().is_empty() => None,
         Some(r) => Some(root.join(r)),
-        None if cfg.repos.is_empty() => git_root(root),
-        None => None,
+        None => git_root(root),
     };
     let mut all: Vec<(String, PathBuf, Option<String>)> = Vec::new();
     for (name, path, base) in first.map(|p| (String::new(), p, cfg.base.clone())).into_iter().chain(cfg.repos.iter().map(|r| (r.name.clone(), root.join(&r.path), r.base.clone()))) {
@@ -194,6 +227,9 @@ pub struct Room {
     pending_git: VecDeque<Event>,
     /// The mark saved by an earlier run, until the first ingest turns it into this run's mark.
     restored: Option<crate::seen::Seen>,
+    github: Vec<crate::github::GitHubWatch>,
+    /// The last recorded row for each `gh:` id, so an unchanged pull request is not re-appended.
+    gh_rows: HashMap<String, Event>,
     /// Per source: how many ids it has yielded, for stable positions.
     counts: Vec<u64>,
     trio_exe: String,
@@ -254,6 +290,7 @@ impl Room {
             .map(|(label, path, base)| GitSource { watch: crate::gitwatch::GitWatch::start(path, base, label.clone()), label })
             .collect();
         let restored = crate::seen::load(&root);
+        let github = github_links(&cfg, &root).into_iter().map(crate::github::GitHubWatch::start).collect();
         Ok(Self {
             root,
             ledger,
@@ -274,6 +311,8 @@ impl Room {
             git_seeded: false,
             pending_git: VecDeque::new(),
             restored,
+            github,
+            gh_rows: HashMap::new(),
             counts: Vec::new(),
             trio_exe,
             seen: None,
@@ -429,6 +468,9 @@ impl Room {
             changed |= self.apply_git_poll(p);
         }
         let mut fresh = Vec::new();
+        if self.flush_github() {
+            self.poll_source(n - 1, &mut fresh);
+        }
         self.flush_git(n - 1, &mut fresh);
         changed | self.apply_batch(fresh)
     }
@@ -490,7 +532,29 @@ impl Room {
         }
     }
 
+    /// Record pull-request rows that changed since they were last recorded. True if any were.
+    fn flush_github(&mut self) -> bool {
+        let mut appended = false;
+        for i in 0..self.github.len() {
+            for e in self.github[i].take() {
+                if self.gh_rows.get(&e.id) == Some(&e) {
+                    continue;
+                }
+                if let Err(err) = append(&self.ledger, &e) {
+                    eprintln!("trio: could not record {}: {err}", e.id);
+                    return appended;
+                }
+                self.gh_rows.insert(e.id.clone(), e);
+                appended = true;
+            }
+        }
+        appended
+    }
+
     fn apply(&mut self, e: Event, pos: u64) -> bool {
+        if e.id.starts_with("gh:") {
+            self.gh_rows.insert(e.id.clone(), e.clone());
+        }
         if let Body::Commit { branch, sha, touches, .. } = &e.body
             && crate::gitwatch::is_refresh(&e)
         {
@@ -1064,6 +1128,46 @@ mod tests {
         for d in [api, web, room] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    #[test]
+    fn a_pull_request_moves_its_branch_through_review() {
+        use crate::github::{Link, Login, Pr, Requested, Review};
+        let root = temp_room("pull");
+        std::fs::write(root.join(".trio/room.toml"), "me = 'sanjith'\nrepo = ''\n").unwrap();
+        let link = Link { repo: "o/r".into(), label: None, remote_only: true, me: "sanjith".into(), my_login: Some("ana".into()) };
+        let mut pr = Pr {
+            number: 7, title: "Rate limit the login".into(), head_ref_name: "feature/limit".into(), head_ref_oid: "abc".into(),
+            state: "OPEN".into(), is_draft: false, created_at: "2026-11-24T15:00:00Z".into(), updated_at: "2026-11-24T15:00:00Z".into(),
+            merged_at: None, url: String::new(), author: Some(Login { login: "bo".into() }),
+            review_requests: vec![Requested { login: Some("ana".into()), name: None }], latest_reviews: vec![],
+        };
+        let mut room = Room::open(&root).unwrap();
+        let push = |room: &mut Room, pr: &Pr| {
+            for e in link.events(pr) {
+                if room.gh_rows.get(&e.id) != Some(&e) {
+                    append(&room.ledger, &e).unwrap();
+                }
+            }
+            room.tick();
+            crate::work::all(&room.graph, &room.me())["feature/limit"].clone()
+        };
+        let w = push(&mut room, &pr);
+        assert_eq!((w.lane, w.waiting_on.as_deref()), ("review", Some("sanjith")), "my login was asked: waiting on you");
+        assert_eq!(room.graph.items["feature/limit"].title, "Rate limit the login");
+        pr.latest_reviews.push(Review { author: Some(Login { login: "ana".into() }), state: "APPROVED".into(), submitted_at: "2026-11-24T16:00:00Z".into() });
+        assert_eq!(push(&mut room, &pr).lane, "done");
+        pr.state = "MERGED".into();
+        pr.merged_at = Some("2026-11-24T17:00:00Z".into());
+        assert_eq!(push(&mut room, &pr).lane, "done");
+        let rows = ledger_rows(&room).len();
+        push(&mut room, &pr);
+        assert_eq!(ledger_rows(&room).len(), rows, "an unchanged pull request is not recorded again");
+        drop(room);
+        let mut cold = Room::open(&root).unwrap();
+        cold.tick();
+        assert_eq!(crate::work::all(&cold.graph, &cold.me())["feature/limit"].lane, "done", "replay agrees");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn ledger_rows(room: &Room) -> Vec<Event> {

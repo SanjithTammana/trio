@@ -35,7 +35,8 @@ pub fn cmd_setup(args: &[String]) -> Result<(), String> {
          - Codex: add the two hooks in adapters/codex/hooks.json (see docs/codex.md), then review them in Settings > Hooks\n\
          - Usage-aware routing for Claude: set Claude Code's statusLine command to `trio statusline`\n   \
            (or `trio statusline -- \"<your current command>\"` to keep yours); Codex is read from its session logs\n\
-         - A room: trio open <project-dir> (any folder; it picks up the repo and *-posts.md files); in a session, type: trio"
+         - A room: trio open <project-dir> (any folder; it picks up the repo, its GitHub pull requests and *-posts.md files)\n\
+         - More repos in one project: trio link <project-dir> <other-repo-folder | owner/name>; in a session, type: trio"
     );
     Ok(())
 }
