@@ -122,7 +122,7 @@ impl Tips {
         let repo = self.repo.clone();
         let list = git(
             &repo,
-            &["for-each-ref", "--format=%(refname:short)%09%(objectname)%09%(committerdate:format-local:%Y-%m-%dT%H:%M)%09%(subject)", "refs/heads/claude", "refs/heads/codex"],
+            &["for-each-ref", "--format=%(refname:short)%09%(objectname)%09%(committerdate:format-local:%Y-%m-%dT%H:%M)%09%(subject)", "refs/heads"],
         )?;
         if self.base.is_none() {
             self.base = base_branch(&repo, self.configured_base.as_deref());
@@ -135,6 +135,10 @@ impl Tips {
         for l in list.lines() {
             let mut p = l.splitn(4, '\t');
             let (Some(branch), Some(sha), Some(at)) = (p.next(), p.next(), p.next()) else { continue };
+            // Topic branches only (`owner/topic`): the base and other one-word names are not work.
+            if !branch.contains('/') || Some(branch) == self.base.as_deref() {
+                continue;
+            }
             let subject = p.next().unwrap_or("");
             listed.insert(branch);
             let key = format!("{sha}:{base_tip}");
@@ -192,8 +196,10 @@ impl Tips {
     }
 }
 
+/// The agent a branch belongs to by its prefix; any other branch is the person's (`""`, which
+/// the room fills in with its human).
 fn owner(branch: &str) -> String {
-    branch.split('/').next().unwrap_or("git").to_string()
+    branch.split('/').next().filter(|o| ["claude", "codex"].contains(o)).unwrap_or("").to_string()
 }
 
 fn action(e: &Event) -> Option<&str> {

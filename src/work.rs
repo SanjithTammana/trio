@@ -83,6 +83,33 @@ pub fn work(it: &WorkItem, branches: &[&str], g: &Graph, me: &str) -> Work {
     Work { lane, story: story(it, &live, all_merged, ask, lane, waiting_on.as_deref(), me), waiting_on, last: last.into(), state: verdict.map_or(it.base_state(), |v| &v.outcome).into() }
 }
 
+/// The Work reading of a branch no item names. The same order as items: a request after the
+/// last verdict is review; a merge after the last verdict is done; else the verdict decides;
+/// else it is in progress. It waits on its agent (by prefix) when it has one.
+fn branch_work(b: &WorkItem, me: &str) -> Work {
+    let verdict = b.verdicts.iter().max_by_key(|v| v.key());
+    let ask = b.latest_request().filter(|r| verdict.is_none_or(|v| r.key() > v.key()));
+    let merged = b.merged_at.as_ref().filter(|(at, seq)| verdict.is_none_or(|v| (at.as_str(), *seq) > v.key()));
+    let author = agent_of(&b.id);
+    let (lane, waiting_on) = match (ask, merged, verdict.map(|v| v.outcome.as_str())) {
+        (Some(r), _, _) => ("review", reviewer(r, author.as_deref())),
+        (None, Some(_), _) | (None, None, Some("pass")) => ("done", None),
+        (None, None, Some("changes" | "blocked")) => ("changes", author.clone()),
+        (None, None, Some(_)) => ("review", None),
+        (None, None, None) => ("progress", author.clone()),
+    };
+    let whose = author.as_deref().map(cap).unwrap_or_else(|| who(&b.owner, me));
+    let mut story = format!("{whose}'s branch {}", b.id);
+    if !b.title.is_empty() {
+        story.push_str(&format!(", last commit \u{201c}{}\u{201d}", b.title));
+    }
+    story.push_str(if b.merged_at.is_some() { ", merged." } else { "." });
+    if let Some(n) = &waiting_on {
+        story.push_str(&format!(" Waiting on {}.", if n == me { "you".to_string() } else { cap(n) }));
+    }
+    Work { lane, waiting_on, story, last: b.last.clone(), state: verdict.map_or(b.base_state(), |v| &v.outcome).into() }
+}
+
 /// The agent a branch belongs to, from its prefix (`claude/hooks-p0a` -> claude).
 fn agent_of(node: &str) -> Option<String> {
     node.split_once('/').map(|(o, _)| o).filter(|o| AGENTS.contains(o)).map(str::to_string)
@@ -188,12 +215,20 @@ fn story(it: &WorkItem, live: &[&WorkItem], all_merged: bool, ask: Option<&Revie
 /// The Work reading of every item in the graph, keyed by id. Branches are left to the Code lens.
 pub fn all(g: &Graph, me: &str) -> HashMap<String, Work> {
     let by = implementers(g);
+    let linked: std::collections::HashSet<&str> = by.values().flatten().copied().collect();
     g.items
         .values()
-        .filter(|it| it.kind() == "item")
-        .map(|it| {
-            let branches = by.get(it.id.as_str()).map(Vec::as_slice).unwrap_or(&[]);
-            (it.id.clone(), work(it, branches, g, me))
+        .filter_map(|it| {
+            if it.kind() == "item" {
+                let branches = by.get(it.id.as_str()).map(Vec::as_slice).unwrap_or(&[]);
+                Some((it.id.clone(), work(it, branches, g, me)))
+            } else if !linked.contains(it.id.as_str()) && !it.tip_sha.is_empty() {
+                // A branch no item names is its own card: in an existing repo most work is
+                // branches and commits, not posts that name items.
+                Some((it.id.clone(), branch_work(it, me)))
+            } else {
+                None
+            }
         })
         .collect()
 }
@@ -258,6 +293,20 @@ mod tests {
     }
 
     #[test]
+    fn a_branch_no_item_names_is_its_own_card() {
+        let d = derivers();
+        let mut g = Graph::default();
+        let commit = |branch: &str, merged| Body::Commit { branch: branch.into(), sha: "abc12345".into(), subject: "Add the login form".into(), touches: vec![], merged, gone: false };
+        g.apply(&ev("g1", "2026-11-23T09:00", "sanjith", commit("feature/login", false)), &d);
+        g.apply(&ev("g2", "2026-11-23T09:05", "claude", commit("claude/login-tests", false)), &d);
+        let w = all(&g, "sanjith");
+        assert_eq!((w["feature/login"].lane, w["feature/login"].waiting_on.as_deref()), ("progress", None));
+        assert_eq!((w["claude/login-tests"].lane, w["claude/login-tests"].waiting_on.as_deref()), ("progress", Some("claude")));
+        g.apply(&ev("g3", "2026-11-23T10:00", "sanjith", commit("feature/login", true)), &d);
+        assert_eq!(all(&g, "sanjith")["feature/login"].lane, "done");
+    }
+
+    #[test]
     fn a_branch_makes_an_item_in_progress_and_merging_it_finishes_it() {
         let d = derivers();
         let mut g = Graph::default();
@@ -266,7 +315,7 @@ mod tests {
         let w = &all(&g, "sanjith")["XF1"];
         assert_eq!((w.lane, w.waiting_on.as_deref()), ("progress", Some("codex")));
         assert!(w.story.contains("On branch codex/x."), "{}", w.story);
-        assert!(!all(&g, "sanjith").contains_key("codex/x"), "branches are not Work cards");
+        assert!(!all(&g, "sanjith").contains_key("codex/x"), "a branch that implements an item is not its own card");
         g.apply(&ev("g2", "2026-11-23T10:00", "codex", commit(true)), &d);
         assert_eq!(all(&g, "sanjith")["XF1"].lane, "done");
     }

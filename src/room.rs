@@ -384,7 +384,12 @@ impl Room {
         changed | self.apply_batch(fresh)
     }
 
-    fn apply_git_poll(&mut self, poll: crate::gitwatch::Poll) -> bool {
+    fn apply_git_poll(&mut self, mut poll: crate::gitwatch::Poll) -> bool {
+        // A branch without an agent prefix is the human's.
+        let me = self.me();
+        for e in poll.durable.iter_mut().chain(poll.tips.iter_mut()).filter(|e| e.from.is_empty()) {
+            e.from = me.clone();
+        }
         self.pending_git.extend(poll.durable);
         let mut changed = false;
         for e in poll.tips {

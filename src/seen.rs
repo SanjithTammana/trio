@@ -233,7 +233,8 @@ mod tests {
         }
         let c = catchup(&before, &g, &crate::work::all(&g, "sanjith"), rows.iter(), "sanjith", false).unwrap();
         assert_eq!((c.commits, c.branches, c.verdicts, c.messages), (2, 1, 1, 1));
-        assert_eq!(c.moved.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["XF4", "XF2", "XF3"]);
+        // Branches no item names are cards of their own, so they move too (claude/y merged: done).
+        assert_eq!(c.moved.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["XF4", "claude/x", "XF2", "XF3", "claude/y"]);
     }
 
     #[test]
