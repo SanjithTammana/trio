@@ -265,29 +265,31 @@ function CatchupStrip({ snap, onSelect }: { snap: Snapshot; onSelect: (p: Pick, 
   const c = snap.catchup!;
   // Seen once it has been on screen for a minute in a visible page (Dismiss is the fast way).
   const token = snap.token;
+  const upto = c.upto;
   useEffect(() => {
     let t: number | undefined;
     const arm = () => {
       window.clearTimeout(t);
-      if (document.visibilityState === 'visible') t = window.setTimeout(() => markSeen(token), 60_000);
+      if (document.visibilityState === 'visible') t = window.setTimeout(() => markSeen(token, upto), 60_000);
     };
     arm();
     document.addEventListener('visibilitychange', arm);
     return () => { window.clearTimeout(t); document.removeEventListener('visibilitychange', arm); };
-  }, [token, c.since]);
+  }, [token, c.since, upto]);
   const facts = [
     c.moved.length + c.more > 0 && plural(c.moved.length + c.more, 'item moved', 'items moved'),
     c.waiting_on_you > 0 && `${c.waiting_on_you} wait${c.waiting_on_you === 1 ? 's' : ''} on you`,
     c.commits > 0 && `${plural(c.commits, 'commit')} on ${plural(c.branches, 'branch', 'branches')}`,
     c.verdicts > 0 && plural(c.verdicts, 'verdict'),
     c.messages > 0 && plural(c.messages, 'message'),
+    c.partial && 'and more before that',
   ].filter(Boolean);
   return (
     <section className="catchup" aria-label="Since you left">
       <div className="catchup-h">
         <b>Since {timeLabel(c.since)}</b>
         <span>{facts.join(' · ')}</span>
-        <button className="catchup-x" onClick={() => markSeen(snap.token)}>Dismiss</button>
+        <button className="catchup-x" onClick={() => markSeen(snap.token, upto)}>Dismiss</button>
       </div>
       {c.moved.length > 0 && (
         <ul className="catchup-list">

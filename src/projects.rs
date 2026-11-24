@@ -67,8 +67,10 @@ pub fn known(path: &str) -> Option<PathBuf> {
 /// Start (or find) the room's server. With `web`, wait for it and return its URL; otherwise it
 /// opens its own window. Blocking: call off the async runtime.
 pub fn open(root: &Path, web: bool) -> Result<Option<String>, String> {
-    if let Some(port) = crate::hook::poke(root) {
-        return Ok(web.then(|| format!("http://127.0.0.1:{port}/")));
+    // A running room in the browser is just its address. Native always runs `trio open`: on a
+    // running room it opens (or focuses) that room's window without a second server.
+    if web && let Some(port) = port(root) {
+        return Ok(Some(format!("http://127.0.0.1:{port}/")));
     }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut cmd = std::process::Command::new(exe);
@@ -88,7 +90,7 @@ pub fn open(root: &Path, web: bool) -> Result<Option<String>, String> {
     }
     for _ in 0..50 {
         std::thread::sleep(std::time::Duration::from_millis(100));
-        if let Some(port) = crate::hook::poke(root) {
+        if let Some(port) = port(root) {
             return Ok(Some(format!("http://127.0.0.1:{port}/")));
         }
     }
@@ -98,9 +100,13 @@ pub fn open(root: &Path, web: bool) -> Result<Option<String>, String> {
 /// Whether something listens on the port the room's `server.json` names. A bare connect, not a
 /// poke: a poke ticks that room, and listing rooms must not make one route a pending message.
 fn listening(root: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(root.join(".trio").join("server.json")) else { return false };
-    let Some(port) = serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| v["port"].as_u64()).and_then(|p| u16::try_from(p).ok()) else { return false };
-    std::net::TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], port)), std::time::Duration::from_millis(150)).is_ok()
+    port(root).is_some()
+}
+
+fn port(root: &Path) -> Option<u16> {
+    let text = std::fs::read_to_string(root.join(".trio").join("server.json")).ok()?;
+    let port = serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| v["port"].as_u64()).and_then(|p| u16::try_from(p).ok())?;
+    std::net::TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], port)), std::time::Duration::from_millis(150)).is_ok().then_some(port)
 }
 
 fn same(a: &Path, b: &Path) -> bool {

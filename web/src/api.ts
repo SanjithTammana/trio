@@ -61,6 +61,10 @@ export interface Catchup {
   branches: number;
   verdicts: number;
   messages: number;
+  /** Older history fell out of the server's window: the counts may be short. */
+  partial?: boolean;
+  /** The room's position when this was built; Dismiss sends it back. */
+  upto?: number;
 }
 
 /** One agent's availability (server `usage.rs`): its limit windows, spend and state. */
@@ -197,9 +201,10 @@ export async function openRoom(token: string, path: string): Promise<string> {
   return (await r.json()).url;
 }
 
-/** Dismiss the catch-up: the seen mark moves to now. */
-export async function markSeen(token: string) {
-  await fetch('/api/seen', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token }) });
+/** Dismiss the catch-up built at `upto`: the seen mark moves to now. The server refuses (409)
+ *  when rows arrived since, and the next snapshot shows the newer strip. */
+export async function markSeen(token: string, upto?: number) {
+  await fetch('/api/seen', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token, upto }) });
 }
 
 export async function setPaused(token: string, paused: boolean) {

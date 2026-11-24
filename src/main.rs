@@ -164,7 +164,14 @@ fn init_room(dir: &std::path::Path) -> Result<(), String> {
 }
 
 fn gh_signed_in() -> bool {
-    std::process::Command::new("gh").args(["auth", "status"]).output().is_ok_and(|o| o.status.success())
+    let mut cmd = std::process::Command::new("gh");
+    cmd.args(["auth", "status"]).stdin(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd.output().is_ok_and(|o| o.status.success())
 }
 
 /// `claude-posts.md`, `codex-posts.md`, `sanjith-posts.md`, ...: (file, who), sorted by file.

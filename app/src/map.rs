@@ -70,10 +70,11 @@ pub struct MapState {
     lens: Lens,
     /// None until toggled: explain is then on while the room is empty (where people learn).
     explain: Option<bool>,
-    /// The catch-up on screen: its mark and when it first showed in a focused window.
-    catchup_shown: Option<(String, f64)>,
-    /// The catch-up already marked seen by the timer, so it posts once.
-    catchup_sent: Option<String>,
+    /// The catch-up on screen: its mark, when it began showing in a focused window, and when it
+    /// was last drawn (a gap means another view or an unfocused window: the minute starts over).
+    catchup_shown: Option<(String, f64, f64)>,
+    /// The catch-up already marked seen by the timer (mark and position), so it posts once.
+    catchup_sent: Option<(String, u64)>,
 }
 
 impl MapState {
@@ -774,19 +775,17 @@ fn catchup(ui: &mut egui::Ui, body: Rect, app: &mut TrioApp, snap: &Snapshot, c:
     // Seen once it has been on screen for a minute in a focused window (Dismiss is the fast way).
     let (time, focused) = ui.ctx().input(|i| (i.time, i.focused));
     let shown = match &app.map.catchup_shown {
-        Some((since, at)) if *since == c.since && focused => Some(*at),
-        _ => None,
+        Some((since, at, last)) if *since == c.since && focused && time - *last < 2.0 => *at,
+        _ => time,
     };
-    let shown = shown.unwrap_or_else(|| {
-        app.map.catchup_shown = focused.then(|| (c.since.clone(), time));
-        time
-    });
-    if focused && app.map.catchup_sent.as_deref() != Some(c.since.as_str()) {
+    app.map.catchup_shown = focused.then(|| (c.since.clone(), shown, time));
+    let key = (c.since.clone(), c.upto);
+    if focused && app.map.catchup_sent.as_ref() != Some(&key) {
         if time - shown >= 60.0 {
-            app.map.catchup_sent = Some(c.since.clone());
+            app.map.catchup_sent = Some(key);
             let client = app.client().clone();
-            let token = snap.token.clone();
-            crate::net::background(move || client.seen(&token), |_| ());
+            let (token, upto) = (snap.token.clone(), c.upto);
+            crate::net::background(move || client.seen(&token, upto), |_| ());
         } else {
             ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
         }
@@ -811,8 +810,8 @@ fn catchup(ui: &mut egui::Ui, body: Rect, app: &mut TrioApp, snap: &Snapshot, c:
     paint::focus_ring(&p, &dh.resp, t, 11.0);
     if dh.clicked() {
         let client = app.client().clone();
-        let token = snap.token.clone();
-        crate::net::background(move || client.seen(&token), |_| ());
+        let (token, upto) = (snap.token.clone(), c.upto);
+        crate::net::background(move || client.seen(&token, upto), |_| ());
     }
     let lane_title = |l: &str| WORK_LANES.iter().find(|x| x.0 == l).map_or(l.to_string(), |x| x.1.to_string());
     let cw = (w - 24.0 - (cols - 1) as f32 * 16.0) / cols as f32;

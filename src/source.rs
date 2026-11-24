@@ -169,14 +169,14 @@ impl FileSource for RoomLedger {
         let mut off = base;
         for line in lines.split_inclusive('\n') {
             let t = line.trim();
-            if !t.is_empty() {
-                if let Ok(mut e) = serde_json::from_str::<Event>(t) {
-                    if e.id.is_empty() {
-                        e.id = format!("l{off}");
-                    }
-                    out.push(e);
-                    self.offsets.push(off);
+            if !t.is_empty()
+                && let Ok(mut e) = serde_json::from_str::<Event>(t)
+            {
+                if e.id.is_empty() {
+                    e.id = format!("l{off}");
                 }
+                out.push(e);
+                self.offsets.push(off);
             }
             off += line.len() as u64;
         }

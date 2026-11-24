@@ -205,7 +205,7 @@ pub fn split_reply(text: &str) -> Option<(String, Option<String>)> {
     if summary.is_empty() {
         return None;
     }
-    let rest = t.splitn(2, '\n').nth(1).map(str::trim).unwrap_or("");
+    let rest = t.split_once('\n').map_or("", |(_, r)| r.trim());
     let detail = (!rest.is_empty() || summary != line).then(|| t.to_string());
     Some((summary, detail))
 }

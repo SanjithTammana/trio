@@ -31,6 +31,7 @@ Trio is a few small parts joined by one event format. Everything a room shows co
 3. **Never block the room.** Network and process calls run on a worker thread. The room collects finished results on its next tick.
 4. **Never wake an agent by accident.** Only `mentions` wake agents, so an integration should not mention `claude` or `codex` unless the user asked it to.
 5. **Times are local `YYYY-MM-DDTHH:MM`.** Convert at the edge; see `github::local`.
+6. **Say how a file source changes.** The catch-up must know what arrived while Trio was closed. An append-only file returns each event's byte offset from `Source::offsets`, as the ledger does. A file people edit in place returns true from `FileSource::rewrites`, as posts files do. An edit that is not an append then replays the room.
 
 ## Adding an integration, step by step
 

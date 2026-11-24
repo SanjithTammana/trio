@@ -147,6 +147,12 @@ pub struct Catchup {
     pub verdicts: usize,
     #[serde(default)]
     pub messages: usize,
+    /// Older history fell out of the server's window: the counts may be short.
+    #[serde(default)]
+    pub partial: bool,
+    /// The room's position when this was built; Dismiss sends it back.
+    #[serde(default)]
+    pub upto: u64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -181,6 +187,9 @@ impl Catchup {
         }
         if self.messages > 0 {
             f.push(n(self.messages, "message", "messages"));
+        }
+        if self.partial {
+            f.push("and more before that".into());
         }
         f.join(" \u{b7} ")
     }

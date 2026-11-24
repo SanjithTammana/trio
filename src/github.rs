@@ -174,6 +174,13 @@ impl Link {
     }
 }
 
+/// `owner/name` and nothing else: no host (`gh` would accept `host/owner/name`), no flag-like
+/// leading dash, only the characters GitHub allows.
+pub fn valid_repo(repo: &str) -> bool {
+    let part = |p: &str| !p.is_empty() && !p.starts_with(['-', '.']) && p.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    matches!(repo.split_once('/'), Some((o, n)) if part(o) && part(n) && !n.contains('/'))
+}
+
 /// `2026-11-24T18:03:11Z` -> local `2026-11-24T12:03`.
 pub fn local(iso: &str) -> Option<String> {
     let t = chrono::DateTime::parse_from_rfc3339(iso).ok()?;
@@ -278,6 +285,14 @@ mod tests {
 
     fn link(remote_only: bool) -> Link {
         Link { repo: "o/r".into(), label: Some("web".into()), remote_only, me: "sanjith".into(), my_login: Some("sanjith".into()) }
+    }
+
+    #[test]
+    fn only_owner_and_name_reach_gh() {
+        assert!(valid_repo("SanjithTammana/trio") && valid_repo("o/r.js") && valid_repo("a-b/c_d"));
+        for bad in ["github.com/o/r", "o", "o/", "/r", "-R/x", "o/-x", "o/r/x", "o r/x", "../x", "o/.."] {
+            assert!(!valid_repo(bad), "{bad}");
+        }
     }
 
     #[test]

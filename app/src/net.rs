@@ -163,8 +163,10 @@ impl Client {
         self.post("/api/rooms/open", token, serde_json::json!({ "token": token, "path": path, "web": false }))
     }
 
-    pub fn seen(&self, token: &str) -> Result<(), String> {
-        self.post("/api/seen", token, serde_json::json!({ "token": token }))
+    /// Mark the catch-up built at `upto` seen. The server refuses (and keeps its mark) when rows
+    /// arrived since: the next snapshot shows the newer strip.
+    pub fn seen(&self, token: &str, upto: u64) -> Result<(), String> {
+        self.post("/api/seen", token, serde_json::json!({ "token": token, "upto": upto }))
     }
 
     pub fn pause(&self, token: &str, paused: bool) -> Result<(), String> {

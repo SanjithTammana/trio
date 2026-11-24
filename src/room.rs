@@ -137,6 +137,13 @@ pub fn github_links(cfg: &RoomCfg, root: &Path) -> Vec<crate::github::Link> {
     let many = local.len() + cfg.github.len() > 1;
     cfg.github
         .iter()
+        .filter(|g| {
+            let ok = crate::github::valid_repo(&g.repo);
+            if !ok {
+                eprintln!("trio: [[github]] repo {:?} is not owner/name; skipped", g.repo);
+            }
+            ok
+        })
         .map(|g| {
             let clone = local.iter().find(|(_, r)| r.as_deref().is_some_and(|r| r.eq_ignore_ascii_case(&g.repo)));
             let own = if g.name.is_empty() { g.repo.rsplit('/').next().unwrap_or(&g.repo).to_string() } else { g.name.clone() };
@@ -306,6 +313,9 @@ pub struct Room {
     ledger_read: u64,
     prints: HashMap<String, u64>,
     relabel: Option<Relabel>,
+    /// Each agent's usage state as last published, so a reset that no event marks still updates
+    /// the meters.
+    usage_shown: String,
     /// An imported file was edited in place: replay the room on this tick.
     replay: bool,
     /// Ledger rows before this offset were routed already (set by a replay).
@@ -359,7 +369,11 @@ impl Room {
             Err(e) if e.kind() == io::ErrorKind::NotFound => RoomCfg { hop_budget: 3, ..Default::default() },
             Err(e) => return Err(e),
         };
-        crate::model::add_item_prefixes(&cfg.item_prefixes);
+        // Prefixes are process-wide: only the room this process serves adds its own. A read-only
+        // replay (the project list) must not change which ids the served room recognises.
+        if watch {
+            crate::model::add_item_prefixes(&cfg.item_prefixes);
+        }
         let ledger = dir.join("room.jsonl");
         let mut sources: Vec<Box<dyn Source + Send>> = Vec::new();
         for imp in &cfg.import {
@@ -414,6 +428,7 @@ impl Room {
             ledger_read: 0,
             prints: HashMap::new(),
             relabel,
+            usage_shown: String::new(),
             replay: false,
             route_from: 0,
             trio_exe,
@@ -510,6 +525,11 @@ impl Room {
         }
         self.refresh_usage();
         if self.release_held() {
+            changed = true;
+        }
+        let usage = ["claude", "codex"].map(|a| self.usage(a).why()).join("|");
+        if usage != self.usage_shown {
+            self.usage_shown = usage;
             changed = true;
         }
         // Joining or leaving writes no ledger line, so compare the attachment markers too.
@@ -758,8 +778,16 @@ impl Room {
         }
         let text = format!("{summary}\n{}", detail.as_deref().unwrap_or(""));
         let at = now();
-        // `claim X` and `verdict X: pass` lines say the same here as in a posts file.
-        let facts: Vec<Body> = text.lines().flat_map(crate::source::line_facts).map(|(_, b)| b).collect();
+        // `claim X` and `verdict X: pass` lines say the same here as in a posts file, with ids in
+        // the same shape (`<line>:<item>`), so one line naming several items is one verdict.
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        let base = format!("say-{}-{nanos}", std::process::id());
+        let facts: Vec<(String, Body)> = text
+            .lines()
+            .enumerate()
+            .flat_map(|(n, l)| crate::source::line_facts(l).into_iter().map(move |(item, b)| (format!("#{n}:{item}"), b)))
+            .map(|(tail, b)| (format!("{base}{tail}"), b))
+            .collect();
         let e = Event {
             id: String::new(),
             at: at.clone(),
@@ -767,8 +795,8 @@ impl Room {
             body: Body::Message { summary: summary.to_string(), detail, mentions: mentions_in(&text, &self.me()), items: crate::model::item_ids(&text) },
         };
         append(&self.ledger, &e).map_err(|e| e.to_string())?;
-        for body in facts {
-            append(&self.ledger, &Event { id: String::new(), at: at.clone(), from: from.to_string(), body }).map_err(|e| e.to_string())?;
+        for (id, body) in facts {
+            append(&self.ledger, &Event { id, at: at.clone(), from: from.to_string(), body }).map_err(|e| e.to_string())?;
         }
         Ok(())
     }
@@ -1346,6 +1374,21 @@ mod tests {
         room.say("codex", "XF7 looked at", Some("verdict XF7: pass, all good".into())).unwrap();
         room.tick();
         assert_eq!(crate::work::all(&room.graph, "sanjith")["XF7"].lane, "done");
+        room.mark_seen().unwrap();
+        room.say("codex", "XF8 and XF9 checked", Some("verdict XF8: pass, XF9 too".into())).unwrap();
+        room.tick();
+        let work = crate::work::all(&room.graph, "sanjith");
+        assert_eq!((work["XF8"].lane, work["XF9"].lane), ("done", "done"));
+        assert_eq!(room.catchup(&work).unwrap().verdicts, 1, "one verdict line naming two items is one verdict");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn listing_a_room_never_changes_the_served_rooms_ids() {
+        let root = temp_room("prefix-read");
+        std::fs::write(root.join(".trio/room.toml"), "me = 'sanjith'\nrepo = ''\nitem_prefixes = ['QZW']\n").unwrap();
+        let _ = Room::open_read(&root).unwrap();
+        assert!(crate::model::item_ids("QZW-4 done").is_empty(), "a read-only replay adds no prefixes");
         let _ = std::fs::remove_dir_all(root);
     }
 
