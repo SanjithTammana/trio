@@ -173,6 +173,30 @@ export async function send(token: string, text: string): Promise<string | null> 
   return r.ok ? null : (await r.text()) || `error ${r.status}`;
 }
 
+/** One of your rooms (server `projects.rs`), for the project switcher. */
+export interface RoomSummary {
+  name: string;
+  path: string;
+  current: boolean;
+  running: boolean;
+  waiting_on_you: number;
+  in_flight: number;
+  new: number;
+  last: string;
+}
+
+export async function fetchRooms(): Promise<RoomSummary[]> {
+  const r = await fetch('/api/rooms');
+  return r.ok ? r.json() : [];
+}
+
+/** Start (or find) another room's server; resolves to its URL. */
+export async function openRoom(token: string, path: string): Promise<string> {
+  const r = await fetch('/api/rooms/open', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token, path, web: true }) });
+  if (!r.ok) throw new Error((await r.text()) || `error ${r.status}`);
+  return (await r.json()).url;
+}
+
 /** Dismiss the catch-up: the seen mark moves to now. */
 export async function markSeen(token: string) {
   await fetch('/api/seen', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token }) });

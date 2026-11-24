@@ -196,17 +196,8 @@ impl PostsFile {
                 last_text = l;
             }
             let eid = format!("{id}#{n}");
-            if let Some(rest) = l.strip_prefix("verdict ") {
-                if let Some((target, tail)) = rest.split_once(':') {
-                    let outcome = tail.split_whitespace().next().unwrap_or("").trim_matches(|c: char| !c.is_alphanumeric());
-                    for item in std::iter::once(target.trim().to_string()).chain(item_ids(tail)) {
-                        out.push(Event { id: format!("{eid}:{item}"), at: at.clone(), from: self.from.clone(), body: Body::Verdict { item, outcome: outcome.to_string() } });
-                    }
-                }
-            } else if let Some(rest) = l.strip_prefix("claim ") {
-                for item in item_ids(rest) {
-                    out.push(Event { id: format!("{eid}:{item}"), at: at.clone(), from: self.from.clone(), body: Body::Claim { item } });
-                }
+            for (item, body) in line_facts(l) {
+                out.push(Event { id: format!("{eid}:{item}"), at: at.clone(), from: self.from.clone(), body });
             }
         }
         if let Some(s) = last_text.strip_prefix("Status:") {
@@ -225,6 +216,26 @@ impl PostsFile {
         self.published_status = status;
         rows
     }
+}
+
+/// The facts one line states, by item: `verdict X: pass|changes ...` (X and any ids after the
+/// colon) and `claim X Y`. Posts files, chat and `trio say` all read lines the same way.
+pub fn line_facts(l: &str) -> Vec<(String, Body)> {
+    let l = l.trim();
+    let mut out = Vec::new();
+    if let Some(rest) = l.strip_prefix("verdict ") {
+        if let Some((target, tail)) = rest.split_once(':') {
+            let outcome = tail.split_whitespace().next().unwrap_or("").trim_matches(|c: char| !c.is_alphanumeric());
+            for item in std::iter::once(target.trim().to_string()).chain(item_ids(tail)) {
+                out.push((item.clone(), Body::Verdict { item, outcome: outcome.to_string() }));
+            }
+        }
+    } else if let Some(rest) = l.strip_prefix("claim ") {
+        for item in item_ids(rest) {
+            out.push((item.clone(), Body::Claim { item }));
+        }
+    }
+    out
 }
 
 impl FileSource for PostsFile {

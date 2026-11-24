@@ -29,6 +29,25 @@ pub struct Snapshot {
     pub usage: BTreeMap<String, Usage>,
 }
 
+/// One of your rooms (server `projects.rs`), for the project switcher.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RoomSummary {
+    pub name: String,
+    pub path: String,
+    #[serde(default)]
+    pub current: bool,
+    #[serde(default)]
+    pub running: bool,
+    #[serde(default)]
+    pub waiting_on_you: usize,
+    #[serde(default)]
+    pub in_flight: usize,
+    #[serde(default)]
+    pub new: usize,
+    #[serde(default)]
+    pub last: String,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct UsageWindow {
     pub label: String,

@@ -48,6 +48,10 @@ pub struct RoomCfg {
     /// `[[github]] repo = "owner/name"`. Read with your `gh` login every two minutes.
     #[serde(default)]
     pub github: Vec<GitHubCfg>,
+    /// Your own item id prefixes, on top of the built-in ones (P, XF, H, ...):
+    /// `item_prefixes = ["WEB", "ENG"]` makes `WEB-12` and `ENG42` work items.
+    #[serde(default)]
+    pub item_prefixes: Vec<String>,
     #[serde(default)]
     pub agents: HashMap<String, AgentConfig>,
     /// Daily spend caps in dollars: `[budget] claude_usd_day = 5.0`, `codex_usd_day = 3.0`.
@@ -262,6 +266,15 @@ pub struct MessageView<'a> {
 
 impl Room {
     pub fn open(root: &Path) -> io::Result<Self> {
+        Self::open_with(root, true)
+    }
+
+    /// The room replayed from its files only: no git or GitHub watchers (for the project list).
+    pub fn open_read(root: &Path) -> io::Result<Self> {
+        Self::open_with(root, false)
+    }
+
+    fn open_with(root: &Path, watch: bool) -> io::Result<Self> {
         let root = root.canonicalize()?;
         let dir = root.join(".trio");
         let cfg: RoomCfg = match std::fs::read_to_string(dir.join("room.toml")) {
@@ -269,6 +282,7 @@ impl Room {
             Err(e) if e.kind() == io::ErrorKind::NotFound => RoomCfg { hop_budget: 3, ..Default::default() },
             Err(e) => return Err(e),
         };
+        crate::model::add_item_prefixes(&cfg.item_prefixes);
         let ledger = dir.join("room.jsonl");
         let mut sources: Vec<Box<dyn Source + Send>> = Vec::new();
         for imp in &cfg.import {
@@ -287,10 +301,11 @@ impl Room {
         let trio_exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "trio".into());
         let git = repos_of(&cfg, &root)
             .into_iter()
+            .filter(|_| watch)
             .map(|(label, path, base)| GitSource { watch: crate::gitwatch::GitWatch::start(path, base, label.clone()), label })
             .collect();
         let restored = crate::seen::load(&root);
-        let github = github_links(&cfg, &root).into_iter().map(crate::github::GitHubWatch::start).collect();
+        let github = if watch { github_links(&cfg, &root).into_iter().map(crate::github::GitHubWatch::start).collect() } else { Vec::new() };
         Ok(Self {
             root,
             ledger,
@@ -593,13 +608,20 @@ impl Room {
             return Err(format!("summary is over {SUMMARY_MAX} chars; put the rest in detail"));
         }
         let text = format!("{summary}\n{}", detail.as_deref().unwrap_or(""));
+        let at = now();
+        // `claim X` and `verdict X: pass` lines say the same here as in a posts file.
+        let facts: Vec<Body> = text.lines().flat_map(crate::source::line_facts).map(|(_, b)| b).collect();
         let e = Event {
             id: String::new(),
-            at: now(),
+            at: at.clone(),
             from: from.to_string(),
             body: Body::Message { summary: summary.to_string(), detail, mentions: mentions_in(&text, &self.me()), items: crate::model::item_ids(&text) },
         };
-        append(&self.ledger, &e).map_err(|e| e.to_string())
+        append(&self.ledger, &e).map_err(|e| e.to_string())?;
+        for body in facts {
+            append(&self.ledger, &Event { id: String::new(), at: at.clone(), from: from.to_string(), body }).map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 
     fn record(&self, from: &str, body: Body) {
@@ -1128,6 +1150,20 @@ mod tests {
         for d in [api, web, room] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    #[test]
+    fn claims_and_verdicts_said_in_chat_count() {
+        let root = temp_room("said");
+        std::fs::write(root.join(".trio/room.toml"), "me = 'sanjith'\nrepo = ''\n").unwrap();
+        let mut room = Room::open(&root).unwrap();
+        room.say("claude", "claim XF7", None).unwrap();
+        room.tick();
+        assert_eq!(crate::work::all(&room.graph, "sanjith")["XF7"].lane, "progress");
+        room.say("codex", "XF7 looked at", Some("verdict XF7: pass, all good".into())).unwrap();
+        room.tick();
+        assert_eq!(crate::work::all(&room.graph, "sanjith")["XF7"].lane, "done");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

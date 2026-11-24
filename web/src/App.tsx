@@ -8,7 +8,7 @@ import { Graph, type Pick } from './Graph';
 import { Markdown } from './Detail';
 import { State, Who } from './glyph';
 import { morph, unmorph } from './motion';
-import { STATE_LABEL, components, fetchDetail, hhmm, lanes, nameOf, setPaused, timeLabel, usageSource, usageWhy, useSnapshot, type Message, type Snapshot, type Usage } from './api';
+import { STATE_LABEL, components, fetchDetail, fetchRooms, hhmm, openRoom, lanes, nameOf, setPaused, timeLabel, usageSource, usageWhy, useSnapshot, type Message, type RoomSummary, type Snapshot, type Usage } from './api';
 
 type Panel = { kind: 'message'; m: Message; key: string } | (Pick & { key: string }) | null;
 type View = 'chat' | 'map';
@@ -68,7 +68,7 @@ export default function App() {
   return (
     <div className="app">
       <header className="top">
-        <div className="room-name" title={snap.room}>trio / <b>{snap.room}</b></div>
+        <Projects room={snap.room} token={snap.token} />
         <div className="island-slot">
           <Island snap={snap} open={island} onToggle={toggleIsland} />
         </div>
@@ -142,6 +142,53 @@ function Island({ snap, open, onToggle }: { snap: Snapshot; open: boolean; onTog
           <button onClick={(e) => onToggle(e.detail > 0)} aria-label="Collapse">Done</button>
         </span>
       </div>
+    </div>
+  );
+}
+
+/** The room title opens a list of every room you have: what waits on you in each, what is in
+ * flight, what is new since you last looked. Picking one opens it (starting its server). */
+function Projects({ room, token }: { room: string; token: string }) {
+  const [open, setOpen] = useState(false);
+  const [rooms, setRooms] = useState<RoomSummary[] | null>(null);
+  const [error, setError] = useState('');
+  const box = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    let live = true;
+    fetchRooms().then((r) => live && setRooms(r));
+    const away = (e: MouseEvent) => { if (!box.current?.contains(e.target as Node)) setOpen(false); };
+    const esc = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
+    document.addEventListener('mousedown', away);
+    document.addEventListener('keydown', esc);
+    return () => { live = false; document.removeEventListener('mousedown', away); document.removeEventListener('keydown', esc); };
+  }, [open]);
+  const go = async (r: RoomSummary) => {
+    if (r.current) return setOpen(false);
+    setError('');
+    try { window.location.href = await openRoom(token, r.path); } catch (e) { setError(String((e as Error).message)); }
+  };
+  return (
+    <div className="projects" ref={box}>
+      <button className="room-name" title="Your rooms" aria-expanded={open} onClick={() => setOpen((o) => !o)}>trio / <b>{room}</b><span className="caret" aria-hidden>▾</span></button>
+      {open && (
+        <div className="projects-menu" role="menu">
+          {rooms === null && <p className="muted">Reading your rooms…</p>}
+          {rooms?.map((r) => (
+            <button key={r.path} role="menuitem" className={r.current ? 'on' : ''} onClick={() => go(r)} title={r.path}>
+              <span className="pn"><b>{r.name}</b>{r.running && !r.current && <span className="dot" title="open now" />}</span>
+              <span className="pm">
+                {r.waiting_on_you > 0 && <span className="you">{r.waiting_on_you} waiting on you</span>}
+                {r.in_flight > 0 && <span>{r.in_flight} in flight</span>}
+                {r.new > 0 && !r.current && <span>{r.new} new</span>}
+                {r.last && <span>{timeLabel(r.last)}</span>}
+              </span>
+            </button>
+          ))}
+          {error && <p className="err">{error}</p>}
+          <p className="muted hint">Add one: <code>trio open &lt;folder&gt;</code>. Link more repos: <code>trio link &lt;room&gt; &lt;repo&gt;</code></p>
+        </div>
+      )}
     </div>
   );
 }

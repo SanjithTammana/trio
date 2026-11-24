@@ -101,6 +101,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/pause", post(pause))
         .route("/api/poke", post(poke))
         .route("/api/seen", post(seen))
+        .route("/api/rooms", get(rooms))
+        .route("/api/rooms/open", post(open_room))
         .fallback(get(asset))
         .layer(middleware::from_fn_with_state(app.clone(), guard))
         .with_state(app)
@@ -238,6 +240,39 @@ async fn pause(State(app): State<Arc<App>>, headers: HeaderMap, Json(r): Json<Pa
     let _ = app.tx.send(rev);
     app.wake.notify_one();
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// Every room you have, for the project switcher. Replays each room's files off the runtime.
+async fn rooms(State(app): State<Arc<App>>) -> Response {
+    let root = app.room.lock().expect("room lock").root.clone();
+    match tokio::task::spawn_blocking(move || crate::projects::all(&root)).await {
+        Ok(list) => Json(list).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct OpenReq {
+    token: String,
+    path: String,
+    /// The browser asks for a URL to go to; the native window lets the room open its own.
+    #[serde(default)]
+    web: bool,
+}
+
+/// Open another of your rooms: only one registered in `~/.trio/rooms.txt`.
+async fn open_room(State(app): State<Arc<App>>, headers: HeaderMap, Json(r): Json<OpenReq>) -> Response {
+    if r.token != app.token || !same_origin(&app, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(root) = crate::projects::known(&r.path) else {
+        return (StatusCode::NOT_FOUND, "not one of your rooms").into_response();
+    };
+    match tokio::task::spawn_blocking(move || crate::projects::open(&root, r.web)).await {
+        Ok(Ok(url)) => Json(serde_json::json!({ "url": url })).into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_GATEWAY, e).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 #[derive(Deserialize)]

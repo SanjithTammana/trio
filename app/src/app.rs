@@ -70,6 +70,9 @@ struct Morph {
     start: f64,
 }
 
+/// The project switcher's rooms, filled in by a background read (None while reading).
+type RoomsSlot = Arc<Mutex<Option<Result<Vec<crate::model::RoomSummary>, String>>>>;
+
 pub struct TrioApp {
     client: Client,
     visible: Arc<AtomicBool>,
@@ -91,6 +94,8 @@ pub struct TrioApp {
     reduce: bool,
     title: String,
     dark: Option<bool>,
+    /// The project switcher: open, and the rooms once read (None while reading).
+    projects: Option<RoomsSlot>,
 }
 
 impl TrioApp {
@@ -117,6 +122,7 @@ impl TrioApp {
             reduce: theme::reduced_motion(),
             title: String::new(),
             dark: None,
+            projects: None,
         }
     }
 
@@ -247,9 +253,22 @@ impl eframe::App for TrioApp {
             let mut job = egui::text::LayoutJob::default();
             job.append("trio / ", 0.0, paint::fmt(theme::mono(13.0), t.ink3));
             job.append(&snap.room, 0.0, paint::fmt(theme::mono(13.0), t.ink));
+            job.append(" \u{25be}", 0.0, paint::fmt(theme::sans(10.0), t.ink3));
             paint::elide(&mut job, room_w);
             let g = paint::job(ui, job);
-            ui.painter().galley(pos2(top.left() + 16.0, top.center().y - g.size().y / 2.0), g, t.ink);
+            let at = pos2(top.left() + 16.0, top.center().y - g.size().y / 2.0);
+            let title = Rect::from_min_size(at, g.size()).expand2(vec2(6.0, 4.0));
+            let hit = paint::Hit::new(ui, title, Id::unique("projects-title"), "Your rooms");
+            if hit.hot() || self.projects.is_some() {
+                ui.painter().rect_filled(title, 6.0, t.sunk);
+            }
+            ui.painter().galley(at, g, t.ink);
+            if hit.clicked() {
+                self.toggle_projects();
+            }
+            if self.projects.is_some() {
+                self.projects_menu(ui, title, &t, &snap.token);
+            }
         }
         if let Some(v) = tab_open {
             self.view = v;
@@ -349,6 +368,73 @@ impl eframe::App for TrioApp {
 
 impl TrioApp {
     /// Chat | Map segmented control at the right of the top bar.
+    fn toggle_projects(&mut self) {
+        if self.projects.take().is_some() {
+            return;
+        }
+        let slot = Arc::new(Mutex::new(None));
+        self.projects = Some(slot.clone());
+        let client = self.client.clone();
+        crate::net::background(move || client.rooms(), move |r| *slot.lock().expect("rooms") = Some(r));
+    }
+
+    /// Every room you have under the title: what waits on you, what is in flight, what is new.
+    /// Picking another opens it in its own window (the server starts it if it is not running).
+    fn projects_menu(&mut self, ui: &mut egui::Ui, title: Rect, t: &Tokens, token: &str) {
+        let Some(slot) = self.projects.clone() else { return };
+        let state = slot.lock().expect("rooms").clone();
+        let mut close = false;
+        let area = egui::Area::new(Id::unique("projects-menu")).order(egui::Order::Foreground).fixed_pos(pos2(title.left(), title.bottom() + 6.0));
+        let resp = area.show(ui.ctx(), |ui| {
+            egui::Frame::new().fill(t.surface).stroke(Stroke::new(1.0, t.line)).corner_radius(8.0).inner_margin(6.0).show(ui, |ui| {
+                ui.set_width(360.0);
+                match &state {
+                    None => {
+                        ui.label(egui::RichText::new("Reading your rooms\u{2026}").color(t.ink3).size(12.0));
+                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+                    }
+                    Some(Err(e)) => {
+                        ui.label(egui::RichText::new(e).color(t.accent).size(12.0));
+                    }
+                    Some(Ok(rooms)) => {
+                        let day = today();
+                        for r in rooms {
+                            let mut facts: Vec<String> = Vec::new();
+                            if r.waiting_on_you > 0 {
+                                facts.push(format!("{} waiting on you", r.waiting_on_you));
+                            }
+                            if r.in_flight > 0 {
+                                facts.push(format!("{} in flight", r.in_flight));
+                            }
+                            if r.new > 0 && !r.current {
+                                facts.push(format!("{} new", r.new));
+                            }
+                            if !r.last.is_empty() {
+                                facts.push(time_label(&r.last, &day));
+                            }
+                            let name = format!("{}{}", r.name, if r.running && !r.current { "  \u{b7} open" } else { "" });
+                            let text = egui::RichText::new(format!("{name}\n{}", facts.join("  \u{b7}  "))).size(12.5).color(if r.waiting_on_you > 0 { t.accent } else { t.ink });
+                            let b = ui.add_sized([348.0, 34.0], egui::Button::new(text).fill(if r.current { t.sunk } else { t.surface }).stroke(Stroke::NONE)).on_hover_text(&r.path);
+                            if b.clicked() {
+                                close = true;
+                                if !r.current {
+                                    let client = self.client.clone();
+                                    let (token, path) = (token.to_string(), r.path.clone());
+                                    crate::net::background(move || client.open_room(&token, &path), |_| ());
+                                }
+                            }
+                        }
+                        ui.label(egui::RichText::new("Add one: trio open <folder>. Link more repos: trio link <room> <repo>").color(t.ink3).size(11.0));
+                    }
+                }
+            });
+        });
+        let away = ui.ctx().input(|i| i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| !resp.response.rect.contains(p) && !title.contains(p)));
+        if close || away || ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.projects = None;
+        }
+    }
+
     fn tabs(&self, ui: &mut egui::Ui, top: Rect, t: &Tokens, narrow: bool) -> (Rect, Option<View>) {
         let items = [(View::Chat, "Chat", "c"), (View::Map, "Map", "g")];
         let gal: Vec<_> = items

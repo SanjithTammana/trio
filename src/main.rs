@@ -11,6 +11,7 @@
 mod agent;
 mod gitwatch;
 mod github;
+mod projects;
 mod graph;
 mod hook;
 mod oslock;
@@ -445,6 +446,7 @@ fn cmd_open(args: &[String]) -> Result<(), String> {
         init_room(&PathBuf::from(&dir))?;
     }
     let port: u16 = flag(args, "--port").map(|p| p.parse().map_err(|_| "bad --port")).transpose()?.unwrap_or(8964);
+    let explicit_port = flag(args, "--port").is_some();
     let no_browser = args.iter().any(|a| a == "--no-browser");
     let web = args.iter().any(|a| a == "--web");
     let mut room = room::Room::open(&PathBuf::from(&dir)).map_err(|e| format!("{dir}: {e}"))?;
@@ -463,7 +465,12 @@ fn cmd_open(args: &[String]) -> Result<(), String> {
     register(&app_root);
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
     rt.block_on(async move {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.map_err(|e| e.to_string())?;
+        // The default port may belong to another room's server: then any free port will do.
+        let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && !explicit_port => tokio::net::TcpListener::bind(("127.0.0.1", 0)).await,
+            r => r,
+        }
+        .map_err(|e| e.to_string())?;
         let port = listener.local_addr().map_err(|e| e.to_string())?.port();
         // Hooks read this to poke the server after they append (see hook::poke).
         let info = hook::ServerInfo { port, pid: std::process::id() };

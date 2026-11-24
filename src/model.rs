@@ -393,7 +393,34 @@ pub fn item_ids(text: &str) -> Vec<String> {
 }
 
 /// `XF29`, `P0a`, `P1`, `H3`: 1-2 uppercase letters, digits, optional one lowercase suffix.
+/// Item prefixes rooms add in room.toml (`item_prefixes = ["WEB", "ENG"]`), on top of the
+/// built-in ones. Shared by every room in the process; only ever grows.
+static EXTRA_PREFIXES: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+pub fn add_item_prefixes(prefixes: &[String]) {
+    let mut extra = EXTRA_PREFIXES.write().expect("prefixes");
+    for p in prefixes.iter().map(|p| p.trim().trim_end_matches('-').to_ascii_uppercase()) {
+        if (1..=10).contains(&p.len()) && p.bytes().all(|c| c.is_ascii_uppercase()) && !extra.contains(&p) {
+            extra.push(p);
+        }
+    }
+}
+
+/// `WEB-12` or `WEB12` for a configured prefix `WEB`: tracker keys (Jira, Linear) and bare ids.
+fn is_configured_id(w: &str) -> bool {
+    let extra = EXTRA_PREFIXES.read().expect("prefixes");
+    extra.iter().any(|p| {
+        w.strip_prefix(p.as_str()).map(|r| r.strip_prefix('-').unwrap_or(r)).is_some_and(|n| (1..=6).contains(&n.len()) && n.bytes().all(|c| c.is_ascii_digit()))
+    })
+}
+
 fn is_code_id(w: &str) -> bool {
+    if w.contains('-') || w.bytes().take_while(|c| c.is_ascii_uppercase()).count() > 2 {
+        return is_configured_id(w);
+    }
+    if is_configured_id(w) {
+        return true;
+    }
     let b = w.as_bytes();
     let letters = b.iter().take_while(|c| c.is_ascii_uppercase()).count();
     if !(1..=2).contains(&letters) {
@@ -479,6 +506,13 @@ mod tests {
     fn ids_found_once_in_order() {
         let t = "verdict claude/hooks-p0a: changes; XF29, XF30 and P0a. See item 16 and #desk. XF29 again. UTC9 no.";
         assert_eq!(item_ids(t), vec!["XF29", "XF30", "P0a", "item 16", "#desk"]);
+    }
+
+    #[test]
+    fn configured_prefixes_take_tracker_keys_and_bare_ids() {
+        assert!(item_ids("WEB-12 and QZX7 and UTF-8").is_empty(), "nothing before a room adds them");
+        add_item_prefixes(&["web".into(), "QZX-".into(), "bad1".into()]);
+        assert_eq!(item_ids("WEB-12 fixes WEB13; QZX7 next. UTF-8, GPT-4 and WEBSITE-3 are not ids."), vec!["WEB-12", "WEB13", "QZX7"]);
     }
 
     #[test]

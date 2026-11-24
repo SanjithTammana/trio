@@ -148,6 +148,21 @@ impl Client {
     }
 
     /// Dismiss the catch-up: the room's seen mark moves to now.
+    /// Every room you have, read by the server on demand.
+    pub fn rooms(&self) -> Result<Vec<crate::model::RoomSummary>, String> {
+        let (mut conn, _) = self.verified_for_action(self.target())?;
+        let (code, body) = conn.request("GET", "/api/rooms", None)?;
+        if code != 200 {
+            return Err(format!("error {code}"));
+        }
+        serde_json::from_slice(&body).map_err(|e| e.to_string())
+    }
+
+    /// Open another of your rooms in its own window.
+    pub fn open_room(&self, token: &str, path: &str) -> Result<(), String> {
+        self.post("/api/rooms/open", token, serde_json::json!({ "token": token, "path": path, "web": false }))
+    }
+
     pub fn seen(&self, token: &str) -> Result<(), String> {
         self.post("/api/seen", token, serde_json::json!({ "token": token }))
     }
