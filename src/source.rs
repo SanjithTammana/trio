@@ -22,6 +22,10 @@ pub trait Source {
     fn rewritten(&mut self) -> bool {
         false
     }
+    /// For an append-only source: the byte offset just past the last complete line read.
+    fn read_to(&self) -> Option<u64> {
+        None
+    }
 }
 
 #[derive(Default)]
@@ -36,9 +40,21 @@ pub struct Tail {
     edited: bool,
 }
 
-const FNV0: u64 = 0xcbf2_9ce4_8422_2325;
+pub const FNV0: u64 = 0xcbf2_9ce4_8422_2325;
 
-fn fnv(h: u64, bytes: &[u8]) -> u64 {
+/// The fingerprint of a file's first `min(n, 4 KiB)` bytes, or None when the file is shorter
+/// than `n` (it was cut or replaced since those `n` bytes were read).
+pub fn head_print(path: &Path, n: u64) -> Option<u64> {
+    if std::fs::metadata(path).map_or(0, |m| m.len()) < n {
+        return None;
+    }
+    let want = n.min(4096);
+    let mut buf = Vec::with_capacity(want as usize);
+    File::open(path).ok()?.take(want).read_to_end(&mut buf).ok()?;
+    (buf.len() as u64 == want).then(|| fnv(FNV0, &buf))
+}
+
+pub fn fnv(h: u64, bytes: &[u8]) -> u64 {
     bytes.iter().fold(h, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
 }
 
@@ -62,6 +78,10 @@ pub trait FileSource {
     /// See `Source::offsets`.
     fn take_offsets(&mut self) -> Vec<u64> {
         Vec::new()
+    }
+    /// See `Source::read_to`.
+    fn end(&self) -> Option<u64> {
+        None
     }
 }
 
@@ -87,6 +107,10 @@ impl<T: FileSource> Source for T {
         std::mem::take(&mut self.tail().edited)
     }
 
+    fn read_to(&self) -> Option<u64> {
+        self.end()
+    }
+
     fn poll(&mut self) -> io::Result<Vec<Event>> {
         let path = self.path().to_path_buf();
         let (len, mtime) = match std::fs::metadata(&path) {
@@ -102,8 +126,11 @@ impl<T: FileSource> Source for T {
             return Ok(Vec::new());
         }
         if len < self.tail().offset {
-            *self.tail() = Tail::default();
-            self.reset();
+            // Cut short: rows already read may be gone and offsets are reused. Report it, so the
+            // room replays from the new file rather than tailing it as if nothing happened.
+            self.tail().edited = true;
+            self.tail().mtime = mtime;
+            return Ok(Vec::new());
         }
         self.tail().mtime = mtime;
         if len == self.tail().offset {
@@ -160,6 +187,9 @@ impl FileSource for RoomLedger {
     }
     fn take_offsets(&mut self) -> Vec<u64> {
         std::mem::take(&mut self.offsets)
+    }
+    fn end(&self) -> Option<u64> {
+        Some(self.offset())
     }
     fn tail(&mut self) -> &mut Tail {
         &mut self.tail

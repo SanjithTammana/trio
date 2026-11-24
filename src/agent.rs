@@ -69,6 +69,11 @@ pub trait Agent: Participant {
     /// Start the run. Implementors only deliver; guards live in `wake_if_allowed`.
     fn spawn(&mut self, prompt: &str) -> Result<(), String>;
 
+    /// Whether a wake would start now, guards aside: enabled, idle, and its transcript free.
+    fn ready(&self) -> bool {
+        self.binding().enabled && !self.is_running() && !self.mirror().busy()
+    }
+
     /// Inherited guard sequence: enabled -> paused -> budget -> running -> mirror busy -> spawn.
     fn wake_if_allowed(&mut self, prompt: &str, g: &Guard) -> WakeDecision {
         if !self.binding().enabled {

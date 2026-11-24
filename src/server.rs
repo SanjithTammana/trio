@@ -101,6 +101,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/say", post(say))
         .route("/api/pause", post(pause))
         .route("/api/poke", post(poke))
+        .route("/api/is", post(is_room))
         .route("/api/seen", post(seen))
         .route("/api/rooms", get(rooms))
         .route("/api/rooms/open", post(open_room))
@@ -315,6 +316,11 @@ async fn poke(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
         app.wake.notify_one();
     }
     status.into_response()
+}
+
+/// "Are you this room's server?" The same answer as a poke, with no tick.
+async fn is_room(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    poke_status(headers.get("x-trio-poke").map(|v| v.as_bytes()), &app.room_id).into_response()
 }
 
 /// No header: 403 (not a hook). Another room's id: 409, and nothing wakes.

@@ -774,11 +774,13 @@ fn catchup(ui: &mut egui::Ui, body: Rect, app: &mut TrioApp, snap: &Snapshot, c:
     let h = 12.0 + 22.0 + if rows > 0 { 6.0 + rows as f32 * ROW } else { 0.0 } + 10.0;
     // Seen once it has been on screen for a minute in a focused window (Dismiss is the fast way).
     let (time, focused) = ui.ctx().input(|i| (i.time, i.focused));
+    // A strip that changed (new rows: a new position) gets its own full minute.
+    let strip = format!("{}|{}", c.since, c.upto);
     let shown = match &app.map.catchup_shown {
-        Some((since, at, last)) if *since == c.since && focused && time - *last < 2.0 => *at,
+        Some((s, at, last)) if *s == strip && focused && time - *last < 2.0 => *at,
         _ => time,
     };
-    app.map.catchup_shown = focused.then(|| (c.since.clone(), shown, time));
+    app.map.catchup_shown = focused.then_some((strip, shown, time));
     let key = (c.since.clone(), c.upto);
     if focused && app.map.catchup_sent.as_ref() != Some(&key) {
         if time - shown >= 60.0 {

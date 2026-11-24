@@ -555,6 +555,16 @@ pub fn server_info_path(room: &Path) -> PathBuf {
 /// Returns the port when the server there answered as this room's own (204); a server for
 /// another room answers 403, and anything else is not a Trio server for this room.
 pub fn poke(room: &Path) -> Option<u16> {
+    ask_server(room, "/api/poke")
+}
+
+/// The port of this room's running server, proven by the server itself: it answers 204 only to
+/// its own room id. Unlike `poke`, the server does nothing in response.
+pub fn serving(room: &Path) -> Option<u16> {
+    ask_server(room, "/api/is")
+}
+
+fn ask_server(room: &Path, path: &str) -> Option<u16> {
     use std::io::Write;
     use std::net::{SocketAddr, TcpStream};
     use std::time::Duration;
@@ -565,7 +575,7 @@ pub fn poke(room: &Path) -> Option<u16> {
     let addr = SocketAddr::from(([127, 0, 0, 1], info.port));
     let mut s = TcpStream::connect_timeout(&addr, left()?.min(Duration::from_millis(300))).ok()?;
     let req = format!(
-        "POST /api/poke HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nX-Trio-Poke: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nX-Trio-Poke: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         info.port,
         room_id(room)
     );

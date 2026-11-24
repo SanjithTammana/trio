@@ -135,6 +135,19 @@ pub struct GitHubCfg {
 pub fn github_links(cfg: &RoomCfg, root: &Path) -> Vec<crate::github::Link> {
     let local: Vec<(Option<String>, Option<String>)> = repos_of(cfg, root).into_iter().map(|(label, path, _)| (label, crate::github::repo_of_clone(&path))).collect();
     let many = local.len() + cfg.github.len() > 1;
+    // A repo without a clone gets a label no local repo (or earlier link) uses, so a remote
+    // branch never shares an id with a local one.
+    let mut taken: Vec<String> = repos_named(cfg, root).into_iter().map(|(n, _, _)| n.to_ascii_lowercase()).collect();
+    let mut unique = move |own: String| {
+        let mut l = own.clone();
+        let mut n = 1;
+        while taken.contains(&l.to_ascii_lowercase()) {
+            n += 1;
+            l = format!("{own}-{n}");
+        }
+        taken.push(l.to_ascii_lowercase());
+        l
+    };
     cfg.github
         .iter()
         .filter(|g| {
@@ -147,9 +160,13 @@ pub fn github_links(cfg: &RoomCfg, root: &Path) -> Vec<crate::github::Link> {
         .map(|g| {
             let clone = local.iter().find(|(_, r)| r.as_deref().is_some_and(|r| r.eq_ignore_ascii_case(&g.repo)));
             let own = if g.name.is_empty() { g.repo.rsplit('/').next().unwrap_or(&g.repo).to_string() } else { g.name.clone() };
+            let own = own.replace(':', "-");
             crate::github::Link {
                 repo: g.repo.clone(),
-                label: clone.map_or_else(|| many.then_some(own), |(l, _)| l.clone()),
+                label: match clone {
+                    Some((l, _)) => l.clone(),
+                    None => many.then(|| unique(own)),
+                },
                 remote_only: clone.is_none(),
                 me: human(cfg),
                 my_login: None,
@@ -192,6 +209,11 @@ impl Relabel {
     }
 
     fn apply(&self, e: &mut Event) {
+        // Pull-request rows are named by their link's current label (`github_links`), not by
+        // the local repos' shape.
+        if e.id.starts_with("gh:") {
+            return;
+        }
         match &mut e.body {
             Body::Commit { branch, .. } => {
                 if let Some(n) = self.name(branch) {
@@ -316,8 +338,9 @@ pub struct Room {
     /// Each agent's usage state as last published, so a reset that no event marks still updates
     /// the meters.
     usage_shown: String,
-    /// An imported file was edited in place: replay the room on this tick.
+    /// An imported file was edited in place, or a file was cut short: replay the room on this tick.
     replay: bool,
+    ledger_replaced: bool,
     /// Ledger rows before this offset were routed already (set by a replay).
     route_from: u64,
     trio_exe: String,
@@ -331,8 +354,11 @@ pub struct Room {
     /// Wakes waiting for their agent to come back.
     held: Vec<Held>,
     /// The message each running agent was woken for, so a limit hit can hand it on.
-    /// The message each running agent was woken for, and everyone that message went to.
-    triggers: HashMap<String, (Event, Vec<String>)>,
+    triggers: HashMap<String, Event>,
+    /// Per message: the agents that have it (woken for it, holding it, or attached when it was
+    /// routed). A message reaches each agent once, whatever retries and reroutes follow.
+    delivered: HashMap<String, std::collections::BTreeSet<String>>,
+    delivered_order: VecDeque<String>,
     /// Cost of every finished run, by event id, so a day's spend survives the chat window.
     spend: HashMap<String, (String, String, f64)>,
 }
@@ -400,6 +426,11 @@ impl Room {
         let restored = crate::seen::load(&root);
         // A read-only replay (the project list) never wakes anyone: no agents, nothing held.
         let held: Vec<Held> = if watch { std::fs::read(held_path(&root)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default() } else { Vec::new() };
+        let mut delivered: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
+        for h in &held {
+            delivered.entry(h.event.id.clone()).or_default().insert(h.agent.clone());
+        }
+        let delivered_order: VecDeque<String> = delivered.keys().cloned().collect();
         let agents = if watch { agents } else { HashMap::new() };
         let github = if watch { github_links(&cfg, &root).into_iter().map(crate::github::GitHubWatch::start).collect() } else { Vec::new() };
         Ok(Self {
@@ -430,6 +461,7 @@ impl Room {
             relabel,
             usage_shown: String::new(),
             replay: false,
+            ledger_replaced: false,
             route_from: 0,
             trio_exe,
             seen: None,
@@ -439,6 +471,8 @@ impl Room {
             held,
             spend: HashMap::new(),
             triggers: HashMap::new(),
+            delivered,
+            delivered_order,
         })
     }
 
@@ -474,7 +508,17 @@ impl Room {
 
     fn seen_now(&self) -> crate::seen::Seen {
         let prints = self.prints.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        crate::seen::mark(&now(), self.arrival, &crate::work::all(&self.graph, &self.me()), self.ledger_read, prints)
+        let mut s = crate::seen::mark(&now(), self.arrival, &crate::work::all(&self.graph, &self.me()), self.ledger_read, prints);
+        s.ledger_head = crate::source::head_print(&self.ledger, self.ledger_read);
+        s
+    }
+
+    /// Whether the ledger still starts as it did at `mark` (it was not replaced or cut).
+    fn same_ledger(&self, mark: &crate::seen::Seen) -> bool {
+        match (mark.ledger, mark.ledger_head) {
+            (Some(n), Some(h)) => crate::source::head_print(&self.ledger, n) == Some(h),
+            _ => true,
+        }
     }
 
     fn print_key(&self, i: usize, e: &Event) -> Option<String> {
@@ -484,15 +528,17 @@ impl Room {
     /// Whether an event read at the first ingest was already there at a saved mark: a ledger row
     /// by its byte offset, an imported post by its content. A mark without offsets (an older
     /// Trio) falls back to its time.
-    fn before_mark(&self, mark: &crate::seen::Seen, e: &Event, pos: u64, offset: Option<u64>) -> bool {
-        let Some(read) = mark.ledger else { return e.at <= mark.at };
+    /// When in doubt an event counts as new: showing a seen row again is a nuisance, hiding a
+    /// new one is the failure the catch-up exists to prevent.
+    fn before_mark(&self, mark: &crate::seen::Seen, e: &Event, pos: u64, offset: Option<u64>, same_ledger: bool) -> bool {
+        let Some(read) = mark.ledger else { return e.at < mark.at };
         if let Some(o) = offset {
-            return o < read;
+            return same_ledger && o < read;
         }
         let i = ((pos >> 40) as usize).saturating_sub(1);
         match self.print_key(i, e) {
             Some(k) => mark.prints.get(&k) == Some(&crate::seen::print(e)),
-            None => e.at <= mark.at,
+            None => e.at < mark.at,
         }
     }
 
@@ -527,7 +573,7 @@ impl Room {
         if self.release_held() {
             changed = true;
         }
-        let usage = ["claude", "codex"].map(|a| self.usage(a).why()).join("|");
+        let usage = ["claude", "codex"].map(|a| serde_json::to_string(&self.usage(a)).unwrap_or_default()).join("|");
         if usage != self.usage_shown {
             self.usage_shown = usage;
             changed = true;
@@ -559,13 +605,26 @@ impl Room {
         std::mem::swap(&mut fresh.agents, &mut self.agents);
         std::mem::swap(&mut fresh.started, &mut self.started);
         std::mem::swap(&mut fresh.triggers, &mut self.triggers);
+        std::mem::swap(&mut fresh.delivered, &mut self.delivered);
+        std::mem::swap(&mut fresh.delivered_order, &mut self.delivered_order);
+        // The operator's pause holds until they lift it, whatever room.toml says.
+        fresh.cfg.paused = self.cfg.paused;
+        // Arrival numbers keep rising, so a strip drawn before the replay is older than the room.
+        fresh.arrival = self.arrival;
         std::mem::swap(&mut fresh.stops, &mut self.stops);
         std::mem::swap(&mut fresh.readings, &mut self.readings);
         fresh.read_at = self.read_at;
         fresh.hop = self.hop;
         fresh.presence = std::mem::take(&mut self.presence);
         fresh.restored = self.seen.take().or_else(|| self.restored.take());
-        fresh.route_from = self.ledger_read;
+        // Rows read before were routed then. A ledger that was cut or replaced is a new file
+        // whose rows this process cannot place: none of them is routed now.
+        fresh.route_from = if std::mem::take(&mut self.ledger_replaced) {
+            self.record("trio", Body::Status { text: "room.jsonl was cut or replaced: replayed it without waking anyone".into() });
+            u64::MAX
+        } else {
+            self.ledger_read
+        };
         fresh.live = self.live;
         fresh.ingest();
         fresh.rev = self.rev + 1;
@@ -600,11 +659,15 @@ impl Room {
             // arrives first and the rest after the new mark, so what came in while Trio was
             // closed is the catch-up. Without one, all history is the baseline.
             let restored = self.restored.take();
-            let (old, new): (Vec<_>, Vec<_>) = fresh.into_iter().partition(|(e, _, pos, off)| restored.as_ref().is_none_or(|m| self.before_mark(m, e, *pos, *off)));
+            let same = restored.as_ref().is_none_or(|m| self.same_ledger(m));
+            let (old, new): (Vec<_>, Vec<_>) = fresh.into_iter().partition(|(e, _, pos, off)| restored.as_ref().is_none_or(|m| self.before_mark(m, e, *pos, *off, same)));
             changed = self.apply_batch(old);
+            // The mark this process starts from is the saved one, not what was just read: rows
+            // read now but past the saved mark stay unread (a replay, too, starts from it).
             let mut mark = self.seen_now();
             if let Some(m) = restored {
-                (mark.at, mark.lanes) = (m.at, m.lanes);
+                (mark.at, mark.lanes, mark.prints) = (m.at, m.lanes, m.prints);
+                (mark.ledger, mark.ledger_head) = if same { (m.ledger, m.ledger_head) } else { (Some(0), crate::source::head_print(&self.ledger, 0)) };
             }
             self.seen = Some(mark);
             changed |= self.apply_batch(new);
@@ -673,6 +736,26 @@ impl Room {
 
     fn apply_batch(&mut self, mut fresh: Vec<Fresh>) -> bool {
         let mut changed = false;
+        // A row that reuses an id replaces the earlier one, so within one batch only the last
+        // version in source order counts, at the first version's position: the same result as
+        // reading the rows one tick at a time, whatever their times say.
+        let mut last: HashMap<&str, usize> = HashMap::new();
+        for (k, f) in fresh.iter().enumerate() {
+            last.insert(f.0.id.as_str(), k);
+        }
+        if last.len() < fresh.len() {
+            let mut first: HashMap<String, u64> = HashMap::new();
+            for f in &fresh {
+                first.entry(f.0.id.clone()).or_insert(f.2);
+            }
+            let keep: std::collections::HashSet<usize> = last.into_values().collect();
+            fresh = fresh.into_iter().enumerate().filter(|(k, _)| keep.contains(k)).map(|(_, mut f)| {
+                f.2 = first[&f.0.id];
+                f
+            }).collect();
+        } else {
+            drop(last);
+        }
         fresh.sort_by(|a, b| crate::gitwatch::replay_at(&a.0).cmp(crate::gitwatch::replay_at(&b.0)).then(a.2.cmp(&b.2)).then(a.3.cmp(&b.3)));
         for (e, from_ledger, pos, offset) in fresh {
             let route = self.live && from_ledger && matches!(e.body, Body::Message { .. }) && !self.graph.has_event(&e.id) && offset.is_none_or(|o| o >= self.route_from);
@@ -689,7 +772,13 @@ impl Room {
     fn poll_source(&mut self, i: usize, fresh: &mut Vec<Fresh>) {
         let from_ledger = i == self.sources.len() - 1;
         let polled = self.sources[i].poll();
-        self.replay |= self.sources[i].rewritten();
+        if self.sources[i].rewritten() {
+            self.replay = true;
+            self.ledger_replaced |= i + 1 == self.sources.len();
+        }
+        if let Some(end) = self.sources[i].read_to() {
+            self.ledger_read = end;
+        }
         if let Ok(evs) = polled {
             let offsets = self.sources[i].offsets();
             for (k, mut e) in evs.into_iter().enumerate() {
@@ -697,9 +786,6 @@ impl Room {
                     r.apply(&mut e);
                 }
                 let offset = offsets.get(k).copied();
-                if let Some(o) = offset {
-                    self.ledger_read = self.ledger_read.max(o + 1);
-                }
                 if let Some(key) = self.print_key(i, &e) {
                     self.prints.insert(key, crate::seen::print(&e));
                 }
@@ -847,35 +933,57 @@ impl Room {
             // Attached agents are pull-on-turn: the mention reaches them with their next message.
             if let Some(a) = crate::hook::attached(&self.root, t) {
                 self.record("trio", Body::Status { text: format!("{t} is attached: waiting on you in {}", a.surface.label()) });
+                self.deliver(&e.id, t);
                 continue;
             }
-            self.dispatch(t, e, &recent, detail, &targets);
+            self.dispatch(t, e, &recent, detail);
         }
     }
 
     /// Wake `t` for `e`, by its usage. Out (limit, used-up window or spent budget): the other
     /// agent takes it, with the item history, unless that would have the author review its own
     /// work; then the wake is held until `t` is back. Low: woken anyway, with a warning line.
-    fn dispatch(&mut self, t: &str, e: &Event, recent: &[String], detail: Option<&str>, targets: &[String]) {
+    fn has(&self, id: &str, agent: &str) -> bool {
+        self.delivered.get(id).is_some_and(|s| s.contains(agent))
+    }
+
+    fn deliver(&mut self, id: &str, agent: &str) {
+        if !self.delivered.contains_key(id) {
+            self.delivered_order.push_back(id.to_string());
+            if self.delivered_order.len() > 512 && let Some(old) = self.delivered_order.pop_front() {
+                self.delivered.remove(&old);
+            }
+        }
+        self.delivered.entry(id.to_string()).or_default().insert(agent.to_string());
+    }
+
+    fn undeliver(&mut self, id: &str, agent: &str) {
+        if let Some(s) = self.delivered.get_mut(id) {
+            s.remove(agent);
+        }
+    }
+
+    fn dispatch(&mut self, t: &str, e: &Event, recent: &[String], detail: Option<&str>) {
+        if self.has(&e.id, t) {
+            return; // it reached `t` already (a reroute earlier in this route, or held)
+        }
         let u = self.usage(t);
         if !u.out() {
             if u.state == "low" {
                 self.record("trio", Body::Status { text: clip(&format!("{t} is low ({}); woken anyway", u.reason.as_deref().unwrap_or("")), 120) });
             }
-            self.wake_for(t, e, recent, detail, &[], targets);
+            self.wake(t, e, recent, detail, &[]);
             return;
         }
         let other = other_agent(t).filter(|o| self.agents.get(*o).is_some_and(|a| a.cfg.enabled) && !self.usage(o).out());
         match other {
-            Some(o) if targets.iter().any(|x| x == o) => {
+            Some(o) if self.has(&e.id, o) => {
                 self.record("trio", Body::Status { text: clip(&format!("{t} is {}; {} already has this", u.why(), cap(o)), 120) });
             }
             Some(o) if !self.reviews_own_work(e, o) => {
                 self.record("trio", Body::Status { text: clip(&format!("routed to {}: {} is {}", cap(o), cap(t), u.why()), 120) });
                 let note = self.handoff(t, &u, e);
-                let mut all = targets.to_vec();
-                all.push(o.to_string());
-                self.wake_for(o, e, recent, detail, &note, &all);
+                self.wake(o, e, recent, detail, &note);
             }
             Some(o) => {
                 self.hold(t, e);
@@ -888,13 +996,8 @@ impl Room {
         }
     }
 
-    fn wake(&mut self, t: &str, e: &Event, recent: &[String], detail: Option<&str>, handoff: &[String]) {
-        self.wake_for(t, e, recent, detail, handoff, &[t.to_string()]);
-    }
-
-    /// Wake `t`, remembering every agent the message `e` went to (so a retry after a usage limit
-    /// never sends it to one of them twice).
-    fn wake_for(&mut self, t: &str, e: &Event, recent: &[String], detail: Option<&str>, handoff: &[String], targets: &[String]) {
+    /// Wake `t` for `e`. Only a run that started counts as delivered.
+    fn wake(&mut self, t: &str, e: &Event, recent: &[String], detail: Option<&str>, handoff: &[String]) -> WakeDecision {
         let me = self.me();
         let room = self.root.display().to_string();
         let guard = Guard { paused: self.cfg.paused, hop: self.hop, budget: self.cfg.hop_budget, from_human: e.from == me };
@@ -905,17 +1008,20 @@ impl Room {
             Some(a) => a.wake_if_allowed(&prompt, &guard),
             None => WakeDecision::Disabled,
         };
-        match decision {
+        match &decision {
             WakeDecision::Started => {
                 self.started.insert(t.to_string(), Instant::now());
-                self.triggers.insert(t.to_string(), (e.clone(), targets.to_vec()));
+                self.triggers.insert(t.to_string(), e.clone());
+                self.deliver(&e.id, t);
                 self.record(&e.from, Body::RunStarted { agent: t.to_string(), hop: self.hop, trigger: e.id.clone() });
             }
             other => self.record("trio", Body::Status { text: clip(&format!("{t} not woken: {other:?}"), 120) }),
         }
+        decision
     }
 
     fn hold(&mut self, t: &str, e: &Event) {
+        self.deliver(&e.id, t);
         if !self.held.iter().any(|h| h.agent == t && h.event.id == e.id) {
             self.held.push(Held { agent: t.to_string(), event: e.clone() });
             if self.held.len() > HELD_MAX {
@@ -945,24 +1051,35 @@ impl Room {
     }
 
     /// Wake held agents that are back, oldest first and one at a time per agent: the next waits
-    /// until that run ends. True when any was woken.
+    /// until that run ends. A held wake leaves the queue only when its run starts, or when it can
+    /// never start (disabled, over the hop budget, failed to spawn); while the room is paused,
+    /// the agent is busy, or there is no runtime to run it on, it stays. True when any changed.
     fn release_held(&mut self) -> bool {
-        let mut woke = false;
+        if self.cfg.paused || tokio::runtime::Handle::try_current().is_err() {
+            return false;
+        }
+        let mut changed = false;
         for agent in ["claude", "codex"] {
-            let busy = self.agents.get(agent).is_some_and(|a| a.is_running());
             let Some(i) = self.held.iter().position(|h| h.agent == agent) else { continue };
-            if busy || self.usage(agent).out() {
+            if self.usage(agent).out() || !self.agents.get(agent).is_some_and(|a| a.ready()) {
                 continue;
             }
-            let h = self.held.remove(i);
-            self.save_held();
+            let h = self.held[i].clone();
             let recent: Vec<String> = self.recent();
             self.record("trio", Body::Status { text: format!("{} is back: waking it for the held message", cap(&h.agent)) });
             let detail = h.event.detail().map(str::to_string);
-            self.wake(&h.agent, &h.event, &recent, detail.as_deref(), &[]);
-            woke = true;
+            let decision = self.wake(&h.agent, &h.event, &recent, detail.as_deref(), &[]);
+            if matches!(decision, WakeDecision::Running | WakeDecision::Busy | WakeDecision::Paused) {
+                continue;
+            }
+            if !matches!(decision, WakeDecision::Started) {
+                self.undeliver(&h.event.id, &h.agent);
+            }
+            self.held.retain(|x| !(x.agent == h.agent && x.event.id == h.event.id));
+            self.save_held();
+            changed = true;
         }
-        woke
+        changed
     }
 
     /// The newest eight chat lines, oldest first, for a wake prompt.
@@ -1038,6 +1155,10 @@ impl Room {
             if let Some(r) = a.reap() {
                 self.started.remove(&n);
                 let trigger = self.triggers.remove(&n);
+                let stopped = r.stop.is_some();
+                if let (true, Some(e)) = (stopped, &trigger) {
+                    self.undeliver(&e.id, &n); // it never answered: the message is not delivered
+                }
                 self.record(&n, Body::RunFinished { agent: n.clone(), exit: r.exit, secs, cost: r.cost });
                 // A usage limit: the agent is out until its reset, and the message it was woken
                 // for goes on by the same rules as a fresh one (rerouted or held).
@@ -1045,10 +1166,10 @@ impl Room {
                     self.stops.insert(n.clone(), stop);
                     let u = self.usage(&n);
                     self.record("trio", Body::Status { text: clip(&format!("{n} hit a usage limit: {}", u.why()), 120) });
-                    if let Some((e, targets)) = trigger {
+                    if let Some(e) = trigger {
                         let recent = self.recent();
                         let detail = e.detail().map(str::to_string);
-                        self.dispatch(&n, &e, &recent, detail.as_deref(), &targets);
+                        self.dispatch(&n, &e, &recent, detail.as_deref());
                     }
                     changed = true;
                     continue;
@@ -1579,6 +1700,120 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn a_replay_keeps_the_pause_and_what_is_unread() {
+        let root = temp_room("replay-unread");
+        std::fs::write(root.join(".trio/room.toml"), "me = 'sanjith'\nrepo = ''\n[[import]]\nfile = 'claude-posts.md'\nfrom = 'claude'\n").unwrap();
+        let file = root.join("claude-posts.md");
+        std::fs::write(&file, "## 2026-11-23 09:00 XF1 started\nworking\n").unwrap();
+        let mut room = Room::open(&root).unwrap();
+        room.tick();
+        room.mark_seen().unwrap();
+        drop(room);
+        append(&root.join(".trio/room.jsonl"), &message("", "2026-11-23T09:30", "codex", "XF2 opened while you were out")).unwrap();
+        let mut room = Room::open(&root).unwrap();
+        room.tick();
+        let upto = room.catchup(&crate::work::all(&room.graph, "sanjith")).expect("one unread").upto;
+        room.set_paused(true);
+        std::fs::write(&file, "## 2026-11-23 09:00 XF1 started\nworking \n").unwrap();
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(std::time::SystemTime::now() + Duration::from_secs(5)).unwrap();
+        room.tick();
+        assert!(room.cfg.paused, "a replay keeps the pause");
+        let c = room.catchup(&crate::work::all(&room.graph, "sanjith")).expect("still unread after the replay");
+        assert!(c.messages >= 1, "{c:?}");
+        assert!(!room.mark_seen_upto(Some(upto)).unwrap(), "a strip from before the replay is stale");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_replaced_ledger_counts_as_new() {
+        let root = temp_room("ledger-cut");
+        let ledger = root.join(".trio/room.jsonl");
+        let mut room = Room::open(&root).unwrap();
+        append(&ledger, &message("", "2026-11-23T09:00", "codex", "XF1 a long first message that sets the offset well past the next one")).unwrap();
+        room.tick();
+        room.mark_seen().unwrap();
+        drop(room);
+        std::fs::remove_file(&ledger).unwrap();
+        append(&ledger, &message("", "2026-11-23T08:00", "codex", "XF2 short")).unwrap();
+        let mut back = Room::open(&root).unwrap();
+        back.tick();
+        let c = back.catchup(&crate::work::all(&back.graph, "sanjith")).expect("the new ledger's row is new");
+        assert_eq!(c.messages, 1, "{c:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_ledger_cut_while_open_replays_without_waking_anyone() {
+        let (root, mut room) = room_with("cut-live", &[("codex", "On it.", 0)]);
+        room.tick();
+        room.say(&room.me(), "just a note about XF1", None).unwrap();
+        room.tick();
+        let ledger = root.join(".trio/room.jsonl");
+        std::fs::write(&ledger, "").unwrap();
+        append(&ledger, &message("", "2026-11-23T09:00", "sanjith", "@codex XF2")).unwrap();
+        room.tick();
+        room.tick();
+        assert!(room.graph.items.contains_key("XF2"));
+        assert!(!room.any_running(), "rows in a replaced ledger are not routed");
+        let text = std::fs::read_to_string(&ledger).unwrap();
+        assert!(text.contains("cut or replaced"), "{text}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pull_request_lifecycles_agree_live_and_cold() {
+        use crate::github::{Link, Login, Pr};
+        let root = temp_room("pr-life");
+        std::fs::write(root.join(".trio/room.toml"), "me = 'sanjith'\nrepo = ''\n").unwrap();
+        let link = Link { repo: "o/r".into(), label: None, remote_only: false, me: "sanjith".into(), my_login: None };
+        let mut pr = Pr {
+            number: 4, title: "Login".into(), head_ref_name: "claude/y".into(), head_ref_oid: "def".into(),
+            state: "OPEN".into(), is_draft: false, created_at: "2026-11-23T15:00:00Z".into(), updated_at: "2026-11-23T15:00:00Z".into(),
+            merged_at: None, url: String::new(), author: Some(Login { login: "bo".into() }), review_requests: vec![], latest_reviews: vec![],
+        };
+        let mut room = Room::open(&root).unwrap();
+        append(&room.ledger, &commit("c1", "2026-11-23T08:00", "claude/y", "def", "XF3 login", false, false)).unwrap();
+        let push = |room: &mut Room, pr: &Pr| {
+            for e in link.events(pr) {
+                if room.gh_rows.get(&e.id) != Some(&e) {
+                    append(&room.ledger, &e).unwrap();
+                }
+            }
+            room.tick();
+            crate::work::all(&room.graph, "sanjith")["XF3"].lane
+        };
+        assert_eq!(push(&mut room, &pr), "review");
+        pr.state = "CLOSED".into();
+        pr.updated_at = "2026-11-23T18:00:00Z".into();
+        assert_ne!(push(&mut room, &pr), "review");
+        pr.state = "OPEN".into();
+        pr.updated_at = "2026-11-23T19:00:00Z".into();
+        assert_eq!(push(&mut room, &pr), "review", "reopened");
+        let mut cold = Room::open(&root).unwrap();
+        cold.tick();
+        assert_eq!(crate::work::all(&cold.graph, "sanjith")["XF3"].lane, "review", "the reopen is the last row, cold too");
+        // Merging its only branch answers the request.
+        append(&room.ledger, &commit("c2", "2026-11-23T20:00", "claude/y", "def", "XF3 login", true, false)).unwrap();
+        room.tick();
+        assert_ne!(crate::work::all(&room.graph, "sanjith")["XF3"].lane, "review");
+        pr.is_draft = true;
+        let Body::Message { items, .. } = &link.events(&pr)[0].body else { panic!() };
+        assert!(items.is_empty(), "a draft names no branch");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_remote_repo_never_shares_a_local_repos_label() {
+        let root = temp_room("labels");
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let cfg: RoomCfg = toml::from_str(&format!("repo = {}\n[[github]]\nrepo = 'o/work'\n", toml::Value::String(work.display().to_string()))).unwrap();
+        let links = github_links(&cfg, &root);
+        assert_eq!((links[0].remote_only, links[0].label.as_deref()), (true, Some("work-2")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     fn ledger_rows(room: &Room) -> Vec<Event> {
         RoomLedger::new(room.ledger.clone()).poll().unwrap()
     }
@@ -1861,6 +2096,60 @@ mod tests {
         assert_eq!(ledger.matches("\"kind\":\"run_started\"").count(), 2, "both held messages woke Claude: {ledger}");
         assert!(!ledger.contains("not woken"), "{ledger}");
         assert!(!root.join(".trio/held.json").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn stop() -> crate::usage::Stop {
+        crate::usage::Stop { until: crate::usage::epoch_now() + 3600, reason: "session limit".into() }
+    }
+
+    #[tokio::test]
+    async fn a_held_both_message_reaches_each_agent_once() {
+        let (root, mut room) = room_with("held-both", &[("claude", "You've hit your session limit - resets 3:45pm", 1), ("codex", "On it.", 0)]);
+        room.tick();
+        room.stops.insert("claude".into(), stop());
+        room.stops.insert("codex".into(), stop());
+        room.say(&room.me(), "@both look at XF1", None).unwrap();
+        room.tick();
+        assert_eq!((room.held_for("claude"), room.held_for("codex")), (1, 1));
+        room.stops.remove("codex");
+        room.tick();
+        settle(&mut room).await;
+        room.stops.remove("claude");
+        room.tick();
+        settle(&mut room).await;
+        let ledger = std::fs::read_to_string(root.join(".trio").join("room.jsonl")).unwrap();
+        assert_eq!(ledger.matches("\"agent\":\"codex\",\"hop\"").count(), 1, "Codex had it already: {ledger}");
+        assert!(ledger.contains("Codex already has this"), "{ledger}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_held_wake_waits_for_a_runtime_and_an_unpaused_room() {
+        let (root, mut room) = room_with("held-rt", &[("claude", "Done.", 0)]);
+        room.tick();
+        room.stops.insert("claude".into(), stop());
+        room.say(&room.me(), "@claude look at XF1", None).unwrap();
+        room.tick();
+        room.stops.clear();
+        room.tick(); // no runtime: a run could not start, so the wake stays queued
+        assert_eq!(room.held_for("claude"), 1);
+        assert!(held_path(&root).exists());
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        room.set_paused(true);
+        {
+            let _inside = rt.enter();
+            room.tick();
+        }
+        assert_eq!(room.held_for("claude"), 1, "a paused room keeps it");
+        room.set_paused(false);
+        {
+            let _inside = rt.enter();
+            room.tick();
+        }
+        assert_eq!(room.held_for("claude"), 0);
+        assert!(room.any_running());
+        rt.block_on(settle(&mut room));
         let _ = std::fs::remove_dir_all(root);
     }
 

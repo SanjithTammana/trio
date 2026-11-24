@@ -97,16 +97,16 @@ pub fn open(root: &Path, web: bool) -> Result<Option<String>, String> {
     Err("the room's server did not start".into())
 }
 
-/// Whether something listens on the port the room's `server.json` names. A bare connect, not a
-/// poke: a poke ticks that room, and listing rooms must not make one route a pending message.
+/// Whether this room's own server is running. It asks `/api/is`, never pokes:
+/// a poke ticks that room, and listing rooms must not make one route a pending message.
 fn listening(root: &Path) -> bool {
     port(root).is_some()
 }
 
+/// The port of this room's own server: a listener on the recorded port could be another room's
+/// that took the port after this one stopped, so the server must answer to this room's id.
 fn port(root: &Path) -> Option<u16> {
-    let text = std::fs::read_to_string(root.join(".trio").join("server.json")).ok()?;
-    let port = serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| v["port"].as_u64()).and_then(|p| u16::try_from(p).ok())?;
-    std::net::TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], port)), std::time::Duration::from_millis(150)).is_ok().then_some(port)
+    crate::hook::serving(root)
 }
 
 fn same(a: &Path, b: &Path) -> bool {

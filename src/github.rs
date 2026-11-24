@@ -139,10 +139,13 @@ impl Link {
                 summary,
                 detail: (!detail.trim().is_empty()).then(|| detail.trim().to_string()),
                 mentions: if asks { pr.review_requests.iter().filter_map(|r| r.login.as_deref()).map(|l| self.who(l, None)).filter(|w| !["claude", "codex"].contains(&w.as_str())).collect() } else { Vec::new() },
-                items: if open { vec![branch.clone()] } else { Vec::new() },
+                items: if asks { vec![branch.clone()] } else { Vec::new() },
             },
         }];
-        for r in &pr.latest_reviews {
+        // Reviews name the branch, so after a PR closes they could bring back a branch deleted
+        // here. Those seen while it was open are recorded already; a clone's own refs say the rest.
+        let reviews: &[Review] = if open || self.remote_only { &pr.latest_reviews } else { &[] };
+        for r in reviews {
             let outcome = match r.state.as_str() {
                 "APPROVED" => "pass",
                 "CHANGES_REQUESTED" => "changes",
@@ -177,8 +180,9 @@ impl Link {
 /// `owner/name` and nothing else: no host (`gh` would accept `host/owner/name`), no flag-like
 /// leading dash, only the characters GitHub allows.
 pub fn valid_repo(repo: &str) -> bool {
-    let part = |p: &str| !p.is_empty() && !p.starts_with(['-', '.']) && p.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
-    matches!(repo.split_once('/'), Some((o, n)) if part(o) && part(n) && !n.contains('/'))
+    let chars = |p: &str| !p.is_empty() && !p.starts_with('-') && p.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    // Owners never start with a dot; names may (`org/.github`), but are never `.` or `..`.
+    matches!(repo.split_once('/'), Some((o, n)) if chars(o) && !o.starts_with('.') && chars(n) && n != "." && n != "..")
 }
 
 /// `2026-11-24T18:03:11Z` -> local `2026-11-24T12:03`.
@@ -289,8 +293,8 @@ mod tests {
 
     #[test]
     fn only_owner_and_name_reach_gh() {
-        assert!(valid_repo("SanjithTammana/trio") && valid_repo("o/r.js") && valid_repo("a-b/c_d"));
-        for bad in ["github.com/o/r", "o", "o/", "/r", "-R/x", "o/-x", "o/r/x", "o r/x", "../x", "o/.."] {
+        assert!(valid_repo("SanjithTammana/trio") && valid_repo("o/r.js") && valid_repo("a-b/c_d") && valid_repo("org/.github"));
+        for bad in ["github.com/o/r", "o", "o/", "/r", "-R/x", "o/-x", "o/r/x", "o r/x", "../x", "o/..", "o/.", ".o/x"] {
             assert!(!valid_repo(bad), "{bad}");
         }
     }

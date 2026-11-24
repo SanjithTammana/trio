@@ -431,7 +431,8 @@ impl Graph {
             if newest.map(Verdict::key) > facts.verdict.as_ref().map(Verdict::key) {
                 facts.verdict = newest.cloned();
             }
-            let ask = branch.latest_request();
+            // A merged branch's request was answered by the merge.
+            let ask = branch.latest_request().filter(|_| branch.merged_at.is_none());
             if ask.map(ReviewAsk::key) > facts.ask.as_ref().map(ReviewAsk::key) {
                 facts.ask = ask.cloned();
             }

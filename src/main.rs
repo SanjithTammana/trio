@@ -467,10 +467,15 @@ fn cmd_open(args: &[String]) -> Result<(), String> {
         }
         return Ok(());
     };
-    room.tick();
+    // The first tick can start runs (a held wake whose limit reset while Trio was closed), and
+    // runs live on the runtime: build it first and tick inside it.
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
+    {
+        let _inside = rt.enter();
+        room.tick();
+    }
     let app_root = room.root.clone();
     register(&app_root);
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
     rt.block_on(async move {
         // The default port may belong to another room's server: then any free port will do.
         let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {

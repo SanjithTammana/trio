@@ -26,6 +26,10 @@ pub struct Seen {
     /// at or past this byte offset (the ledger is append-only, so offsets are arrival order)...
     #[serde(default)]
     pub ledger: Option<u64>,
+    /// A fingerprint of the ledger's first bytes (up to 4 KiB, never past `ledger`). A ledger
+    /// that no longer starts this way was replaced, and its offsets mean nothing to this mark.
+    #[serde(default)]
+    pub ledger_head: Option<u64>,
     /// ...and an imported post is new unless one with its id and the same content was there at
     /// the mark (posts files are edited in place). Keys are `<file>|<event id>`.
     #[serde(default)]
@@ -56,7 +60,7 @@ pub fn save(root: &Path, s: &Seen) -> std::io::Result<()> {
 }
 
 pub fn mark(at: &str, position: u64, work: &HashMap<String, Work>, ledger: u64, prints: BTreeMap<String, u64>) -> Seen {
-    Seen { at: at.to_string(), position, lanes: work.iter().map(|(id, w)| (id.clone(), w.lane.to_string())).collect(), ledger: Some(ledger), prints }
+    Seen { at: at.to_string(), position, lanes: work.iter().map(|(id, w)| (id.clone(), w.lane.to_string())).collect(), ledger: Some(ledger), ledger_head: None, prints }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -273,7 +277,7 @@ mod tests {
     fn the_mark_round_trips_on_disk() {
         let dir = std::env::temp_dir().join(format!("trio-seen-{}", std::process::id()));
         std::fs::create_dir_all(dir.join(".trio")).unwrap();
-        let s = Seen { at: "2026-11-23T09:30".into(), position: 42, lanes: [("XF1".to_string(), "done".to_string())].into(), ledger: Some(7), prints: [("a.md|p1".to_string(), 9)].into() };
+        let s = Seen { at: "2026-11-23T09:30".into(), position: 42, lanes: [("XF1".to_string(), "done".to_string())].into(), ledger: Some(7), ledger_head: Some(3), prints: [("a.md|p1".to_string(), 9)].into() };
         save(&dir, &s).unwrap();
         assert_eq!(serde_json::from_slice::<Seen>(&std::fs::read(path(&dir)).unwrap()).unwrap(), s);
         std::fs::remove_dir_all(dir).ok();
