@@ -63,36 +63,33 @@ impl View for ChatView {
 /// Edge kinds a client draws.
 const DRAWN_EDGES: &[&str] = &["implements"];
 
-pub struct GraphView;
-impl View for GraphView {
-    fn snapshot(&self, room: &Room) -> serde_json::Value {
-        use crate::graph::Node;
-        use crate::model::{Entity, Summarized, Timed};
-        let mut items: Vec<_> = room.graph.items.values().collect();
-        items.sort_by(|a, b| a.at().cmp(b.at()));
-        let work = crate::work::all(&room.graph, &room.me());
-        // Serialized through the Node interface, so any future node type renders the same way.
-        let nodes: Vec<_> = items
-            .iter()
-            .map(|n| {
-                let mut v = serde_json::json!({
-                    "id": n.id(), "kind": n.kind(), "lane": n.lane(), "state": n.state(),
-                    "first": n.at(), "last": n.last, "summary": n.summary(),
-                    "touches": n.touches, "steps": n.steps,
-                });
-                if let Some(w) = work.get(n.id()) {
-                    v["work"] = serde_json::json!(w);
-                }
-                v
-            })
-            .collect();
-        // Clients draw only these; the other derived edges stay server-side (85% of the list).
-        let drawn: Vec<_> = room.graph.edges.iter().filter(|e| DRAWN_EDGES.contains(&e.kind.as_str())).collect();
-        serde_json::json!({
-            "items": nodes, "edges": drawn, "now": room.graph.now,
-            "touches": room.graph.touches, "merged": room.graph.merged,
-        })
-    }
+fn graph_snapshot(room: &Room, work: &HashMap<String, crate::work::Work>) -> serde_json::Value {
+    use crate::graph::Node;
+    use crate::model::{Entity, Summarized, Timed};
+    let mut items: Vec<_> = room.graph.items.values().collect();
+    items.sort_by(|a, b| a.at().cmp(b.at()).then(a.id().cmp(b.id())));
+    let nodes: Vec<_> = items.iter().map(|n| {
+        let w = work.get(n.id());
+        let state = match w {
+            Some(w) => &w.state,
+            None => crate::work::latest_verdict(n).map_or(n.base_state(), |v| &v.outcome),
+        };
+        let mut v = serde_json::json!({
+            "id": n.id(), "kind": n.kind(), "lane": n.lane(), "state": state,
+            "first": n.at(), "last": n.last, "summary": n.summary(),
+            "touches": n.touches, "steps": n.steps,
+        });
+        if let Some(w) = w {
+            v["work"] = serde_json::json!(w);
+        }
+        v
+    }).collect();
+    // Clients draw only these; the other derived edges stay server-side.
+    let drawn: Vec<_> = room.graph.edges.iter().filter(|e| DRAWN_EDGES.contains(&e.kind.as_str())).collect();
+    serde_json::json!({
+        "items": nodes, "edges": drawn, "now": room.graph.now,
+        "touches": room.graph.touches, "merged": room.graph.merged,
+    })
 }
 
 pub fn router(app: Arc<App>) -> Router {
@@ -158,7 +155,8 @@ fn snapshot(room: &Room, token: &str, room_id: &str) -> serde_json::Value {
     if let serde_json::Value::Object(chat) = ChatView.snapshot(room) {
         obj.extend(chat);
     }
-    obj.insert("graph".into(), GraphView.snapshot(room));
+    let work = crate::work::all(&room.graph, &room.me());
+    obj.insert("graph".into(), graph_snapshot(room, &work));
     // Each agent's availability for the island bars and for "held until" on cards.
     let usage: serde_json::Map<String, serde_json::Value> = ["claude", "codex"]
         .iter()
@@ -170,11 +168,8 @@ fn snapshot(room: &Room, token: &str, room_id: &str) -> serde_json::Value {
         })
         .collect();
     obj.insert("usage".into(), serde_json::Value::Object(usage));
-    if let Some(seen) = &room.seen {
-        let work = crate::work::all(&room.graph, &room.me());
-        if let Some(c) = crate::seen::catchup(seen, &room.graph, &work, room.events(), &room.me()) {
-            obj.insert("catchup".into(), serde_json::json!(c));
-        }
+    if let Some(c) = room.catchup(&work) {
+        obj.insert("catchup".into(), serde_json::json!(c));
     }
     v
 }
@@ -257,7 +252,10 @@ async fn seen(State(app): State<Arc<App>>, headers: HeaderMap, Json(r): Json<See
     }
     let rev = {
         let mut room = app.room.lock().expect("room lock");
-        room.mark_seen();
+        if let Err(e) = room.mark_seen() {
+            eprintln!("trio: could not save the seen mark: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "could not save the seen mark").into_response();
+        }
         room.rev
     };
     let _ = app.tx.send(rev);
@@ -309,6 +307,63 @@ mod tests {
         assert_eq!(poke_status(None, &id), StatusCode::FORBIDDEN);
         assert_eq!(poke_status(Some(b"1"), &id), StatusCode::CONFLICT);
         assert_eq!(poke_status(Some(id.as_bytes()), &id), StatusCode::NO_CONTENT);
+    }
+
+    #[test]
+    fn the_exported_state_and_work_use_the_branch_verdict_after_a_late_link() {
+        use crate::model::{Body, Event};
+        let mut g = crate::graph::Graph::default();
+        let derivers = crate::graph::derivers();
+        let apply = |g: &mut crate::graph::Graph, id: &str, at: &str, body| {
+            g.apply(&Event { id: id.into(), at: at.into(), from: "codex".into(), body }, &derivers);
+        };
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("trio-state-link-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut room = Room::open(&root).unwrap();
+        apply(&mut g, "changes", "2026-11-23T09:00", Body::Verdict { item: "XF1".into(), outcome: "changes".into() });
+        apply(&mut g, "pass", "2026-11-23T10:00", Body::Verdict { item: "claude/x".into(), outcome: "pass".into() });
+        let tip = |branch: &str, subject: &str| Body::Commit {
+            branch: branch.into(), sha: "a".into(), subject: subject.into(), touches: vec![], merged: false, gone: false,
+        };
+        apply(&mut g, "link", "2026-11-23T10:00", tip("claude/x", "XF1 work"));
+        apply(&mut g, "tie", "2026-11-23T10:00", tip("claude/a", "other work"));
+        room.graph = g;
+        let snap = snapshot(&room, "t", "r");
+        let nodes = snap["graph"]["items"].as_array().unwrap();
+        assert_eq!(nodes.iter().map(|n| n["id"].as_str().unwrap()).collect::<Vec<_>>(), ["XF1", "claude/a", "claude/x"]);
+        assert_eq!((&nodes[0]["state"], &nodes[0]["work"]["lane"]), (&serde_json::json!("pass"), &serde_json::json!("done")));
+        assert_eq!(nodes[1]["state"], "branch");
+        assert_eq!(nodes[2]["state"], "pass");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn seen_post_reports_a_failed_save_without_advancing_the_mark() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("trio-seen-http-{}-{nanos}", std::process::id()));
+        let blocked = crate::seen::path(&root);
+        std::fs::create_dir_all(&blocked).unwrap();
+        let mut room = Room::open(&root).unwrap();
+        room.tick();
+        let before = room.seen.clone();
+        let rev = room.rev;
+        let (tx, mut rx) = broadcast::channel(16);
+        let app = Arc::new(App { room: Mutex::new(room), token: "t".into(), hosts: vec!["localhost:8964".into()], tx, wake: tokio::sync::Notify::new(), room_id: "r".into(), snapshot: Mutex::new(None) });
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ORIGIN, HeaderValue::from_static("http://localhost:8964"));
+        let response = seen(State(app.clone()), headers.clone(), Json(SeenReq { token: "t".into() })).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        {
+            let room = app.room.lock().unwrap();
+            assert_eq!((room.seen.clone(), room.rev), (before, rev));
+        }
+        assert!(rx.try_recv().is_err());
+        std::fs::remove_dir(blocked).unwrap();
+        let response = seen(State(app), headers, Json(SeenReq { token: "t".into() })).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(rx.try_recv().unwrap(), rev + 1);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     async fn body(app: &Arc<App>) -> Bytes {

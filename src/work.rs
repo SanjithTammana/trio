@@ -18,6 +18,8 @@ pub struct Work {
     pub story: String,
     /// When the item or any branch implementing it last moved: what a card's age shows.
     pub last: String,
+    #[serde(skip)]
+    pub state: String,
 }
 
 /// Branches that implement each item, from the `implements` edges.
@@ -29,41 +31,56 @@ pub fn implementers(g: &Graph) -> HashMap<&str, Vec<&str>> {
     by
 }
 
-/// The Work reading of one item (not a branch).
-///
-/// The newest review event decides: a request after the last verdict puts it in review; else the
-/// last verdict (pass is done; changes go back to the author unless a merge came after them);
-/// else a full merge is done; else a claim or a branch is progress; else it is only asked.
-/// Events compare by (time, arrival), so same-minute posts keep their file order.
-pub fn work(it: &WorkItem, branches: &[&str], g: &Graph, me: &str) -> Work {
-    let live: Vec<&WorkItem> = branches.iter().filter_map(|b| g.items.get(*b)).collect();
-    let verdict = std::iter::once(it).chain(live.iter().copied()).flat_map(|n| n.verdicts.iter()).max_by(|a, b| a.key().cmp(&b.key()));
-    let ask = it.review_asked.as_ref().filter(|r| verdict.is_none_or(|v| (r.at.as_str(), r.seq) > v.key()));
-    let author = author(it, &live);
-    let has_branch = !live.is_empty() || !it.merged_gone.is_empty();
-    let all_merged = has_branch && live.iter().all(|b| g.merged.contains(&b.id));
-    // The latest merge, by the same (minute, position) key as verdicts and requests.
-    let merged = live.iter().filter_map(|b| b.merged_at.as_ref()).chain(it.merged_gone.iter().map(|m| &m.merged)).max();
-    let (lane, waiting_on) = if let Some(r) = ask {
-        ("review", reviewer(r, author.as_deref()))
+pub struct Reading<'a> {
+    pub lane: &'static str,
+    verdict: Option<&'a Verdict>,
+    ask: Option<&'a ReviewAsk>,
+    all_merged: bool,
+}
+
+/// The verdict shared by Work and the graph export. Branches have no implementers of their own.
+pub fn latest_verdict(it: &WorkItem) -> Option<&Verdict> {
+    it.verdicts.iter().chain(it.branches.verdict.iter()).max_by_key(|v| v.key())
+}
+
+/// The same lane decision is used at ingest and when rendering Work.
+pub fn reading(it: &WorkItem) -> Reading<'_> {
+    let verdict = latest_verdict(it);
+    let ask = it.latest_request().filter(|r| verdict.is_none_or(|v| r.key() > v.key()));
+    let has_branch = it.branches.count > 0 || !it.merged_gone.is_empty();
+    let all_merged = has_branch && it.branches.unmerged == 0;
+    let merged = it.branches.merged.iter().chain(it.merged_gone.iter().map(|m| &m.merged)).max();
+    let merged_after_review = all_merged && verdict.is_none_or(|v| merged.is_some_and(|(at, seq)| (at.as_str(), *seq) > v.key()));
+    let lane = if ask.is_some() {
+        "review"
+    } else if merged_after_review {
+        "done"
     } else if let Some(v) = verdict {
         match v.outcome.as_str() {
-            "pass" => ("done", None),
-            _ if all_merged && merged.is_some_and(|(at, s)| (at.as_str(), *s) > v.key()) => ("done", None),
-            "changes" | "blocked" => ("changes", agent_of(&v.on).or(author.clone())),
-            _ => ("review", None),
+            "pass" => "done",
+            "changes" | "blocked" => "changes",
+            _ => "review",
         }
-    } else if all_merged {
-        ("done", None)
-    } else if let Some(c) = &it.claimed_by {
-        ("progress", Some(c.clone()))
-    } else if has_branch {
-        ("progress", author.clone())
+    } else if it.claimed_by.is_some() || has_branch {
+        "progress"
     } else {
-        ("asked", None)
+        "asked"
     };
-    let last = live.iter().map(|b| b.last.as_str()).chain(std::iter::once(it.last.as_str())).max().unwrap_or("").to_string();
-    Work { lane, story: story(it, &live, all_merged, ask, lane, waiting_on.as_deref(), me), waiting_on, last }
+    Reading { lane, verdict, ask, all_merged }
+}
+
+/// The Work reading of one item (not a branch).
+pub fn work(it: &WorkItem, branches: &[&str], g: &Graph, me: &str) -> Work {
+    let live: Vec<&WorkItem> = branches.iter().filter_map(|b| g.items.get(*b)).collect();
+    let Reading { lane, verdict, ask, all_merged } = reading(it);
+    let waiting_on = match lane {
+        "review" => ask.and_then(|r| reviewer(r, author(it, &live).as_deref())),
+        "changes" => verdict.and_then(|v| agent_of(&v.on)).or_else(|| author(it, &live)),
+        "progress" => it.claimed_by.clone().or_else(|| author(it, &live)),
+        _ => None,
+    };
+    let last = live.iter().map(|b| b.last.as_str()).chain(it.merged_gone.iter().map(|b| b.last.as_str())).max().unwrap_or(&it.last).max(&it.last);
+    Work { lane, story: story(it, &live, all_merged, ask, lane, waiting_on.as_deref(), me), waiting_on, last: last.into(), state: verdict.map_or(it.base_state(), |v| &v.outcome).into() }
 }
 
 /// The agent a branch belongs to, from its prefix (`claude/hooks-p0a` -> claude).
@@ -362,6 +379,19 @@ mod tests {
         assert!(w.story.contains("On branch claude/x, merged."), "{}", w.story);
     }
 
+    #[test]
+    fn a_merged_and_deleted_branch_keeps_its_activity_on_the_card() {
+        let d = derivers();
+        let mut g = Graph::default();
+        g.apply(&ev("item", "2026-11-23T09:00", "sanjith", msg("XF1 needs work", &[], &["XF1"])), &d);
+        g.apply(&ev("merge", "2026-11-23T10:00", "claude", commit("claude/x", "XF1 work", true, false)), &d);
+        g.apply(&ev("review", "2026-11-23T11:00", "codex", verdict("claude/x", "pass")), &d);
+        g.apply(&ev("gone", "2026-11-23T12:00", "claude", commit("claude/x", "", false, true)), &d);
+        let work = &all(&g, "sanjith")["XF1"];
+        assert_eq!((work.lane, work.last.as_str()), ("done", "2026-11-23T11:00"));
+        assert_eq!(g.items["XF1"].last, "2026-11-23T09:00");
+    }
+
     fn post(file: &str, from: &str, text: &str) -> Vec<Event> {
         use crate::source::Source;
         let p = std::env::temp_dir().join(format!("trio-work-{}-{file}", std::process::id()));
@@ -400,14 +430,14 @@ mod tests {
         };
         let live = lane((&pass, p_pass), (&ask, p_ask));
         let cold = lane((&ask, p_ask), (&pass, p_pass));
-        assert_eq!(live, cold, "arrival order must not decide");
+        assert_eq!((live, cold), ("done", "done"), "arrival order must not decide");
     }
 
     #[test]
     fn a_post_title_names_the_reviewer_and_a_fenced_example_is_not_an_answer() {
         let d = derivers();
         let mut g = Graph::default();
-        let text = "# Claude\n\n## 2026-11-23 10:00 @codex XF1 needs review\n\nThanks @claude for implementing it. Reply like:\n\n```\nverdict XF1: pass\n```\n";
+        let text = "# Claude\n\n## 2026-11-23 10:00 @codex XF1 needs review\n\nThanks @sanjith for the log. Reply like:\n\n```\nverdict XF1: pass\n```\n";
         for e in post("claude-posts.md", "claude", text) {
             g.apply(&e, &d);
         }
@@ -421,6 +451,44 @@ mod tests {
     }
 
     #[test]
+    fn a_group_request_in_the_title_wins_over_a_body_mention() {
+        let d = derivers();
+        let mut g = Graph::default();
+        let text = "## 2026-11-23 10:00 @both XF1 needs review\nThanks @sanjith for the log.\n\n## 2026-11-23 10:01 XF2 needs review\nPlease take it, @sanjith.\n";
+        for e in post("group-requests.md", "claude", text) {
+            g.apply(&e, &d);
+        }
+        let work = all(&g, "sanjith");
+        assert_eq!((work["XF1"].lane, work["XF1"].waiting_on.as_deref()), ("review", Some("codex")));
+        assert_eq!((work["XF2"].lane, work["XF2"].waiting_on.as_deref()), ("review", Some("sanjith")));
+    }
+
+    #[test]
+    fn replacing_the_latest_ask_reveals_the_older_request() {
+        let d = derivers();
+        let mut g = Graph::default();
+        g.apply(&ev("old", "2026-11-23T09:00", "claude", msg("@codex please review XF1", &["codex"], &["XF1"])), &d);
+        g.apply(&ev("new", "2026-11-23T10:00", "claude", msg("@sanjith please review XF1", &["sanjith"], &["XF1"])), &d);
+        assert_eq!(all(&g, "sanjith")["XF1"].waiting_on.as_deref(), Some("sanjith"));
+        g.apply(&ev("new", "2026-11-23T10:00", "claude", msg("verdict XF2: pass", &[], &["XF2"])), &d);
+        assert_eq!(all(&g, "sanjith")["XF1"].waiting_on.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn replacing_a_verdict_line_changes_the_outcome_without_counting_twice() {
+        let d = derivers();
+        let mut g = Graph::default();
+        for outcome in ["pass", "changes"] {
+            g.apply(&ev("claude-posts.md@0#1:XF1", "2026-11-23T10:00", "claude", verdict("XF1", outcome)), &d);
+        }
+        let work = &all(&g, "sanjith")["XF1"];
+        assert_eq!((work.state.as_str(), work.lane), ("changes", "changes"));
+        assert!(work.story.contains("reviewed it once: changes."));
+        assert_eq!(g.items["XF1"].verdicts.len(), 1);
+        assert!(!g.edges.iter().any(|e| e.kind == "review:pass"));
+    }
+
+    #[test]
     fn a_late_branch_link_never_overrides_a_newer_item_verdict() {
         let d = derivers();
         let mut g = Graph::default();
@@ -429,8 +497,8 @@ mod tests {
         // Git links the branch to XF1 afterwards, then refreshes it.
         g.apply(&ev("git:claude/x", "2026-11-23T10:30", "claude", commit("claude/x", "XF1 work", false, false)), &d);
         g.apply(&ev("git:claude/x", "2026-11-23T10:40", "claude", commit("claude/x", "XF1 more", false, false)), &d);
-        assert_eq!(g.items["XF1"].state, "review", "exported state");
-        assert_eq!(all(&g, "sanjith")["XF1"].lane, "review");
+        let work = &all(&g, "sanjith")["XF1"];
+        assert_eq!((work.state.as_str(), work.lane), ("review", "review"));
     }
 
     #[test]
