@@ -45,7 +45,8 @@ pub struct App {
 impl App {
     /// Watched = a visible page holds the event stream (hidden tabs disconnect themselves).
     pub fn active(&self) -> bool {
-        self.tx.receiver_count() > 0 || self.room.lock().expect("room lock").any_running()
+        // Held wakes keep the room ticking, so a limit that resets with no page open still wakes.
+        self.tx.receiver_count() > 0 || { let r = self.room.lock().expect("room lock"); r.any_running() || r.has_held() }
     }
 }
 

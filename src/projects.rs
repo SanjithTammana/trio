@@ -38,7 +38,7 @@ pub fn summary(root: &Path, current: &Path) -> Option<Summary> {
         name: room.name(),
         path: root.display().to_string(),
         current: same(root, current),
-        running: crate::hook::poke(root).is_some(),
+        running: listening(root),
         waiting_on_you,
         in_flight,
         new,
@@ -93,6 +93,14 @@ pub fn open(root: &Path, web: bool) -> Result<Option<String>, String> {
         }
     }
     Err("the room's server did not start".into())
+}
+
+/// Whether something listens on the port the room's `server.json` names. A bare connect, not a
+/// poke: a poke ticks that room, and listing rooms must not make one route a pending message.
+fn listening(root: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(root.join(".trio").join("server.json")) else { return false };
+    let Some(port) = serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| v["port"].as_u64()).and_then(|p| u16::try_from(p).ok()) else { return false };
+    std::net::TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], port)), std::time::Duration::from_millis(150)).is_ok()
 }
 
 fn same(a: &Path, b: &Path) -> bool {

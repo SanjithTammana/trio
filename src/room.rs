@@ -78,10 +78,14 @@ impl Budget {
 }
 
 /// A wake waiting for its agent to be available again.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Held {
     agent: String,
     event: Event,
+}
+
+fn held_path(root: &Path) -> PathBuf {
+    root.join(".trio").join("held.json")
 }
 
 /// Held wakes kept at most (the oldest go first).
@@ -247,7 +251,10 @@ pub struct Room {
     /// Wakes waiting for their agent to come back.
     held: Vec<Held>,
     /// The message each running agent was woken for, so a limit hit can hand it on.
-    triggers: HashMap<String, Event>,
+    /// The message each running agent was woken for, and everyone that message went to.
+    triggers: HashMap<String, (Event, Vec<String>)>,
+    /// Cost of every finished run, by event id, so a day's spend survives the chat window.
+    spend: HashMap<String, (String, String, f64)>,
 }
 
 #[derive(Serialize)]
@@ -305,6 +312,9 @@ impl Room {
             .map(|(label, path, base)| GitSource { watch: crate::gitwatch::GitWatch::start(path, base, label.clone()), label })
             .collect();
         let restored = crate::seen::load(&root);
+        // A read-only replay (the project list) never wakes anyone: no agents, nothing held.
+        let held: Vec<Held> = if watch { std::fs::read(held_path(&root)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default() } else { Vec::new() };
+        let agents = if watch { agents } else { HashMap::new() };
         let github = if watch { github_links(&cfg, &root).into_iter().map(crate::github::GitHubWatch::start).collect() } else { Vec::new() };
         Ok(Self {
             root,
@@ -334,7 +344,8 @@ impl Room {
             readings: HashMap::new(),
             read_at: None,
             stops: HashMap::new(),
-            held: Vec::new(),
+            held,
+            spend: HashMap::new(),
             triggers: HashMap::new(),
         })
     }
@@ -570,6 +581,13 @@ impl Room {
         if e.id.starts_with("gh:") {
             self.gh_rows.insert(e.id.clone(), e.clone());
         }
+        if let Body::RunFinished { agent, cost: Some(c), .. } = &e.body {
+            self.spend.insert(e.id.clone(), (e.at.get(..10).unwrap_or("").to_string(), agent.clone(), *c));
+            if self.spend.len() > 4096 {
+                let today = now();
+                self.spend.retain(|_, (day, _, _)| today.starts_with(day.as_str()));
+            }
+        }
         if let Body::Commit { branch, sha, touches, .. } = &e.body
             && crate::gitwatch::is_refresh(&e)
         {
@@ -638,7 +656,17 @@ impl Room {
         }
         let mut targets: Vec<String> = mentions.iter().filter(|m| m.as_str() != "both" && m.as_str() != me).cloned().collect();
         if mentions.iter().any(|m| m == "both") {
-            targets.extend(["claude".to_string(), "codex".to_string()]);
+            // "Both" asks for review from whoever did not write the work: never its author.
+            for a in ["claude", "codex"] {
+                if targets.iter().any(|t| t == a) || a == e.from {
+                    continue;
+                }
+                if self.reviews_own_work(e, a) {
+                    self.record("trio", Body::Status { text: format!("{} wrote it, so @both asks only the other agent to review", cap(a)) });
+                    continue;
+                }
+                targets.push(a.to_string());
+            }
         }
         targets.retain(|t| t != &e.from);
         targets.dedup();
@@ -675,7 +703,7 @@ impl Room {
             if u.state == "low" {
                 self.record("trio", Body::Status { text: clip(&format!("{t} is low ({}); woken anyway", u.reason.as_deref().unwrap_or("")), 120) });
             }
-            self.wake(t, e, recent, detail, &[]);
+            self.wake_for(t, e, recent, detail, &[], targets);
             return;
         }
         let other = other_agent(t).filter(|o| self.agents.get(*o).is_some_and(|a| a.cfg.enabled) && !self.usage(o).out());
@@ -686,7 +714,9 @@ impl Room {
             Some(o) if !self.reviews_own_work(e, o) => {
                 self.record("trio", Body::Status { text: clip(&format!("routed to {}: {} is {}", cap(o), cap(t), u.why()), 120) });
                 let note = self.handoff(t, &u, e);
-                self.wake(o, e, recent, detail, &note);
+                let mut all = targets.to_vec();
+                all.push(o.to_string());
+                self.wake_for(o, e, recent, detail, &note, &all);
             }
             Some(o) => {
                 self.hold(t, e);
@@ -700,6 +730,12 @@ impl Room {
     }
 
     fn wake(&mut self, t: &str, e: &Event, recent: &[String], detail: Option<&str>, handoff: &[String]) {
+        self.wake_for(t, e, recent, detail, handoff, &[t.to_string()]);
+    }
+
+    /// Wake `t`, remembering every agent the message `e` went to (so a retry after a usage limit
+    /// never sends it to one of them twice).
+    fn wake_for(&mut self, t: &str, e: &Event, recent: &[String], detail: Option<&str>, handoff: &[String], targets: &[String]) {
         let me = self.me();
         let room = self.root.display().to_string();
         let guard = Guard { paused: self.cfg.paused, hop: self.hop, budget: self.cfg.hop_budget, from_human: e.from == me };
@@ -713,7 +749,7 @@ impl Room {
         match decision {
             WakeDecision::Started => {
                 self.started.insert(t.to_string(), Instant::now());
-                self.triggers.insert(t.to_string(), e.clone());
+                self.triggers.insert(t.to_string(), (e.clone(), targets.to_vec()));
                 self.record(&e.from, Body::RunStarted { agent: t.to_string(), hop: self.hop, trigger: e.id.clone() });
             }
             other => self.record("trio", Body::Status { text: clip(&format!("{t} not woken: {other:?}"), 120) }),
@@ -726,26 +762,48 @@ impl Room {
             if self.held.len() > HELD_MAX {
                 self.held.remove(0);
             }
+            self.save_held();
         }
     }
 
-    /// Wake held agents that are back. True when any was woken.
+    /// Held wakes outlive a restart: write them through on every change.
+    fn save_held(&self) {
+        let path = held_path(&self.root);
+        if self.held.is_empty() {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        let tmp = path.with_extension("json.tmp");
+        let ok = serde_json::to_vec(&self.held).ok().is_some_and(|b| std::fs::write(&tmp, b).is_ok()) && std::fs::rename(&tmp, &path).is_ok();
+        if !ok {
+            eprintln!("trio: could not save held wakes");
+        }
+    }
+
+    /// Wakes waiting for an agent to come back (the server keeps ticking while there are any).
+    pub fn has_held(&self) -> bool {
+        !self.held.is_empty()
+    }
+
+    /// Wake held agents that are back, oldest first and one at a time per agent: the next waits
+    /// until that run ends. True when any was woken.
     fn release_held(&mut self) -> bool {
-        let back: Vec<bool> = self.held.iter().map(|h| !self.usage(&h.agent).out()).collect();
-        if !back.contains(&true) {
-            return false;
-        }
-        let mut ready: Vec<Held> = Vec::new();
-        for (h, is_back) in std::mem::take(&mut self.held).into_iter().zip(back) {
-            if is_back { ready.push(h) } else { self.held.push(h) }
-        }
-        let recent: Vec<String> = self.recent();
-        for h in ready {
+        let mut woke = false;
+        for agent in ["claude", "codex"] {
+            let busy = self.agents.get(agent).is_some_and(|a| a.is_running());
+            let Some(i) = self.held.iter().position(|h| h.agent == agent) else { continue };
+            if busy || self.usage(agent).out() {
+                continue;
+            }
+            let h = self.held.remove(i);
+            self.save_held();
+            let recent: Vec<String> = self.recent();
             self.record("trio", Body::Status { text: format!("{} is back: waking it for the held message", cap(&h.agent)) });
             let detail = h.event.detail().map(str::to_string);
             self.wake(&h.agent, &h.event, &recent, detail.as_deref(), &[]);
+            woke = true;
         }
-        true
+        woke
     }
 
     /// The newest eight chat lines, oldest first, for a wake prompt.
@@ -796,13 +854,7 @@ impl Room {
     /// Dollars this room's runs of `agent` cost today (estimated for Codex).
     fn spent_today(&self, agent: &str) -> f64 {
         let today = &now()[..10];
-        self.chat.events()
-            .filter(|e| e.at.starts_with(today))
-            .filter_map(|e| match &e.body {
-                Body::RunFinished { agent: a, cost: Some(c), .. } if a == agent => Some(*c),
-                _ => None,
-            })
-            .sum()
+        self.spend.values().filter(|(day, a, _)| day == today && a == agent).map(|(_, _, c)| c).sum()
     }
 
     /// `agent`'s availability now: ok, low or out, with why and until when.
@@ -834,10 +886,10 @@ impl Room {
                     self.stops.insert(n.clone(), stop);
                     let u = self.usage(&n);
                     self.record("trio", Body::Status { text: clip(&format!("{n} hit a usage limit: {}", u.why()), 120) });
-                    if let Some(e) = trigger {
+                    if let Some((e, targets)) = trigger {
                         let recent = self.recent();
                         let detail = e.detail().map(str::to_string);
-                        self.dispatch(&n, &e, &recent, detail.as_deref(), &[]);
+                        self.dispatch(&n, &e, &recent, detail.as_deref(), &targets);
                     }
                     changed = true;
                     continue;
@@ -1464,6 +1516,59 @@ mod tests {
         assert!(ledger.contains("Claude is back"), "{ledger}");
         assert!(ledger.contains("\"summary\":\"Reviewed.\""), "{ledger}");
         assert_eq!(room.held_for("claude"), 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn held_wakes_go_out_one_at_a_time_and_survive_a_restart() {
+        let (root, mut room) = room_with("held-two", &[("claude", "Done.", 0)]);
+        room.tick();
+        room.stops.insert("claude".into(), crate::usage::Stop { until: crate::usage::epoch_now() + 3600, reason: "session limit".into() });
+        room.say(&room.me(), "@claude look at XF1", None).unwrap();
+        room.say(&room.me(), "@claude and XF2", None).unwrap();
+        room.tick();
+        assert_eq!(room.held_for("claude"), 2);
+        drop(room);
+        let mut room = Room::open(&root).unwrap();
+        assert_eq!(room.held_for("claude"), 2, "held wakes survive a restart");
+        room.tick();
+        assert_eq!(room.held_for("claude"), 1, "one run at a time");
+        settle(&mut room).await;
+        settle(&mut room).await;
+        assert_eq!(room.held_for("claude"), 0);
+        let ledger = std::fs::read_to_string(root.join(".trio").join("room.jsonl")).unwrap();
+        assert_eq!(ledger.matches("\"kind\":\"run_started\"").count(), 2, "both held messages woke Claude: {ledger}");
+        assert!(!ledger.contains("not woken"), "{ledger}");
+        assert!(!root.join(".trio/held.json").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_limit_retry_never_wakes_an_agent_twice_for_one_message() {
+        let (root, mut room) = room_with("retry", &[("claude", "You've hit your session limit - resets 3:45pm", 1), ("codex", "On it.", 0)]);
+        room.tick();
+        room.say(&room.me(), "@both look at XF1", None).unwrap();
+        room.tick();
+        settle(&mut room).await;
+        let ledger = std::fs::read_to_string(root.join(".trio").join("room.jsonl")).unwrap();
+        assert_eq!(ledger.matches("\"agent\":\"codex\",\"hop\"").count(), 1, "{ledger}");
+        assert!(ledger.contains("Codex already has this"), "{ledger}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn both_never_asks_the_author_to_review_its_own_work() {
+        let (root, mut room) = room_with("both-author", &[("claude", "x", 0), ("codex", "y", 0)]);
+        room.tick();
+        let branch = Event { id: "git:codex/x".into(), at: now(), from: "codex".into(), body: Body::Commit { branch: "codex/x".into(), sha: "abc12345".into(), subject: "XF1 work".into(), touches: vec![], merged: false, gone: false } };
+        append(&room.ledger, &branch).unwrap();
+        room.tick();
+        room.say(&room.me(), "@both please review XF1", None).unwrap();
+        room.tick();
+        let ledger = std::fs::read_to_string(root.join(".trio").join("room.jsonl")).unwrap();
+        assert!(ledger.contains("Codex wrote it, so @both asks only the other agent"), "{ledger}");
+        assert!(!ledger.contains("\"agent\":\"codex\",\"hop\""), "{ledger}");
+        assert!(ledger.contains("\"agent\":\"claude\",\"hop\""), "{ledger}");
         let _ = std::fs::remove_dir_all(root);
     }
 
