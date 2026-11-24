@@ -49,7 +49,11 @@ export interface Edge { from: string; to: string; kind: string }
 /** One component a branch changes since its merge-base: a path prefix and lines added + deleted. */
 export interface Touch { part: string; lines: number; files: number }
 
-export interface AgentState { enabled: boolean; running: boolean; hue: string; attached?: string | null }
+/** One agent of the room: `glyph` is the shape it is drawn with, `order` its place in room.toml. */
+export interface AgentState {
+  enabled: boolean; running: boolean; hue: string; attached?: string | null;
+  glyph?: string; harness?: string; model?: string | null; roles?: string[]; order?: number;
+}
 
 /** What changed since the human was last here (server `seen.rs`). */
 export interface Catchup {
@@ -129,7 +133,11 @@ export function useSnapshot(): Snapshot | null {
       timer.current = window.setTimeout(async () => {
         try {
           const r = await fetch('/api/state');
-          if (r.ok && alive) setSnap(await r.json());
+          if (r.ok && alive) {
+            const s: Snapshot = await r.json();
+            setRoster(s.agents ?? {});
+            setSnap(s);
+          }
         } catch { /* the stream reconnects and triggers another load */ }
       }, 120);
     };
@@ -211,15 +219,42 @@ export async function setPaused(token: string, paused: boolean) {
   await fetch('/api/pause', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token, paused }) });
 }
 
-const AGENTS: Record<string, string> = { claude: 'Claude', codex: 'Codex', trio: 'Trio', both: 'Both' };
+const NAMES: Record<string, string> = { claude: 'Claude', codex: 'Codex', trio: 'Trio', both: 'Both', all: 'All', github: 'GitHub' };
+
+/** The room's agents in room.toml order, their glyphs and roles: set from each snapshot. */
+let ROSTER: { name: string; glyph: string; roles: string[] }[] = [];
+
+export function setRoster(agents: Record<string, AgentState>) {
+  ROSTER = Object.entries(agents)
+    .filter(([, a]) => a.enabled || a.attached || a.order !== undefined && a.order < 1000)
+    .sort(([an, a], [bn, b]) => (a.order ?? 1000) - (b.order ?? 1000) || an.localeCompare(bn))
+    .map(([name, a]) => ({ name, glyph: a.glyph ?? name, roles: a.roles ?? [] }));
+}
+
+const capital = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 
 /** Display name; the room's human (`snap.me`) is always "You". */
 export function nameOf(who: string, me: string): string {
-  return who === me ? 'You' : AGENTS[who] ?? who;
+  return who === me ? 'You' : NAMES[who] ?? capital(who);
 }
 
-/** Lane order, used by the chat gutter, the island and the time strip: you, Claude, Codex. */
-export const lanes = (me: string) => [me, 'claude', 'codex'];
+/** The shape an agent is drawn with (Claude a circle, Codex a triangle, others by position). */
+export function glyphOf(who: string): string {
+  return ROSTER.find((r) => r.name === who)?.glyph ?? who;
+}
+
+/** The room's agent handles in order; Claude and Codex until a snapshot names the agents. */
+export function agentNames(): string[] {
+  return ROSTER.length > 0 ? ROSTER.map((r) => r.name) : ['claude', 'codex'];
+}
+
+/** Every role some agent holds, for `@<role>` mentions. */
+export function roleNames(): string[] {
+  return [...new Set(ROSTER.flatMap((r) => r.roles))];
+}
+
+/** Lane order, used by the chat gutter, the island and the time strip: you, then the agents. */
+export const lanes = (me: string) => [me, ...agentNames()];
 
 export function timeLabel(at: string): string {
   const [d, t] = at.split('T');

@@ -2,7 +2,7 @@
 // state by outline (open ○, claimed ◐, review ◇, changes ◆ accent, pass ✓, blocked ⊘ accent,
 // branch ⑂). One 10×10 box each, drawn the same in HTML and inside the map's SVG.
 import type { ReactNode } from 'react';
-import { STATE_LABEL } from './api';
+import { STATE_LABEL, glyphOf } from './api';
 
 function shape(kind: string, filled: boolean): ReactNode {
   const c = filled ? 'f' : 's';
@@ -11,14 +11,20 @@ function shape(kind: string, filled: boolean): ReactNode {
     case 'claude': return <circle className={c} cx={5} cy={5} r={4.2} />;
     case 'codex': return <path className={c} d="M5 0.8 L9.4 9 L0.6 9 Z" />;
     case 'trio': return <circle className="s" cx={5} cy={5} r={2.4} />;
-    case 'both': return <><circle className={c} cx={3.2} cy={5} r={2.6} /><path className={c} d="M7.2 2.2 L9.6 7.8 L4.8 7.8 Z" /></>;
+    case 'both': case 'all': return <><circle className={c} cx={3.2} cy={5} r={2.6} /><path className={c} d="M7.2 2.2 L9.6 7.8 L4.8 7.8 Z" /></>;
+    case 'hex': return <path className={c} d="M2.7 1 L7.3 1 L9.6 5 L7.3 9 L2.7 9 L0.4 5 Z" />;
+    case 'down': return <path className={c} d="M0.6 1 L9.4 1 L5 9.2 Z" />;
+    case 'pent': return <path className={c} d="M5 0.6 L9.4 3.8 L7.7 9.2 L2.3 9.2 L0.6 3.8 Z" />;
+    case 'plus': return <path className={c} d="M3.6 0.8 H6.4 V3.6 H9.2 V6.4 H6.4 V9.2 H3.6 V6.4 H0.8 V3.6 H3.6 Z" />;
+    case 'bar': return <rect className={c} x={0.8} y={3} width={8.4} height={4} rx={1} />;
+    case 'ring': return <><circle className="s" cx={5} cy={5} r={4.2} /><circle className={c} cx={5} cy={5} r={1.8} /></>;
     default: return <circle className={c} cx={5} cy={5} r={3} />;
   }
 }
 
 /** A participant's glyph: `me` is the room's human handle. Hollow when `to` (addressed, not sender). */
 export function Who({ who, me, to = false, title }: { who: string; me: string; to?: boolean; title?: string }) {
-  const kind = who === me ? 'me' : who;
+  const kind = who === me ? 'me' : glyphOf(who);
   return (
     <svg className="g" viewBox="0 0 10 10" aria-hidden={title ? undefined : true} role={title ? 'img' : undefined}>
       {title && <title>{title}</title>}

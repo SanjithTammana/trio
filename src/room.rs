@@ -1509,15 +1509,28 @@ impl Room {
             .join("|")
     }
 
+    /// Each agent for the clients: state, how to draw it (`glyph`: Claude a circle, Codex a
+    /// triangle, the rest by list position), what it runs on, its roles, and its list position.
     pub fn agent_states(&self) -> serde_json::Value {
         let mut m = serde_json::Map::new();
-        for (n, a) in &self.agents {
-            m.insert(n.clone(), serde_json::json!({ "enabled": a.cfg.enabled, "running": a.is_running(), "hue": crate::agent::Participant::hue(a) }));
+        let mut spare = crate::harness::GLYPHS.iter();
+        for (i, n) in self.order.iter().enumerate() {
+            let a = &self.agents[n.as_str()];
+            let glyph = match n.as_str() {
+                "claude" => "claude",
+                "codex" => "codex",
+                _ => spare.next().copied().unwrap_or("dot"),
+            };
+            let h = a.cfg.harness(n);
+            m.insert(n.clone(), serde_json::json!({
+                "enabled": a.cfg.enabled, "running": a.is_running(), "hue": crate::agent::Participant::hue(a),
+                "glyph": glyph, "harness": h.label, "model": a.cfg.model, "roles": a.cfg.roles(), "order": i,
+            }));
         }
         // Attached sessions show up whether or not a headless agent is configured.
         for n in ["claude", "codex"] {
             let attached = crate::hook::attached(&self.root, n).map(|a| a.surface);
-            let entry = m.entry(n.to_string()).or_insert_with(|| serde_json::json!({ "enabled": false, "running": false, "hue": "dusk" }));
+            let entry = m.entry(n.to_string()).or_insert_with(|| serde_json::json!({ "enabled": false, "running": false, "hue": "dusk", "glyph": n, "roles": crate::agent::DEFAULT_ROLES, "order": 1000 }));
             entry["attached"] = serde_json::json!(attached);
         }
         serde_json::Value::Object(m)

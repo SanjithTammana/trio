@@ -9,7 +9,7 @@
 // that captions every column, glyph and the strip in place.
 import { useEffect, useMemo, useState, type MouseEvent } from 'react';
 import { State, Who } from './glyph';
-import { components, hhmm, lanes, markSeen, nameOf, timeLabel, WORK_LANES, type Component, type GraphNode, type Snapshot, type WorkLane } from './api';
+import { agentNames, components, hhmm, lanes, markSeen, nameOf, timeLabel, WORK_LANES, type Component, type GraphNode, type Snapshot, type WorkLane } from './api';
 import { Segmented } from './astryx/Segmented';
 
 type Lens = 'work' | 'code' | 'time';
@@ -178,7 +178,7 @@ export function Graph({ snap, selected, onSelect }: { snap: Snapshot; selected: 
           </button>
         </div>
         <div className="key" aria-label="Legend">
-          <span><Who who={me} me={me} />you</span><span><Who who="claude" me={me} />Claude</span><span><Who who="codex" me={me} />Codex</span>
+          <span><Who who={me} me={me} />you</span>{agentNames().map((a) => <span key={a}><Who who={a} me={me} />{nameOf(a, me)}</span>)}
           {lens === 'code' && ['open', 'claimed', 'review', 'changes', 'pass'].map((s) => <span key={s}><State state={s} />{s}</span>)}
           {lens === 'code' && <span><State state="branch" />branch</span>}
           {lens === 'code' && <span><State state="component" hot />hot spot</span>}

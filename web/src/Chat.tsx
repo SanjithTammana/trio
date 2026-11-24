@@ -3,7 +3,7 @@
 // talking to whom reads down the page without colour. Click a line for its detail.
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent } from 'react';
 import { Who } from './glyph';
-import { lanes, nameOf, send, timeLabel, type Message, type Snapshot } from './api';
+import { agentNames, lanes, nameOf, roleNames, send, timeLabel, type Message, type Snapshot } from './api';
 
 const MAX = 140;
 
@@ -12,7 +12,7 @@ function Gutter({ from, to, me }: { from: string; to: string[]; me: string }) {
     <div className="gut" aria-hidden>
       {lanes(me).map((l) => {
         const sender = from === l;
-        const addressed = !sender && (to.includes(l) || (to.includes('both') && l !== me));
+        const addressed = !sender && (to.includes(l) || ((to.includes('both') || to.includes('all')) && l !== me));
         return <span key={l} className={addressed ? 'to' : ''}>{(sender || addressed) && <Who who={l} me={me} to={addressed} />}</span>;
       })}
     </div>
@@ -70,7 +70,7 @@ export function Chat({ snap, onOpen, composerRef }: {
           <div className="gut">
             {lanes(me).map((l) => <span key={l} title={nameOf(l, me)}><Who who={l} me={me} title={nameOf(l, me)} /></span>)}
           </div>
-          <span>{rows.length === 0 ? '' : `${nameOf(me, me)} · Claude · Codex`}</span>
+          <span>{rows.length === 0 ? '' : lanes(me).map((l) => nameOf(l, me)).join(' · ')}</span>
         </div>
         {rows.length === 0 && <p className="empty">Nothing yet. Say something, or type <code>trio</code> in a Claude Code or Codex session in this folder.</p>}
         {rows.map((m, i) => {
@@ -104,7 +104,7 @@ export function Chat({ snap, onOpen, composerRef }: {
       <div className="composer">
         <div className="composer-in">
           <div className="tools">
-            {['claude', 'codex', 'both'].map((w) => (
+            {[...agentNames(), ...roleNames(), 'all'].map((w) => (
               <button key={w} onClick={() => mention(w)} title={`Mention ${nameOf(w, me)}`}>@{w}</button>
             ))}
             <span className={`count ${draft.length > MAX ? 'over' : ''}`}>
