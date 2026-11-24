@@ -89,6 +89,8 @@ pub struct BranchFacts {
     pub count: usize,
     pub unmerged: usize,
     pub verdict: Option<Verdict>,
+    /// The newest review request on any of them (a pull request asks on its branch).
+    pub ask: Option<ReviewAsk>,
     pub merged: Option<Key>,
 }
 
@@ -429,6 +431,10 @@ impl Graph {
             if newest.map(Verdict::key) > facts.verdict.as_ref().map(Verdict::key) {
                 facts.verdict = newest.cloned();
             }
+            let ask = branch.latest_request();
+            if ask.map(ReviewAsk::key) > facts.ask.as_ref().map(ReviewAsk::key) {
+                facts.ask = ask.cloned();
+            }
         }
         self.items.get_mut(id).expect("linked item").branches = facts;
         self.dirty.push(id.into());
@@ -516,7 +522,8 @@ impl Graph {
             for id in old {
                 if let Some(it) = self.items.get_mut(&id) {
                     it.remove_ask(&e.id);
-                    self.dirty.push(id);
+                    self.dirty.push(id.clone());
+                    self.branch_changed(&id);
                 }
             }
         }
@@ -588,12 +595,15 @@ impl Deriver for ItemDeriver {
             of.push("both".into());
         }
         let seq = g.seq;
+        // A request on a branch is a request on the items it implements: refresh them after.
+        let mut asked: Vec<String> = if asks_review { items.clone() } else { Vec::new() };
         if let Some(old) = g.ask_targets.remove(&e.id) {
             let kept: HashSet<_> = if asks_review { items.iter().collect() } else { HashSet::new() };
             for id in old {
                 if !kept.contains(&id) && let Some(it) = g.items.get_mut(&id) {
                     it.remove_ask(&e.id);
-                    g.dirty.push(id);
+                    g.dirty.push(id.clone());
+                    asked.push(id);
                 }
             }
         }
@@ -631,6 +641,9 @@ impl Deriver for ItemDeriver {
             }
             g.step(id, e, summary.clone());
             g.edge(&e.from, id, "touched");
+        }
+        for id in asked {
+            g.branch_changed(&id);
         }
     }
 }

@@ -279,6 +279,9 @@ async fn open_room(State(app): State<Arc<App>>, headers: HeaderMap, Json(r): Jso
 #[derive(Deserialize)]
 struct SeenReq {
     token: String,
+    /// `catchup.upto` of the strip being dismissed.
+    #[serde(default)]
+    upto: Option<u64>,
 }
 
 /// "Dismiss" on the catch-up: move the seen mark to now.
@@ -288,9 +291,14 @@ async fn seen(State(app): State<Arc<App>>, headers: HeaderMap, Json(r): Json<See
     }
     let rev = {
         let mut room = app.room.lock().expect("room lock");
-        if let Err(e) = room.mark_seen() {
-            eprintln!("trio: could not save the seen mark: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "could not save the seen mark").into_response();
+        match room.mark_seen_upto(r.upto) {
+            Ok(true) => {}
+            // Something new arrived after the strip was drawn: keep the mark, show the newer strip.
+            Ok(false) => return StatusCode::CONFLICT.into_response(),
+            Err(e) => {
+                eprintln!("trio: could not save the seen mark: {e}");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "could not save the seen mark").into_response();
+            }
         }
         room.rev
     };
@@ -388,7 +396,7 @@ mod tests {
         let app = Arc::new(App { room: Mutex::new(room), token: "t".into(), hosts: vec!["localhost:8964".into()], tx, wake: tokio::sync::Notify::new(), room_id: "r".into(), snapshot: Mutex::new(None) });
         let mut headers = HeaderMap::new();
         headers.insert(header::ORIGIN, HeaderValue::from_static("http://localhost:8964"));
-        let response = seen(State(app.clone()), headers.clone(), Json(SeenReq { token: "t".into() })).await;
+        let response = seen(State(app.clone()), headers.clone(), Json(SeenReq { token: "t".into(), upto: None })).await;
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         {
             let room = app.room.lock().unwrap();
@@ -396,7 +404,7 @@ mod tests {
         }
         assert!(rx.try_recv().is_err());
         std::fs::remove_dir(blocked).unwrap();
-        let response = seen(State(app), headers, Json(SeenReq { token: "t".into() })).await;
+        let response = seen(State(app), headers, Json(SeenReq { token: "t".into(), upto: None })).await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert_eq!(rx.try_recv().unwrap(), rev + 1);
         let _ = std::fs::remove_dir_all(root);

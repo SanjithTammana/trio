@@ -22,11 +22,19 @@ pub struct Seen {
     pub position: u64,
     /// Work lane of every item at the mark.
     pub lanes: BTreeMap<String, String>,
-    /// How many events each source had given at the mark (`ledger`, `import:<file>`). Replay
-    /// numbers a source's events the same way every time, so after a restart the events past
-    /// these counts are the ones that came in while Trio was closed.
+    /// After a restart, what is new is decided per source: a ledger row is new when it starts
+    /// at or past this byte offset (the ledger is append-only, so offsets are arrival order)...
     #[serde(default)]
-    pub sources: BTreeMap<String, u64>,
+    pub ledger: Option<u64>,
+    /// ...and an imported post is new unless one with its id and the same content was there at
+    /// the mark (posts files are edited in place). Keys are `<file>|<event id>`.
+    #[serde(default)]
+    pub prints: BTreeMap<String, u64>,
+}
+
+/// A fingerprint of an event that is the same in every run and every build (FNV-1a).
+pub fn print(e: &crate::model::Event) -> u64 {
+    serde_json::to_vec(e).unwrap_or_default().iter().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
 }
 
 /// The saved mark, if any. A missing or unreadable file is no mark.
@@ -47,8 +55,8 @@ pub fn save(root: &Path, s: &Seen) -> std::io::Result<()> {
     std::fs::rename(tmp, p)
 }
 
-pub fn mark(at: &str, position: u64, work: &HashMap<String, Work>, sources: BTreeMap<String, u64>) -> Seen {
-    Seen { at: at.to_string(), position, lanes: work.iter().map(|(id, w)| (id.clone(), w.lane.to_string())).collect(), sources }
+pub fn mark(at: &str, position: u64, work: &HashMap<String, Work>, ledger: u64, prints: BTreeMap<String, u64>) -> Seen {
+    Seen { at: at.to_string(), position, lanes: work.iter().map(|(id, w)| (id.clone(), w.lane.to_string())).collect(), ledger: Some(ledger), prints }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -74,6 +82,9 @@ pub struct Catchup {
     pub verdicts: usize,
     pub messages: usize,
     pub partial: bool,
+    /// The room's arrival position this was built at. Dismiss sends it back, so a mark never
+    /// covers rows that arrived after the strip the human saw.
+    pub upto: u64,
 }
 
 /// What changed since `seen`, by others. None when nothing did. O(items + events).
@@ -105,7 +116,7 @@ pub fn catchup<'a>(seen: &Seen, g: &Graph, work: &HashMap<String, Work>, events:
         since: seen.at.clone(),
         more: moves.saturating_sub(MOVES_SHOWN),
         waiting_on_you: work.values().filter(|w| w.waiting_on.as_deref() == Some(me)).count(),
-        commits: 0, branches: 0, verdicts: 0, messages: 0, moved, partial,
+        commits: 0, branches: 0, verdicts: 0, messages: 0, moved, partial, upto: 0,
     };
     for (_, e) in events.filter(|(pos, e)| *pos > seen.position && e.from != me) {
         match &e.body {
@@ -172,7 +183,7 @@ mod tests {
         for (_, e) in &events {
             g.apply(e, &d);
         }
-        let seen = mark("2026-11-23T09:30", 1, &crate::work::all(&g, "sanjith"), Default::default());
+        let seen = mark("2026-11-23T09:30", 1, &crate::work::all(&g, "sanjith"), 0, Default::default());
         assert_eq!(catchup(&seen, &g, &crate::work::all(&g, "sanjith"), events.iter(), "sanjith", false), None, "nothing changed");
         // While away: Codex verdicts XF1 and a new item appears.
         let later = [
@@ -211,7 +222,7 @@ mod tests {
         let mut g = Graph::default();
         let at = "2026-11-23T09:00";
         g.apply(&ev("start", at, "claude", msg("XF1 needs work", &["XF1"])), &d);
-        let before = mark(at, 1, &crate::work::all(&g, "sanjith"), Default::default());
+        let before = mark(at, 1, &crate::work::all(&g, "sanjith"), 0, Default::default());
         let git = |id: &str, branch: &str, merged, gone| ev(id, at, "claude", Body::Commit {
             branch: branch.into(), sha: id.into(), subject: "work".into(), touches: vec![], merged, gone,
         });
@@ -262,7 +273,7 @@ mod tests {
     fn the_mark_round_trips_on_disk() {
         let dir = std::env::temp_dir().join(format!("trio-seen-{}", std::process::id()));
         std::fs::create_dir_all(dir.join(".trio")).unwrap();
-        let s = Seen { at: "2026-11-23T09:30".into(), position: 42, lanes: [("XF1".to_string(), "done".to_string())].into(), sources: [("ledger".to_string(), 7)].into() };
+        let s = Seen { at: "2026-11-23T09:30".into(), position: 42, lanes: [("XF1".to_string(), "done".to_string())].into(), ledger: Some(7), prints: [("a.md|p1".to_string(), 9)].into() };
         save(&dir, &s).unwrap();
         assert_eq!(serde_json::from_slice::<Seen>(&std::fs::read(path(&dir)).unwrap()).unwrap(), s);
         std::fs::remove_dir_all(dir).ok();

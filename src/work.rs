@@ -46,7 +46,7 @@ pub fn latest_verdict(it: &WorkItem) -> Option<&Verdict> {
 /// The same lane decision is used at ingest and when rendering Work.
 pub fn reading(it: &WorkItem) -> Reading<'_> {
     let verdict = latest_verdict(it);
-    let ask = it.latest_request().filter(|r| verdict.is_none_or(|v| r.key() > v.key()));
+    let ask = it.latest_request().into_iter().chain(it.branches.ask.as_ref()).max_by_key(|r| r.key()).filter(|r| verdict.is_none_or(|v| r.key() > v.key()));
     let has_branch = it.branches.count > 0 || !it.merged_gone.is_empty();
     let all_merged = has_branch && it.branches.unmerged == 0;
     let merged = it.branches.merged.iter().chain(it.merged_gone.iter().map(|m| &m.merged)).max();

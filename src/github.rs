@@ -111,22 +111,35 @@ impl Link {
         let opened = local(&pr.created_at).unwrap_or_else(crate::room::now);
         let title = format!("PR #{} \u{201c}{}\u{201d}", pr.number, pr.title);
         let reviewers: Vec<String> = pr.review_requests.iter().filter_map(|r| r.login.clone().map(|l| self.who(&l, None)).or_else(|| r.name.clone())).collect();
+        let open = pr.state == "OPEN";
+        let asks = open && !pr.is_draft;
+        // Only an open, non-draft PR asks for review. Any other state keeps the title out of the
+        // summary (a title saying "ready for review" must not ask) and names no branch: a closed
+        // PR's row must not recreate a branch deleted since.
         let summary = match (pr.state.as_str(), pr.is_draft) {
-            ("MERGED", _) => format!("{title} was merged"),
-            ("CLOSED", _) => format!("{title} was closed without merging"),
-            (_, true) => format!("{title} is a draft"),
+            ("MERGED", _) => format!("PR #{} was merged", pr.number),
+            ("CLOSED", _) => format!("PR #{} was closed without merging", pr.number),
+            (_, true) => format!("PR #{} is a draft", pr.number),
             _ if reviewers.is_empty() => format!("{title} is ready for review"),
             _ => format!("{title} is ready for review by {}", reviewers.join(", ")),
         };
+        let detail = if asks { pr.url.clone() } else { format!("\u{201c}{}\u{201d}\n{}", pr.title, pr.url) };
+        // Rows replay in time order, so a row that closes the PR is dated when it closed.
+        let at = match pr.state.as_str() {
+            "MERGED" => pr.merged_at.as_deref().and_then(local).or_else(|| local(&pr.updated_at)),
+            "CLOSED" => local(&pr.updated_at),
+            _ => None,
+        }
+        .unwrap_or_else(|| opened.clone());
         let mut out = vec![Event {
             id: id.clone(),
-            at: opened.clone(),
+            at,
             from: author.clone(),
             body: Body::Message {
                 summary,
-                detail: (!pr.url.is_empty()).then(|| pr.url.clone()),
-                mentions: if pr.state == "OPEN" && !pr.is_draft { pr.review_requests.iter().filter_map(|r| r.login.as_deref()).map(|l| self.who(l, None)).filter(|w| !["claude", "codex"].contains(&w.as_str())).collect() } else { Vec::new() },
-                items: vec![branch.clone()],
+                detail: (!detail.trim().is_empty()).then(|| detail.trim().to_string()),
+                mentions: if asks { pr.review_requests.iter().filter_map(|r| r.login.as_deref()).map(|l| self.who(l, None)).filter(|w| !["claude", "codex"].contains(&w.as_str())).collect() } else { Vec::new() },
+                items: if open { vec![branch.clone()] } else { Vec::new() },
             },
         }];
         for r in &pr.latest_reviews {

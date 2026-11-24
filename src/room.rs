@@ -157,9 +157,53 @@ struct GitSource {
     watch: crate::gitwatch::GitWatch,
 }
 
-/// Every repo a room watches, labelled when there is more than one: `repo` (or the work tree
-/// the room sits in), then `[[repos]]`. A repo listed twice is watched once.
-pub fn repos_of(cfg: &RoomCfg, root: &Path) -> Vec<(Option<String>, PathBuf, Option<String>)> {
+/// Branch names change shape when a room gains or loses repos: one repo's branches are bare
+/// (`claude/x`), several repos' carry their repo's label (`web:claude/x`). Rows recorded in the
+/// other shape are read in this one, so history joins the live watcher instead of leaving a twin.
+struct Relabel {
+    /// The label of the room's first repo, which bare names belong to.
+    main: String,
+    many: bool,
+}
+
+impl Relabel {
+    fn name(&self, b: &str) -> Option<String> {
+        if !b.contains('/') {
+            return None;
+        }
+        if self.many {
+            (!b.contains(':')).then(|| format!("{}:{b}", self.main))
+        } else {
+            b.strip_prefix(&format!("{}:", self.main)).filter(|r| !r.contains(':')).map(str::to_string)
+        }
+    }
+
+    fn fix(&self, b: &mut String) {
+        if let Some(n) = self.name(b) {
+            *b = n;
+        }
+    }
+
+    fn apply(&self, e: &mut Event) {
+        match &mut e.body {
+            Body::Commit { branch, .. } => {
+                if let Some(n) = self.name(branch) {
+                    if let Some(rest) = e.id.strip_prefix(&format!("git:{branch}:")) {
+                        e.id = format!("git:{n}:{rest}");
+                    }
+                    *branch = n;
+                }
+            }
+            Body::Message { items, .. } => items.iter_mut().for_each(|i| self.fix(i)),
+            Body::Verdict { item, .. } | Body::Claim { item } => self.fix(item),
+            _ => {}
+        }
+    }
+}
+
+/// Every repo a room watches, with its name: `repo` (or the work tree the room sits in), then
+/// `[[repos]]`. A repo listed twice is watched once; a name used twice gets a number.
+fn repos_named(cfg: &RoomCfg, root: &Path) -> Vec<(String, PathBuf, Option<String>)> {
     let first = match &cfg.repo {
         Some(r) if r.as_os_str().is_empty() => None,
         Some(r) => Some(root.join(r)),
@@ -172,8 +216,21 @@ pub fn repos_of(cfg: &RoomCfg, root: &Path) -> Vec<(Option<String>, PathBuf, Opt
             continue;
         }
         let name = if name.is_empty() { path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "repo".into()) } else { name };
-        all.push((name, path, base));
+        let name = name.replace(':', "-");
+        let mut unique = name.clone();
+        let mut n = 1;
+        while all.iter().any(|(u, _, _)| u.eq_ignore_ascii_case(&unique)) {
+            n += 1;
+            unique = format!("{name}-{n}");
+        }
+        all.push((unique, path, base));
     }
+    all
+}
+
+/// Every repo a room watches, labelled when there is more than one.
+pub fn repos_of(cfg: &RoomCfg, root: &Path) -> Vec<(Option<String>, PathBuf, Option<String>)> {
+    let all = repos_named(cfg, root);
     let many = all.len() > 1;
     all.into_iter().map(|(name, path, base)| (many.then_some(name), path, base)).collect()
 }
@@ -211,6 +268,10 @@ impl Window {
     }
 }
 
+/// An event read this tick: whether it came from the ledger, its stable position, and its byte
+/// offset when it came from the ledger.
+type Fresh = (Event, bool, u64, Option<u64>);
+
 pub struct Room {
     pub root: PathBuf,
     pub ledger: PathBuf,
@@ -240,6 +301,15 @@ pub struct Room {
     gh_rows: HashMap<String, Event>,
     /// Per source: how many ids it has yielded, for stable positions.
     counts: Vec<u64>,
+    /// Byte offset just past the last ledger row read, and a fingerprint of every imported
+    /// event: what a seen mark records (`seen.rs`).
+    ledger_read: u64,
+    prints: HashMap<String, u64>,
+    relabel: Option<Relabel>,
+    /// An imported file was edited in place: replay the room on this tick.
+    replay: bool,
+    /// Ledger rows before this offset were routed already (set by a replay).
+    route_from: u64,
     trio_exe: String,
     /// When the human was last here, for the catch-up (`seen.rs`).
     pub seen: Option<crate::seen::Seen>,
@@ -306,6 +376,8 @@ impl Room {
             })
             .collect();
         let trio_exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "trio".into());
+        let named = repos_named(&cfg, &root);
+        let relabel = named.first().map(|(main, _, _)| Relabel { main: main.clone(), many: named.len() > 1 });
         let git = repos_of(&cfg, &root)
             .into_iter()
             .filter(|_| watch)
@@ -339,6 +411,11 @@ impl Room {
             github,
             gh_rows: HashMap::new(),
             counts: Vec::new(),
+            ledger_read: 0,
+            prints: HashMap::new(),
+            relabel,
+            replay: false,
+            route_from: 0,
             trio_exe,
             seen: None,
             readings: HashMap::new(),
@@ -357,41 +434,51 @@ impl Room {
     pub fn catchup(&self, work: &HashMap<String, crate::work::Work>) -> Option<crate::seen::Catchup> {
         let seen = self.seen.as_ref()?;
         let partial = self.chat.dropped.max(self.git_events.dropped) > seen.position;
-        crate::seen::catchup(seen, &self.graph, work, self.activity(), &self.me(), partial)
+        let mut c = crate::seen::catchup(seen, &self.graph, work, self.activity(), &self.me(), partial)?;
+        c.upto = self.arrival;
+        Some(c)
     }
 
     /// Move the seen mark to now, with every item's current lane, and publish the change.
     pub fn mark_seen(&mut self) -> io::Result<()> {
+        self.mark_seen_upto(None).map(|_| ())
+    }
+
+    /// Move the seen mark to now, unless rows arrived after `upto` (the catch-up the human
+    /// dismissed): then nothing moves and the answer is false, so they see the newer strip.
+    pub fn mark_seen_upto(&mut self, upto: Option<u64>) -> io::Result<bool> {
+        if upto.is_some_and(|u| u < self.arrival) {
+            return Ok(false);
+        }
         let s = self.seen_now();
         crate::seen::save(&self.root, &s)?;
         self.seen = Some(s);
         self.rev += 1;
-        Ok(())
+        Ok(true)
     }
 
     fn seen_now(&self) -> crate::seen::Seen {
-        let sources = self.counts.iter().enumerate().filter(|(_, c)| **c > 0).map(|(i, c)| (self.source_key(i), *c)).collect();
-        crate::seen::mark(&now(), self.arrival, &crate::work::all(&self.graph, &self.me()), sources)
+        let prints = self.prints.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        crate::seen::mark(&now(), self.arrival, &crate::work::all(&self.graph, &self.me()), self.ledger_read, prints)
     }
 
-    /// A name for source `i` that survives reordering the imports in room.toml.
-    fn source_key(&self, i: usize) -> String {
-        match self.cfg.import.get(i) {
-            Some(imp) => format!("import:{}", imp.file),
-            None if i + 1 == self.sources.len() => "ledger".into(),
-            None => "git".into(),
-        }
+    fn print_key(&self, i: usize, e: &Event) -> Option<String> {
+        self.cfg.import.get(i).map(|imp| format!("{}|{}", imp.file, e.id))
     }
 
-    /// Whether the event at `pos` was already there at a saved mark. A mark from before
-    /// per-source counts falls back to its time.
-    fn before_mark(&self, mark: &crate::seen::Seen, e: &Event, pos: u64) -> bool {
-        if mark.sources.is_empty() {
-            return e.at <= mark.at;
+    /// Whether an event read at the first ingest was already there at a saved mark: a ledger row
+    /// by its byte offset, an imported post by its content. A mark without offsets (an older
+    /// Trio) falls back to its time.
+    fn before_mark(&self, mark: &crate::seen::Seen, e: &Event, pos: u64, offset: Option<u64>) -> bool {
+        let Some(read) = mark.ledger else { return e.at <= mark.at };
+        if let Some(o) = offset {
+            return o < read;
         }
         let i = ((pos >> 40) as usize).saturating_sub(1);
-        let n = pos & ((1u64 << 40) - 1);
-        n <= mark.sources.get(&self.source_key(i)).copied().unwrap_or(0)
+        match self.print_key(i, e) {
+            Some(k) => mark.prints.get(&k) == Some(&crate::seen::print(e)),
+            None => e.at <= mark.at,
+        }
     }
 
     /// The human's handle: `me` from room.toml when usable, else the OS user name.
@@ -411,6 +498,9 @@ impl Room {
     /// Returns true when anything changed. The first call loads history without waking anyone.
     pub fn tick(&mut self) -> bool {
         let mut changed = self.ingest();
+        if std::mem::take(&mut self.replay) {
+            changed |= self.replay();
+        }
         // A reaped reply was just appended to the ledger. Read and route it now: the loop may
         // sleep after this tick (no page, no live run), and a mention in it must still wake the
         // other agent. Bounded: each pass needs a run to finish, and there are two agents.
@@ -435,6 +525,34 @@ impl Room {
         changed
     }
 
+    /// Replay the whole room from its files, as a restart would, keeping what only this process
+    /// knows: running agents and their triggers, usage, the hop count, presence. Ledger rows
+    /// this process already read were routed then and are not routed again.
+    fn replay(&mut self) -> bool {
+        let mut fresh = match Room::open_with(&self.root, true) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("trio: could not replay the room: {e}");
+                return false;
+            }
+        };
+        std::mem::swap(&mut fresh.agents, &mut self.agents);
+        std::mem::swap(&mut fresh.started, &mut self.started);
+        std::mem::swap(&mut fresh.triggers, &mut self.triggers);
+        std::mem::swap(&mut fresh.stops, &mut self.stops);
+        std::mem::swap(&mut fresh.readings, &mut self.readings);
+        fresh.read_at = self.read_at;
+        fresh.hop = self.hop;
+        fresh.presence = std::mem::take(&mut self.presence);
+        fresh.restored = self.seen.take().or_else(|| self.restored.take());
+        fresh.route_from = self.ledger_read;
+        fresh.live = self.live;
+        fresh.ingest();
+        fresh.rev = self.rev + 1;
+        *self = fresh;
+        true
+    }
+
     /// Stable position for an event from source `i`: sources in
     /// config order, then each source's own order. Same-minute events from different sources
     /// therefore order the same way live and on replay; within a file, file order decides.
@@ -451,7 +569,7 @@ impl Room {
 
     /// Poll every source, apply new events and route new ledger messages.
     fn ingest(&mut self) -> bool {
-        let mut fresh: Vec<(Event, bool, u64)> = Vec::new();
+        let mut fresh: Vec<Fresh> = Vec::new();
         let n = self.sources.len();
         for i in 0..n {
             self.poll_source(i, &mut fresh);
@@ -462,11 +580,11 @@ impl Room {
             // arrives first and the rest after the new mark, so what came in while Trio was
             // closed is the catch-up. Without one, all history is the baseline.
             let restored = self.restored.take();
-            let (old, new): (Vec<_>, Vec<_>) = fresh.into_iter().partition(|(e, _, pos)| restored.as_ref().is_none_or(|m| self.before_mark(m, e, *pos)));
+            let (old, new): (Vec<_>, Vec<_>) = fresh.into_iter().partition(|(e, _, pos, off)| restored.as_ref().is_none_or(|m| self.before_mark(m, e, *pos, *off)));
             changed = self.apply_batch(old);
             let mut mark = self.seen_now();
             if let Some(m) = restored {
-                (mark.at, mark.lanes, mark.sources) = (m.at, m.lanes, m.sources);
+                (mark.at, mark.lanes) = (m.at, m.lanes);
             }
             self.seen = Some(mark);
             changed |= self.apply_batch(new);
@@ -516,7 +634,7 @@ impl Room {
         changed
     }
 
-    fn flush_git(&mut self, ledger_index: usize, fresh: &mut Vec<(Event, bool, u64)>) {
+    fn flush_git(&mut self, ledger_index: usize, fresh: &mut Vec<Fresh>) {
         let mut appended = std::collections::HashSet::new();
         while let Some(e) = self.pending_git.front() {
             if !self.graph.has_event(&e.id) && !appended.contains(&e.id) {
@@ -533,11 +651,11 @@ impl Room {
         }
     }
 
-    fn apply_batch(&mut self, mut fresh: Vec<(Event, bool, u64)>) -> bool {
+    fn apply_batch(&mut self, mut fresh: Vec<Fresh>) -> bool {
         let mut changed = false;
-        fresh.sort_by(|a, b| crate::gitwatch::replay_at(&a.0).cmp(crate::gitwatch::replay_at(&b.0)).then(a.2.cmp(&b.2)));
-        for (e, from_ledger, pos) in fresh {
-            let route = self.live && from_ledger && matches!(e.body, Body::Message { .. }) && !self.graph.has_event(&e.id);
+        fresh.sort_by(|a, b| crate::gitwatch::replay_at(&a.0).cmp(crate::gitwatch::replay_at(&b.0)).then(a.2.cmp(&b.2)).then(a.3.cmp(&b.3)));
+        for (e, from_ledger, pos, offset) in fresh {
+            let route = self.live && from_ledger && matches!(e.body, Body::Message { .. }) && !self.graph.has_event(&e.id) && offset.is_none_or(|o| o >= self.route_from);
             if route {
                 changed |= self.apply(e.clone(), pos);
                 self.route(&e);
@@ -548,12 +666,25 @@ impl Room {
         changed
     }
 
-    fn poll_source(&mut self, i: usize, fresh: &mut Vec<(Event, bool, u64)>) {
+    fn poll_source(&mut self, i: usize, fresh: &mut Vec<Fresh>) {
         let from_ledger = i == self.sources.len() - 1;
-        if let Ok(evs) = self.sources[i].poll() {
-            for e in evs {
+        let polled = self.sources[i].poll();
+        self.replay |= self.sources[i].rewritten();
+        if let Ok(evs) = polled {
+            let offsets = self.sources[i].offsets();
+            for (k, mut e) in evs.into_iter().enumerate() {
+                if let Some(r) = &self.relabel {
+                    r.apply(&mut e);
+                }
+                let offset = offsets.get(k).copied();
+                if let Some(o) = offset {
+                    self.ledger_read = self.ledger_read.max(o + 1);
+                }
+                if let Some(key) = self.print_key(i, &e) {
+                    self.prints.insert(key, crate::seen::print(&e));
+                }
                 let pos = self.position(i, &e.id);
-                fresh.push((e, from_ledger, pos));
+                fresh.push((e, from_ledger, pos, offset));
             }
         }
     }
@@ -1255,6 +1386,153 @@ mod tests {
         let mut cold = Room::open(&root).unwrap();
         cold.tick();
         assert_eq!(crate::work::all(&cold.graph, &cold.me())["feature/limit"].lane, "done", "replay agrees");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_import_continued_while_closed_is_the_catch_up() {
+        let root = temp_room("grow-away");
+        std::fs::write(root.join(".trio/room.toml"), "me = 'sanjith'\nrepo = ''\n[[import]]\nfile = 'claude-posts.md'\nfrom = 'claude'\n").unwrap();
+        let file = root.join("claude-posts.md");
+        std::fs::write(&file, "## 2026-11-23 09:00 XF1 started\nStatus: working on XF1\n").unwrap();
+        let mut room = Room::open(&root).unwrap();
+        room.tick();
+        room.mark_seen().unwrap();
+        drop(room);
+        // Trio is closed: the last post goes on past its status, and a second post follows.
+        std::fs::write(&file, "## 2026-11-23 09:00 XF1 started\nStatus: working on XF1\nverdict XF2: pass\n## 2026-11-23 09:30 XF1 ready for review\n").unwrap();
+        let mut back = Room::open(&root).unwrap();
+        back.tick();
+        let c = back.catchup(&crate::work::all(&back.graph, "sanjith")).expect("the continued post and the new one");
+        assert_eq!((c.messages, c.verdicts), (2, 1), "{c:?}");
+        assert!(!back.graph.now.contains_key("claude"), "the status is no longer the last line");
+        back.mark_seen().unwrap();
+        drop(back);
+        let mut again = Room::open(&root).unwrap();
+        again.tick();
+        assert!(again.catchup(&crate::work::all(&again.graph, "sanjith")).is_none(), "nothing new since the last mark");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rows_that_reuse_an_id_never_resurface_after_a_restart() {
+        let root = temp_room("reuse");
+        let ledger = root.join(".trio/room.jsonl");
+        let mut room = Room::open(&root).unwrap();
+        append(&ledger, &message("gh:o/r#1", "2026-11-23T09:00", "bo", "PR #1 is a draft")).unwrap();
+        room.tick();
+        append(&ledger, &message("gh:o/r#1", "2026-11-23T09:00", "bo", "PR #1 is ready for review")).unwrap();
+        append(&ledger, &message("", "2026-11-23T09:05", "codex", "XF3 noted")).unwrap();
+        room.tick();
+        room.mark_seen().unwrap();
+        drop(room);
+        let mut back = Room::open(&root).unwrap();
+        back.tick();
+        assert!(back.catchup(&crate::work::all(&back.graph, "sanjith")).is_none(), "nothing arrived while closed");
+        assert_eq!(back.chat.get("gh:o/r#1").map(|e| e.summary()), Some("PR #1 is ready for review".into()), "the newer row wins on replay");
+        drop(back);
+        append(&ledger, &message("", "2026-11-23T08:00", "codex", "XF4 written while you were out")).unwrap();
+        let mut again = Room::open(&root).unwrap();
+        again.tick();
+        let c = again.catchup(&crate::work::all(&again.graph, "sanjith")).expect("one row arrived");
+        assert_eq!(c.messages, 1, "{c:?}");
+        assert!(!again.mark_seen_upto(Some(c.upto - 1)).unwrap(), "a strip older than the room does not move the mark");
+        assert!(again.mark_seen_upto(Some(c.upto)).unwrap());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_import_edited_in_place_replays_to_the_cold_result() {
+        let root = temp_room("edit");
+        std::fs::write(root.join(".trio/room.toml"), "me = 'sanjith'\nrepo = ''\n[[import]]\nfile = 'claude-posts.md'\nfrom = 'claude'\n").unwrap();
+        let file = root.join("claude-posts.md");
+        std::fs::write(&file, "## 2026-11-23 09:00 XF1 please review\nStatus: waiting\n## 2026-11-23 09:10 XF2 started\n").unwrap();
+        let mut live = Room::open(&root).unwrap();
+        live.tick();
+        assert_eq!(crate::work::all(&live.graph, "sanjith")["XF1"].lane, "review");
+        // The same length, in the middle of the file.
+        std::fs::write(&file, "## 2026-11-23 09:00 XF1 all done here\nStatus: waiting\n## 2026-11-23 09:10 XF2 started\n").unwrap();
+        let later = std::time::SystemTime::now() + Duration::from_secs(5);
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(later).unwrap();
+        live.tick();
+        let mut cold = Room::open(&root).unwrap();
+        cold.tick();
+        for room in [&live, &cold] {
+            assert_eq!(crate::work::all(&room.graph, "sanjith")["XF1"].lane, "asked");
+        }
+        // The edited post is applied after the mark, so edges may be listed in another order.
+        let sorted = |r: &Room| {
+            let mut v = serde_json::to_value(&r.graph).unwrap();
+            v["edges"].as_array_mut().unwrap().sort_by_key(|e| e.to_string());
+            v
+        };
+        assert_eq!(sorted(&live), sorted(&cold));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn adding_a_repo_relabels_the_branches_already_recorded() {
+        let web = git_room("relabel-web");
+        let api = git_room("relabel-api");
+        let path = |p: &Path| toml::Value::String(p.display().to_string());
+        let ledger = web.join(".trio/room.jsonl");
+        append(&ledger, &commit("c1", "2026-11-23T09:00", "claude/topic", "abc12345", "Topic work", false, false)).unwrap();
+        append(&ledger, &Event { id: "v1".into(), at: "2026-11-23T09:10".into(), from: "codex".into(), body: Body::Verdict { item: "claude/topic".into(), outcome: "pass".into() } }).unwrap();
+        let mut one = Room::open_read(&web).unwrap();
+        one.tick();
+        assert!(one.graph.items.contains_key("claude/topic"));
+        std::fs::write(web.join(".trio/room.toml"), format!("me = 'sanjith'\nrepo = {}\nname = 'w'\n[[repos]]\npath = {}\nname = 'api'\n", path(&web), path(&api))).unwrap();
+        let main = repos_of(&toml::from_str(&std::fs::read_to_string(web.join(".trio/room.toml")).unwrap()).unwrap(), &web)[0].0.clone().unwrap();
+        let mut two = Room::open_read(&web).unwrap();
+        two.tick();
+        let ids: Vec<&String> = two.graph.items.keys().filter(|k| k.contains("topic")).collect();
+        assert_eq!(ids, [&format!("{main}:claude/topic")], "one node, under the main repo's label");
+        assert_eq!(crate::work::all(&two.graph, "sanjith")[&format!("{main}:claude/topic")].lane, "done", "its verdict came along");
+        // Two repos with the same name get distinct labels.
+        let same: RoomCfg = toml::from_str(&format!("repo = ''\n[[repos]]\npath = {}\nname = 'x'\n[[repos]]\npath = {}\nname = 'x'\n", path(&web), path(&api))).unwrap();
+        assert_eq!(repos_of(&same, &web).into_iter().map(|r| r.0.unwrap()).collect::<Vec<_>>(), ["x", "x-2"]);
+        for d in [web, api] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn a_pull_request_asks_for_its_items_and_a_closed_one_never_recreates_its_branch() {
+        use crate::github::{Link, Login, Pr};
+        let root = temp_room("pr-linked");
+        std::fs::write(root.join(".trio/room.toml"), "me = 'sanjith'\nrepo = ''\n").unwrap();
+        let link = Link { repo: "o/r".into(), label: None, remote_only: false, me: "sanjith".into(), my_login: None };
+        let mut pr = Pr {
+            number: 3, title: "Ready for review: the login".into(), head_ref_name: "claude/x".into(), head_ref_oid: "abc".into(),
+            state: "OPEN".into(), is_draft: false, created_at: "2026-11-23T15:00:00Z".into(), updated_at: "2026-11-23T15:00:00Z".into(),
+            merged_at: None, url: String::new(), author: Some(Login { login: "bo".into() }), review_requests: vec![], latest_reviews: vec![],
+        };
+        let mut room = Room::open(&root).unwrap();
+        append(&room.ledger, &commit("c1", "2026-11-23T08:00", "claude/x", "abc", "XF1 login", false, false)).unwrap();
+        let push = |room: &mut Room, pr: &Pr| {
+            for e in link.events(pr) {
+                if room.gh_rows.get(&e.id) != Some(&e) {
+                    append(&room.ledger, &e).unwrap();
+                }
+            }
+            room.tick();
+        };
+        push(&mut room, &pr);
+        assert_eq!(crate::work::all(&room.graph, "sanjith")["XF1"].lane, "review", "the pull request asks for review of what its branch implements");
+        pr.is_draft = true;
+        push(&mut room, &pr);
+        assert_ne!(crate::work::all(&room.graph, "sanjith")["XF1"].lane, "review", "a draft asks nothing, whatever its title says");
+        append(&room.ledger, &commit("c2", "2099-01-01T09:00", "claude/x", "abc", "", false, true)).unwrap();
+        room.tick();
+        pr.state = "CLOSED".into();
+        pr.updated_at = "2099-01-02T10:00:00Z".into();
+        push(&mut room, &pr);
+        let mut cold = Room::open(&root).unwrap();
+        cold.tick();
+        for r in [&room, &cold] {
+            assert!(!r.graph.items.contains_key("claude/x"), "a closed PR does not bring back a deleted branch");
+            assert_ne!(crate::work::all(&r.graph, "sanjith")["XF1"].lane, "review");
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 

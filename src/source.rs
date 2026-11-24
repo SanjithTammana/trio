@@ -12,6 +12,16 @@ pub trait Source {
     fn name(&self) -> &str;
     /// New or replaced events since the last poll.
     fn poll(&mut self) -> io::Result<Vec<Event>>;
+    /// For an append-only source: the byte offset of each event the last poll returned, in order.
+    /// Offsets say exactly what arrived after a given point, whatever ids the rows reuse.
+    fn offsets(&mut self) -> Vec<u64> {
+        Vec::new()
+    }
+    /// True once after the source found its file edited in place rather than appended to. Its
+    /// earlier events may no longer exist, so the room replays everything again.
+    fn rewritten(&mut self) -> bool {
+        false
+    }
 }
 
 #[derive(Default)]
@@ -19,6 +29,17 @@ pub struct Tail {
     offset: u64,
     /// Bytes after the last newline, held until the line completes.
     partial: Vec<u8>,
+    /// Modification time at the last read, and a fingerprint of every byte before `offset`,
+    /// for sources that are edited in place.
+    mtime: Option<std::time::SystemTime>,
+    fnv: u64,
+    edited: bool,
+}
+
+const FNV0: u64 = 0xcbf2_9ce4_8422_2325;
+
+fn fnv(h: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().fold(h, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
 }
 
 pub trait FileSource {
@@ -32,6 +53,25 @@ pub trait FileSource {
     fn flush(&mut self) -> Vec<Event> {
         Vec::new()
     }
+    /// True for files people edit in place (posts), not only append to. When such a file
+    /// changes, the bytes already read are checked: an append is tailed as usual, an edit
+    /// anywhere before the end (even one that keeps the length) is reported by `rewritten`.
+    fn rewrites(&self) -> bool {
+        false
+    }
+    /// See `Source::offsets`.
+    fn take_offsets(&mut self) -> Vec<u64> {
+        Vec::new()
+    }
+}
+
+/// Edited files are checked up to this size; past it they are only tailed.
+const REREAD_MAX: u64 = 4 << 20;
+
+/// Whether the first `n` bytes of the file still hash to `h`.
+fn same_prefix(path: &Path, n: u64, h: u64) -> bool {
+    let mut buf = Vec::with_capacity(n as usize);
+    File::open(path).and_then(|f| f.take(n).read_to_end(&mut buf)).is_ok_and(|got| got as u64 == n) && fnv(FNV0, &buf) == h
 }
 
 impl<T: FileSource> Source for T {
@@ -39,17 +79,33 @@ impl<T: FileSource> Source for T {
         self.path().file_name().and_then(|n| n.to_str()).unwrap_or("?")
     }
 
+    fn offsets(&mut self) -> Vec<u64> {
+        self.take_offsets()
+    }
+
+    fn rewritten(&mut self) -> bool {
+        std::mem::take(&mut self.tail().edited)
+    }
+
     fn poll(&mut self) -> io::Result<Vec<Event>> {
         let path = self.path().to_path_buf();
-        let len = match std::fs::metadata(&path) {
-            Ok(m) => m.len(),
+        let (len, mtime) = match std::fs::metadata(&path) {
+            Ok(m) => (m.len(), m.modified().ok()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e),
         };
+        let checked = self.rewrites() && self.tail().mtime.is_some() && mtime != self.tail().mtime && len <= REREAD_MAX;
+        if checked && (len < self.tail().offset || !same_prefix(&path, self.tail().offset, self.tail().fnv)) {
+            // Edited in place: what was read before may be gone. Report it; read nothing more.
+            self.tail().edited = true;
+            self.tail().mtime = mtime;
+            return Ok(Vec::new());
+        }
         if len < self.tail().offset {
             *self.tail() = Tail::default();
             self.reset();
         }
+        self.tail().mtime = mtime;
         if len == self.tail().offset {
             return Ok(Vec::new());
         }
@@ -59,6 +115,7 @@ impl<T: FileSource> Source for T {
         let mut buf = Vec::with_capacity((len - start) as usize);
         f.take(len - start).read_to_end(&mut buf)?;
         let tail = self.tail();
+        tail.fnv = fnv(if start == 0 { FNV0 } else { tail.fnv }, &buf);
         let base = start - tail.partial.len() as u64;
         let mut bytes = std::mem::take(&mut tail.partial);
         bytes.extend_from_slice(&buf);
@@ -77,17 +134,18 @@ impl<T: FileSource> Source for T {
 pub struct RoomLedger {
     path: PathBuf,
     tail: Tail,
+    offsets: Vec<u64>,
 }
 
 impl RoomLedger {
     pub fn new(path: PathBuf) -> Self {
-        Self { path, tail: Tail::default() }
+        Self { path, tail: Tail::default(), offsets: Vec::new() }
     }
 
     /// Start reading at byte `offset`. A line cut by a mid-line offset fails to parse and is
     /// skipped, so any offset is safe.
     pub fn at(path: PathBuf, offset: u64) -> Self {
-        Self { path, tail: Tail { offset, partial: Vec::new() } }
+        Self { path, tail: Tail { offset, ..Tail::default() }, offsets: Vec::new() }
     }
 
     /// Offset just past the last complete line read: where the next reader should start.
@@ -99,6 +157,9 @@ impl RoomLedger {
 impl FileSource for RoomLedger {
     fn path(&self) -> &Path {
         &self.path
+    }
+    fn take_offsets(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.offsets)
     }
     fn tail(&mut self) -> &mut Tail {
         &mut self.tail
@@ -114,6 +175,7 @@ impl FileSource for RoomLedger {
                         e.id = format!("l{off}");
                     }
                     out.push(e);
+                    self.offsets.push(off);
                 }
             }
             off += line.len() as u64;
@@ -241,6 +303,9 @@ pub fn line_facts(l: &str) -> Vec<(String, Body)> {
 impl FileSource for PostsFile {
     fn path(&self) -> &Path {
         &self.path
+    }
+    fn rewrites(&self) -> bool {
+        true
     }
     fn tail(&mut self) -> &mut Tail {
         &mut self.tail
