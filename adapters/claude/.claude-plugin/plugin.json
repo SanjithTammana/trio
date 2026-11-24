@@ -1,0 +1,16 @@
+{
+  "name": "trio",
+  "version": "0.2.0",
+  "description": "Join a Trio room from this session: type `trio` to attach; room lines arrive with each message and each reply posts to the room.",
+  "author": {
+    "name": "Sanjith Tammana"
+  },
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/SanjithTammana/trio",
+  "keywords": [
+    "chat",
+    "multi-agent",
+    "codex",
+    "hooks"
+  ]
+}

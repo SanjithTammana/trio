@@ -1,0 +1,14 @@
+{
+  "description": "Trio attached mode. Each hook runs the trio binary, which must be on PATH (trio setup puts it there). Unbound sessions cost one string check and one file stat.",
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "trio hook claude prompt", "timeout": 10 } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "trio hook claude stop", "timeout": 10 } ] }
+    ],
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "trio hook claude session-start", "timeout": 10 } ] }
+    ]
+  }
+}

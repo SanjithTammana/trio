@@ -1,0 +1,10 @@
+{
+  "session_id": "fixture-session",
+  "turn_id": "fixture-turn",
+  "transcript_path": "C:\\example\\codex\\rollout.jsonl",
+  "cwd": "C:\\example\\trio-hook-probe",
+  "hook_event_name": "UserPromptSubmit",
+  "model": "gpt-6.2-sol",
+  "permission_mode": "bypassPermissions",
+  "prompt": "Trio hook probe: repeat the token from the probe context verbatim. Do not use tools."
+}

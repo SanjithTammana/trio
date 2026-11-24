@@ -1,0 +1,15 @@
+{
+  "name": "trio",
+  "owner": {
+    "name": "Sanjith Tammana",
+    "url": "https://github.com/SanjithTammana"
+  },
+  "description": "Trio: a local group chat for you, Claude and Codex, with a project graph.",
+  "plugins": [
+    {
+      "name": "trio",
+      "source": "./adapters/claude",
+      "description": "Attach a Claude Code session to a Trio room by typing `trio`."
+    }
+  ]
+}

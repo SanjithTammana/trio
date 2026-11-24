@@ -1,0 +1,109 @@
+name: release
+
+# A tag v* builds trio, trio-start and trio-app (the native window) for Windows, macOS and Linux from a clean checkout, with
+# the UI built once and embedded in every binary. Archives and SHA256SUMS.txt are attached to a
+# draft GitHub release. No secrets beyond the run's own token.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Read-only by default; only the job that drafts the release can write.
+permissions:
+  contents: read
+
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - working-directory: web
+        run: |
+          npm ci
+          npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          if-no-files-found: error
+
+  build:
+    needs: web
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, archive: zip }
+          - { os: macos-latest, target: aarch64-apple-darwin, archive: tar.gz }
+          - { os: macos-latest, target: x86_64-apple-darwin, archive: tar.gz }
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, archive: tar.gz }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Window-system libraries for trio-app (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libwayland-dev
+      - name: Test (native targets only)
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: cargo test --locked --workspace --target ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --workspace --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME}"
+          [[ "$GITHUB_REF" == refs/tags/v* ]] || version="dev-${GITHUB_SHA::8}"
+          name="trio-${version}-${{ matrix.target }}"
+          ext=""; [[ "${{ matrix.target }}" == *windows* ]] && ext=".exe"
+          mkdir -p "dist/$name"
+          for bin in trio trio-start trio-app; do cp "target/${{ matrix.target }}/release/$bin$ext" "dist/$name/"; done
+          cp README.md LICENSE "dist/$name/"
+          cp -R adapters "dist/$name/adapters"
+          mkdir -p "dist/$name/docs" && cp docs/codex.md "dist/$name/docs/"
+          cd dist
+          if [[ "${{ matrix.archive }}" == zip ]]; then 7z a -tzip "$name.zip" "$name" > /dev/null; else tar -czf "$name.tar.gz" "$name"; fi
+          rm -rf "$name"
+          ls -l
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trio-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: trio-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trio-release
+          path: dist/*
+      - name: Draft the GitHub release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --draft --title "$GITHUB_REF_NAME" --notes "Unsigned builds. Verify with SHA256SUMS.txt; install with trio setup (see README)."

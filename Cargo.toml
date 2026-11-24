@@ -1,0 +1,28 @@
+[package]
+name = "trio"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.89"
+description = "A local group chat for you, Claude and Codex, plus a project graph"
+license = "Apache-2.0"
+repository = "https://github.com/SanjithTammana/trio"
+
+[workspace]
+members = [".", "app"]
+
+[dependencies]
+axum = "0.7"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+futures-util = { version = "0.3.34", default-features = false }
+mime_guess = "2.0.5"
+rust-embed = "8.14.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["rt", "macros", "net", "time", "sync", "fs", "process", "io-util"] }
+tokio-stream = { version = "0.1.19", features = ["sync"] }
+toml = "1.2.2"
+toml_edit = "0.25.20"
+
+# A Windows Job Object owns each agent run's whole process tree (see src/proctree.rs).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading"] }

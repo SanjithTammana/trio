@@ -1,0 +1,226 @@
+// Routing map: items | branches | components, with routed wires between neighbouring columns
+// and a time strip underneath. Items link to the branches that implement them; branches link to
+// the parts of the codebase they change since their merge-base. A component two or more open
+// branches change is a hot spot (likely conflict) and carries the one accent colour.
+// Layout is O(V + E): fixed row height, one barycentre pass per column, no force simulation.
+import { useMemo, useState, type MouseEvent } from 'react';
+import { State, Who } from './glyph';
+import { components, lanes, nameOf, timeLabel, type Component, type GraphNode, type Snapshot } from './api';
+
+const ROW = 30;
+const GAP = 56; // gutter width, matches .cols grid
+const ACTIVE_HOURS = 36;
+const MAX_COMPONENTS = 28;
+const PRIORITY = ['changes', 'blocked', 'review', 'claimed', 'open', 'pass'];
+
+export type Pick = { kind: 'item' | 'branch'; id: string } | { kind: 'component'; id: string };
+
+function ms(at: string): number {
+  const t = Date.parse(at);
+  return Number.isNaN(t) ? 0 : t;
+}
+
+const bary = (idx: number[]) => (idx.length ? idx.reduce((a, b) => a + b, 0) / idx.length : Infinity);
+
+function wire(y1: number, y2: number) {
+  const m = GAP / 2;
+  return `M0,${y1} C${m},${y1} ${m},${y2} ${GAP},${y2}`;
+}
+
+export function Graph({ snap, selected, onSelect }: { snap: Snapshot; selected: string | null; onSelect: (p: Pick, el: Element, pointer: boolean) => void }) {
+  const [scope, setScope] = useState<'active' | 'all'>('active');
+  const [hover, setHover] = useState<string | null>(null);
+  const me = snap.me;
+  const touches = useMemo(() => snap.graph.touches ?? {}, [snap.graph.touches]);
+  const merged = useMemo(() => new Set(snap.graph.merged ?? []), [snap.graph.merged]);
+
+  const model = useMemo(() => {
+    const all = snap.graph.items;
+    const implemented = new Map<string, string[]>(); // item -> branches
+    const implementsOf = new Map<string, string[]>(); // branch -> items
+    for (const e of snap.graph.edges) {
+      if (e.kind !== 'implements') continue;
+      implemented.set(e.to, [...(implemented.get(e.to) ?? []), e.from]);
+      implementsOf.set(e.from, [...(implementsOf.get(e.from) ?? []), e.to]);
+    }
+    const newest = all.reduce((m, n) => Math.max(m, ms(n.last)), 0);
+    const cutoff = newest - ACTIVE_HOURS * 3600_000;
+
+    const branches = all
+      .filter((n) => n.kind === 'branch' && (scope === 'all' || !merged.has(n.id)))
+      .sort((a, b) => b.last.localeCompare(a.last));
+    const bIndex = new Map(branches.map((b, i) => [b.id, i]));
+
+    const items = all.filter((n) => {
+      if (n.kind !== 'item') return false;
+      if (scope === 'all') return true;
+      if ((implemented.get(n.id) ?? []).some((b) => bIndex.has(b))) return true;
+      return ms(n.last) >= cutoff && n.state !== 'pass' && (n.touches > 1 || n.state !== 'open');
+    });
+    // Each item's barycentre once, not inside the comparator (O(n) instead of O(n log n) recomputes).
+    const ibOf = new Map(items.map((n) => [n.id, bary((implemented.get(n.id) ?? []).flatMap((b) => (bIndex.has(b) ? [bIndex.get(b)!] : [])))]));
+    const ib = (n: GraphNode) => ibOf.get(n.id)!;
+    items.sort((a, b) => {
+      const d = ib(a) - ib(b);
+      if (d && Number.isFinite(d)) return d;
+      if (Number.isFinite(ib(a)) !== Number.isFinite(ib(b))) return Number.isFinite(ib(a)) ? -1 : 1;
+      const p = PRIORITY.indexOf(a.state) - PRIORITY.indexOf(b.state);
+      return p || b.last.localeCompare(a.last);
+    });
+
+    const comps = [...components(touches, branches.filter((b) => !merged.has(b.id)).map((b) => b.id)).values()];
+    const cb = (c: Component) => {
+      const w = c.branches.reduce((a, b) => a + b.lines, 0) || 1;
+      return c.branches.reduce((a, b) => a + (bIndex.get(b.branch) ?? 0) * b.lines, 0) / w;
+    };
+    const shown = comps.sort((a, b) => Number(b.hot) - Number(a.hot) || b.lines - a.lines).slice(0, MAX_COMPONENTS).sort((a, b) => cb(a) - cb(b));
+    return { items, branches, comps: shown, implemented, implementsOf, hot: comps.filter((c) => c.hot).length, hiddenComps: comps.length - shown.length };
+  }, [snap.graph.items, snap.graph.edges, touches, merged, scope]);
+
+  const { items, branches, comps, implemented, implementsOf } = model;
+  const iy = new Map(items.map((n, i) => [n.id, i * ROW + ROW / 2]));
+  const by = new Map(branches.map((n, i) => [n.id, i * ROW + ROW / 2]));
+  const cy = new Map(comps.map((c, i) => [c.part, i * ROW + ROW / 2]));
+  const left = [...implementsOf].flatMap(([b, its]) => its.filter((i) => iy.has(i) && by.has(b)).map((i) => ({ b, i })));
+  const right = comps.flatMap((c) => c.branches.filter((x) => by.has(x.branch)).map((x) => ({ b: x.branch, c: c.part, lines: x.lines, hot: c.hot })));
+
+  // What lights up around the hovered or selected node: one hop each way, two for items.
+  const focus = hover ?? selected;
+  const lit = useMemo(() => {
+    const s = new Set<string>();
+    if (!focus) return s;
+    const addBranch = (b: string, withItems: boolean) => {
+      s.add(`b:${b}`);
+      for (const t of touches[b] ?? []) s.add(`c:${t.part}`);
+      if (withItems) for (const i of implementsOf.get(b) ?? []) s.add(`i:${i}`);
+    };
+    const id = focus.slice(2);
+    if (focus.startsWith('c:')) {
+      s.add(focus);
+      for (const x of comps.find((c) => c.part === id)?.branches ?? []) {
+        s.add(`b:${x.branch}`);
+        for (const i of implementsOf.get(x.branch) ?? []) s.add(`i:${i}`);
+      }
+    } else if (focus.startsWith('b:')) {
+      addBranch(id, true);
+    } else {
+      s.add(focus);
+      for (const b of implemented.get(id) ?? []) addBranch(b, false);
+    }
+    return s;
+  }, [focus, touches, implementsOf, implemented, comps]);
+
+  const height = Math.max(items.length, branches.length, comps.length, 1) * ROW;
+  const pick = (p: Pick) => (e: MouseEvent<HTMLButtonElement>) => onSelect(p, e.currentTarget, e.detail > 0);
+  const hoverProps = (key: string) => ({ onMouseEnter: () => setHover(key), onMouseLeave: () => setHover(null), onFocus: () => setHover(key), onBlur: () => setHover(null) });
+  const cls = (key: string, extra = '') => `node ${lit.has(key) ? 'lit' : ''} ${selected === key ? 'on' : ''} ${extra}`;
+  const total = (b: string) => (touches[b] ?? []).reduce((a, t) => a + t.lines, 0);
+  const empty = items.length + branches.length === 0;
+
+  return (
+    <div className="map">
+      <div className="map-bar">
+        <div className="scope" role="tablist" aria-label="Scope">
+          {(['active', 'all'] as const).map((s) => (
+            <button key={s} role="tab" aria-selected={scope === s} onClick={() => setScope(s)}>
+              {s === 'active' ? 'In flight' : 'Everything'}
+            </button>
+          ))}
+        </div>
+        <div className="key" aria-label="Legend">
+          {['open', 'claimed', 'review', 'changes', 'pass'].map((s) => <span key={s}><State state={s} />{s === 'changes' ? 'changes' : s}</span>)}
+          <span><State state="branch" />branch</span>
+          <span><State state="component" hot />hot spot</span>
+        </div>
+      </div>
+
+      <div className="map-scroll">
+        {empty ? (
+          <p className="empty">No work in flight. Items appear when a message names one (P0a, XF29); branches when <code>repo</code> is set in room.toml.</p>
+        ) : (
+          <div className={`cols ${focus ? 'dim' : ''}`}>
+            <div className="col-h">Items<span className="n">{items.length}</span></div>
+            <div className="col-h" />
+            <div className="col-h">Branches<span className="n">{branches.length}</span></div>
+            <div className="col-h" />
+            <div className="col-h">Components<span className="n">{comps.length}{model.hiddenComps > 0 ? `+${model.hiddenComps}` : ''}</span>{model.hot > 0 && <span className="hot-count">{model.hot} hot</span>}</div>
+
+            <div className="col">
+              {items.map((n) => (
+                <button key={n.id} className={cls(`i:${n.id}`)} data-morph={`i:${n.id}`} onClick={pick({ kind: 'item', id: n.id })} {...hoverProps(`i:${n.id}`)} title={n.summary}>
+                  <State state={n.state} />
+                  <span className="id">{n.id}<small>{n.summary}</small></span>
+                  <span className="aux"><Who who={n.lane} me={me} title={nameOf(n.lane, me)} /></span>
+                </button>
+              ))}
+            </div>
+            <svg className="wires" width={GAP} height={height} aria-hidden>
+              {left.map(({ b, i }) => (
+                <path key={`${b}>${i}`} d={wire(iy.get(i)!, by.get(b)!)} className={`wire ${lit.has(`i:${i}`) && lit.has(`b:${b}`) ? 'lit' : ''}`} strokeWidth={1.2} />
+              ))}
+            </svg>
+            <div className="col">
+              {branches.map((n) => {
+                const isMerged = merged.has(n.id);
+                return (
+                  <button key={n.id} className={cls(`b:${n.id}`, isMerged ? 'merged' : '')} data-morph={`b:${n.id}`} onClick={pick({ kind: 'branch', id: n.id })} {...hoverProps(`b:${n.id}`)} title={n.summary}>
+                    <State state={isMerged ? 'merged' : n.state} />
+                    <span className="id">{n.id}</span>
+                    <span className="aux">{total(n.id) > 0 && <span>{total(n.id)}</span>}<Who who={n.lane} me={me} title={nameOf(n.lane, me)} /></span>
+                  </button>
+                );
+              })}
+            </div>
+            <svg className="wires" width={GAP} height={height} aria-hidden>
+              {right.map(({ b, c, lines, hot }) => (
+                <path key={`${b}>${c}`} d={wire(by.get(b)!, cy.get(c)!)} className={`wire ${hot ? 'hot' : ''} ${lit.has(`b:${b}`) && lit.has(`c:${c}`) ? 'lit' : ''}`} strokeWidth={1 + Math.min(2.5, Math.log10(lines + 1))} />
+              ))}
+            </svg>
+            <div className="col">
+              {comps.map((c) => (
+                <button key={c.part} className={cls(`c:${c.part}`, c.hot ? 'hot' : '')} data-morph={`c:${c.part}`} onClick={pick({ kind: 'component', id: c.part })} {...hoverProps(`c:${c.part}`)} title={`${c.files} files, ${c.lines} lines, ${c.branches.length} branch${c.branches.length > 1 ? 'es' : ''}`}>
+                  <State state="component" hot={c.hot} />
+                  <span className="id">{c.part}</span>
+                  <span className="aux">{c.hot && <span>×{c.branches.length}</span>}<span>{c.lines}</span></span>
+                </button>
+              ))}
+              {comps.length === 0 && branches.length > 0 && <p className="muted" style={{ fontSize: 12.5 }}>Set <code>repo</code> in room.toml to see what each branch changes.</p>}
+            </div>
+          </div>
+        )}
+      </div>
+
+      <TimeStrip snap={snap} nodes={[...items, ...branches]} lit={lit} />
+    </div>
+  );
+}
+
+/** Every recorded step of the visible work, one row per participant, on a shared time axis.
+ * The hovered or selected node's steps stand out, so you can see when its work happened. */
+function TimeStrip({ snap, nodes, lit }: { snap: Snapshot; nodes: GraphNode[]; lit: Set<string> }) {
+  const me = snap.me;
+  const rows = lanes(me);
+  const ticks = nodes.flatMap((n) => n.steps.map((s) => ({ t: ms(s.at), row: Math.max(0, rows.indexOf(s.who)), on: lit.has(`i:${n.id}`) || lit.has(`b:${n.id}`), key: `${n.id}-${s.event}` })));
+  const ts = ticks.map((x) => x.t).filter(Boolean);
+  if (ts.length < 2) return null;
+  const lo = Math.min(...ts), hi = Math.max(...ts);
+  const W = 1000, H = rows.length * 14;
+  const x = (t: number) => (hi === lo ? W / 2 : ((t - lo) / (hi - lo)) * W);
+  const iso = (t: number) => new Date(t - new Date(t).getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
+  return (
+    <div className="strip" aria-label="Activity over time">
+      <div className="lbls">{rows.map((r) => <span key={r}><Who who={r} me={me} />{nameOf(r, me)}</span>)}</div>
+      <div>
+        <svg className="plot" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" height={H} aria-hidden>
+          {rows.map((_, i) => <line key={i} x1={0} x2={W} y1={i * 14 + 7} y2={i * 14 + 7} className="rule" vectorEffect="non-scaling-stroke" />)}
+          {ticks.filter((k) => k.t).sort((a, b) => Number(a.on) - Number(b.on)).map((k) => (
+            <line key={k.key} x1={x(k.t)} x2={x(k.t)} y1={k.row * 14 + 2} y2={k.row * 14 + 12} className={`tick ${k.on ? 'lit' : ''}`} vectorEffect="non-scaling-stroke" />
+          ))}
+        </svg>
+        <div style={{ display: 'flex', justifyContent: 'space-between' }} className="axis mono muted">
+          <small>{timeLabel(iso(lo))}</small><small>{timeLabel(iso(hi))}</small>
+        </div>
+      </div>
+    </div>
+  );
+}

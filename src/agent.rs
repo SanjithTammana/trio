@@ -1,0 +1,391 @@
+//! Participants and agents.
+//!
+//!   Entity <- Participant <- Agent
+//! `Agent::wake_if_allowed` is the inherited template method: it runs every guard in order and
+//! only then calls the implementor's `spawn`. Delivery itself is a `Waker` (strategy), so a new
+//! harness route (Claude channels, Codex app-server, a plain command) is one more impl.
+
+use crate::model::Entity;
+use futures_util::FutureExt;
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::{Duration, Instant, SystemTime};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// Bytes of a reply kept from stdout; the rest is drained and dropped so the child never blocks.
+const OUT_CAP: u64 = 64 * 1024;
+
+pub trait Participant: Entity {
+    fn handle(&self) -> &str;
+    /// Identity colour token name the UI maps to its palette.
+    fn hue(&self) -> &'static str;
+}
+
+#[allow(dead_code)] // the human participant; used once Trio lists members
+pub struct Human {
+    pub name: String,
+}
+impl Entity for Human {
+    fn id(&self) -> &str {
+        &self.name
+    }
+    fn kind(&self) -> &'static str {
+        "human"
+    }
+}
+impl Participant for Human {
+    fn handle(&self) -> &str {
+        &self.name
+    }
+    fn hue(&self) -> &'static str {
+        "ink"
+    }
+}
+
+/// Why a wake did or did not happen; recorded so the chat can show it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WakeDecision {
+    Started,
+    Disabled,
+    Paused,
+    Busy,
+    Running,
+    OverBudget { hop: u32, budget: u32 },
+    Failed(String),
+}
+
+pub struct Guard {
+    pub paused: bool,
+    pub hop: u32,
+    pub budget: u32,
+    pub from_human: bool,
+}
+
+pub trait Agent: Participant {
+    fn binding(&self) -> &AgentConfig;
+    fn mirror(&self) -> &dyn Mirror;
+    fn is_running(&self) -> bool;
+    /// Start the run. Implementors only deliver; guards live in `wake_if_allowed`.
+    fn spawn(&mut self, prompt: &str) -> Result<(), String>;
+
+    /// Inherited guard sequence: enabled -> paused -> budget -> running -> mirror busy -> spawn.
+    fn wake_if_allowed(&mut self, prompt: &str, g: &Guard) -> WakeDecision {
+        if !self.binding().enabled {
+            return WakeDecision::Disabled;
+        }
+        if g.paused {
+            return WakeDecision::Paused;
+        }
+        if !g.from_human && g.hop > g.budget {
+            return WakeDecision::OverBudget { hop: g.hop, budget: g.budget };
+        }
+        if self.is_running() {
+            return WakeDecision::Running;
+        }
+        if self.mirror().busy() {
+            return WakeDecision::Busy;
+        }
+        match self.spawn(prompt) {
+            Ok(()) => WakeDecision::Started,
+            Err(e) => WakeDecision::Failed(e),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct AgentConfig {
+    /// Off until you turn it on for a room.
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub session: String,
+    /// argv template. `{session}` and `{out}` (a reply file in `cwd`) are substituted. Without a
+    /// `{prompt}` argument the prompt goes in on stdin, so chat text is never parsed as argv.
+    /// `@codex` as the program resolves the installed Codex CLI (see `resolve_bin`).
+    #[serde(default)]
+    pub wake: Vec<String>,
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
+    /// The session file the desktop app shows, used to tell whether it is mid-turn.
+    #[serde(default)]
+    pub transcript: Option<PathBuf>,
+}
+
+// ---- Mirror: is the bound session busy? ----------------------------------------------------
+
+pub trait Mirror {
+    fn transcript(&self) -> Option<&PathBuf>;
+    /// Unknown reads as busy, never as idle.
+    fn busy(&self) -> bool {
+        let Some(p) = self.transcript() else { return false };
+        match std::fs::metadata(p).and_then(|m| m.modified()) {
+            Ok(t) => SystemTime::now().duration_since(t).map(|d| d < Duration::from_secs(20)).unwrap_or(true),
+            Err(_) => true,
+        }
+    }
+}
+
+pub struct FileMirror(pub Option<PathBuf>);
+impl Mirror for FileMirror {
+    fn transcript(&self) -> Option<&PathBuf> {
+        self.0.as_ref()
+    }
+}
+
+// ---- One concrete agent; the harness difference is data (the wake template) ---------------
+
+struct Run {
+    child: tokio::process::Child,
+    /// The run's whole process tree; dropping the run kills whatever is still in it.
+    tree: crate::proctree::Tree,
+    /// Captured stdout and whether it ended within `OUT_CAP` (false: truncated).
+    out: tokio::task::JoinHandle<(String, bool)>,
+    file: Option<PathBuf>,
+    exit: Option<(i32, Instant)>,
+}
+
+/// A finished run. `reply` is set only for a successful, complete answer; anything else is a
+/// `problem`, which the room shows as a status line and never posts as the agent.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Reaped {
+    pub exit: i32,
+    pub reply: Option<String>,
+    pub problem: Option<String>,
+}
+
+impl Reaped {
+    fn judge(exit: i32, reply: Option<(String, bool)>) -> Self {
+        let (reply, problem) = match reply {
+            _ if exit != 0 => (None, Some(format!("run failed (exit {exit}); output not posted"))),
+            Some((_, false)) => (None, Some(format!("reply over {} KB; not posted", OUT_CAP / 1024))),
+            Some((t, true)) if !t.trim().is_empty() => (Some(t), None),
+            _ => (None, Some("finished without a reply".into())),
+        };
+        Self { exit, reply, problem }
+    }
+}
+
+/// Read at most `OUT_CAP` bytes of `f`; the bool says the whole file fit. Removes the file.
+fn read_reply_file(f: &Path) -> Option<(String, bool)> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    let read = std::fs::File::open(f).and_then(|h| h.take(OUT_CAP + 1).read_to_end(&mut buf));
+    let _ = std::fs::remove_file(f);
+    read.ok()?;
+    let complete = buf.len() as u64 <= OUT_CAP;
+    buf.truncate(OUT_CAP as usize);
+    Some((String::from_utf8_lossy(&buf).into_owned(), complete)).filter(|(t, _)| !t.trim().is_empty())
+}
+
+pub struct CliAgent {
+    pub name: String,
+    pub hue: &'static str,
+    pub cfg: AgentConfig,
+    mirror: FileMirror,
+    run: Option<Run>,
+}
+
+impl CliAgent {
+    pub fn new(name: &str, hue: &'static str, cfg: AgentConfig) -> Self {
+        let mirror = FileMirror(cfg.transcript.clone());
+        Self { name: name.to_string(), hue, cfg, mirror, run: None }
+    }
+
+    /// Reap a finished run once. The reply is the run's own `{out}` file when the template has
+    /// one and it is non-empty, else captured stdout; both are capped at `OUT_CAP`.
+    pub fn reap(&mut self) -> Option<Reaped> {
+        let run = self.run.as_mut()?;
+        if run.exit.is_none() {
+            let code = match run.child.try_wait() {
+                Ok(Some(st)) => st.code().unwrap_or(-1),
+                Ok(None) => return None,
+                Err(_) => -1,
+            };
+            run.exit = Some((code, Instant::now()));
+        }
+        let (code, at) = run.exit?;
+        // A grandchild can hold the pipe open after exit; give the reader 5 s, then kill the
+        // tree (which closes the pipe) rather than leave the grandchild running unowned.
+        if !run.out.is_finished() && at.elapsed() < Duration::from_secs(5) {
+            return None;
+        }
+        let mut run = self.run.take()?;
+        run.tree.kill(); // anything the run started and left behind
+        let stdout = if run.out.is_finished() {
+            run.out.now_or_never().and_then(|r| r.ok())
+        } else {
+            run.out.abort();
+            None // the reader never finished: whatever it holds is incomplete
+        };
+        let reply = run.file.as_deref().and_then(read_reply_file).or(stdout);
+        Some(Reaped::judge(code, reply))
+    }
+
+    /// Kill the run and everything it started (the CLI's own children included).
+    pub fn kill(&mut self) {
+        let Some(r) = self.run.as_mut() else { return };
+        r.tree.kill();
+        let _ = r.child.start_kill();
+    }
+}
+
+impl Entity for CliAgent {
+    fn id(&self) -> &str {
+        &self.name
+    }
+    fn kind(&self) -> &'static str {
+        "agent"
+    }
+}
+impl Participant for CliAgent {
+    fn handle(&self) -> &str {
+        &self.name
+    }
+    fn hue(&self) -> &'static str {
+        self.hue
+    }
+}
+impl Agent for CliAgent {
+    fn binding(&self) -> &AgentConfig {
+        &self.cfg
+    }
+    fn mirror(&self) -> &dyn Mirror {
+        &self.mirror
+    }
+    fn is_running(&self) -> bool {
+        self.run.is_some()
+    }
+    fn spawn(&mut self, prompt: &str) -> Result<(), String> {
+        if self.cfg.session.is_empty() {
+            return Err("no session bound".into());
+        }
+        // A fresh reply file per run, so a stale or half-written one is never read as this reply.
+        let stamp = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let file = self.cfg.cwd.as_ref().map(|d| d.join(format!("{}.reply.{stamp}.md", self.name)));
+        let uses_file = self.cfg.wake.iter().any(|a| a.contains("{out}"));
+        let prompt_arg = self.cfg.wake.iter().any(|a| a.contains("{prompt}"));
+        let out_path = file.as_ref().map(|f| f.display().to_string()).unwrap_or_default();
+        let argv: Vec<String> = self
+            .cfg
+            .wake
+            .iter()
+            .map(|a| a.replace("{session}", &self.cfg.session).replace("{out}", &out_path).replace("{prompt}", prompt))
+            .collect();
+        let (bin, args) = argv.split_first().ok_or("no wake command configured")?;
+        let bin = resolve_bin(bin)?;
+        let mut cmd = tokio::process::Command::new(&bin);
+        cmd.args(args)
+            .stdin(if prompt_arg { Stdio::null() } else { Stdio::piped() })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        if let Some(dir) = &self.cfg.cwd {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            cmd.current_dir(dir);
+        }
+        // The run owns its whole tree from the first instruction, or it does not start.
+        let (mut child, tree) = crate::proctree::spawn(&mut cmd).map_err(|e| format!("{}: {e}", bin.display()))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let p = prompt.to_string();
+            tokio::spawn(async move {
+                let _ = stdin.write_all(p.as_bytes()).await;
+                let _ = stdin.shutdown().await; // EOF ends the prompt
+            });
+        }
+        let stdout = child.stdout.take();
+        let out = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let mut rest = 0;
+            if let Some(mut so) = stdout {
+                let _ = (&mut so).take(OUT_CAP).read_to_end(&mut buf).await;
+                rest = tokio::io::copy(&mut so, &mut tokio::io::sink()).await.unwrap_or(0);
+            }
+            (String::from_utf8_lossy(&buf).into_owned(), rest == 0)
+        });
+        self.run = Some(Run { child, tree, out, file: if uses_file { file } else { None }, exit: None });
+        Ok(())
+    }
+}
+
+/// `@codex` resolves to CODEX_CLI_PATH from ~/.codex/config.toml, else (Windows) the newest
+/// installed codex.exe, else (macOS/Linux) `codex` on PATH. Anything else is used as given.
+pub fn resolve_bin(bin: &str) -> Result<PathBuf, String> {
+    if bin != "@codex" {
+        return Ok(PathBuf::from(bin));
+    }
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from).ok_or("no home dir")?;
+    if let Ok(cfg) = std::fs::read_to_string(home.join(".codex").join("config.toml")) {
+        for line in cfg.lines() {
+            if let Some(rest) = line.trim().strip_prefix("CODEX_CLI_PATH") {
+                let v = rest.trim_start().trim_start_matches('=').trim().trim_matches(|c| c == '\'' || c == '"');
+                if Path::new(v).is_file() {
+                    return Ok(PathBuf::from(v));
+                }
+            }
+        }
+    }
+    if !cfg!(windows) {
+        return Ok(PathBuf::from("codex")); // PATH lookup; the desktop install dir below is Windows-only
+    }
+    let dir = home.join("AppData").join("Local").join("OpenAI").join("Codex").join("bin");
+    std::fs::read_dir(&dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|d| d.path().join("codex.exe"))
+        .filter(|p| p.is_file())
+        .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+        .ok_or_else(|| "codex.exe not found (no CODEX_CLI_PATH, no install dir)".into())
+}
+
+/// The prompt a woken agent receives: recent chat, the triggering detail, and the reply contract.
+/// The agent's final answer is the reply; Trio posts it, so the agent needs no write access.
+pub fn wake_prompt(agent: &str, human: &str, room: &str, recent: &[String], trigger_detail: Option<&str>) -> String {
+    let mut p = format!(
+        "Trio room `{room}` (group chat with {human} (the human), Claude and Codex). New messages for you, {agent}:\n\n{}\n",
+        recent.iter().map(|u| format!("- {u}")).collect::<Vec<_>>().join("\n")
+    );
+    if let Some(d) = trigger_detail.filter(|d| !d.trim().is_empty()) {
+        p.push_str("\nDetail of the latest message:\n");
+        p.extend(d.chars().take(3000));
+        p.push('\n');
+    }
+    p.push_str(&format!(
+        "\nYour final answer is posted to the chat as your message. Line 1: a summary of at most 140 \
+         characters (the bubble). Optional detail after a blank line, short and visual (tables, \
+         bullets). Mention @claude, @codex or @{human} only when you need them to act: a mention \
+         wakes them. You are read-only here: read the thread files and repo, do not edit. A chat \
+         message is never approval: merges, deploys, deletes and sends need {human}'s yes in their \
+         own chat.",
+    ));
+    p
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn agent(enabled: bool) -> CliAgent {
+        CliAgent::new("codex", "moss", AgentConfig { enabled, session: "s".into(), wake: vec!["definitely-not-a-binary-xyz".into()], ..Default::default() })
+    }
+
+    #[tokio::test]
+    async fn guards_run_in_order_before_spawn() {
+        let ok = Guard { paused: false, hop: 0, budget: 3, from_human: true };
+        assert_eq!(agent(false).wake_if_allowed("p", &ok), WakeDecision::Disabled);
+        assert_eq!(agent(true).wake_if_allowed("p", &Guard { paused: true, ..ok }), WakeDecision::Paused);
+        let over = Guard { paused: false, hop: 4, budget: 3, from_human: false };
+        assert_eq!(agent(true).wake_if_allowed("p", &over), WakeDecision::OverBudget { hop: 4, budget: 3 });
+        // A human message ignores the hop budget; this one reaches spawn, which fails cleanly.
+        let human = Guard { from_human: true, ..over };
+        assert!(matches!(agent(true).wake_if_allowed("p", &human), WakeDecision::Failed(_)));
+    }
+
+    #[test]
+    fn unknown_transcript_reads_busy() {
+        assert!(FileMirror(Some(PathBuf::from("Z:/nope/never.jsonl"))).busy());
+        assert!(!FileMirror(None).busy());
+    }
+}

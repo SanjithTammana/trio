@@ -1,0 +1,29 @@
+{
+  "description": "Trio attached mode. Replace the absolute Trio executable paths with your installation paths.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/trio hook codex prompt",
+            "commandWindows": "cmd.exe /d /c call \"C:\\Tools\\Trio\\trio.exe\" hook codex prompt",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/trio hook codex stop",
+            "commandWindows": "cmd.exe /d /c call \"C:\\Tools\\Trio\\trio.exe\" hook codex stop",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}
