@@ -253,6 +253,15 @@ pub fn show(ui: &mut Ui, app: &mut TrioApp, snap: &Snapshot, panel: &Panel, t: &
                     c.text(LayoutJob::single_section(n.summary.clone(), paint::fmt(theme::sans(14.0), t.ink2)));
                     c.gap(14.0);
                 }
+                // The Work lens story: who raised it, who has it, what review said, who it waits on.
+                if let Some(w) = n.work.as_ref().filter(|w| !w.story.is_empty()) {
+                    let g = paint::wrapped(c.ui, &w.story, theme::sans(13.0), t.ink, c.w - 22.0);
+                    let r = Rect::from_min_size(pos2(c.x, c.y), vec2(c.w, g.size().y + 18.0));
+                    c.ui.painter().rect_filled(r, 8.0, t.sunk);
+                    c.ui.painter().galley(pos2(c.x + 11.0, c.y + 9.0), g, t.ink);
+                    c.y = r.bottom();
+                    c.gap(14.0);
+                }
                 if !linked.is_empty() {
                     c.section(if is_branch { "Implements" } else { "Branches" }, t);
                     if let Some(x) = chips(&mut c, &linked, t, "linked") {
@@ -267,7 +276,7 @@ pub fn show(ui: &mut Ui, app: &mut TrioApp, snap: &Snapshot, panel: &Panel, t: &
                         nav = Some(Panel::Pick(Pick::Component(part)));
                     }
                 }
-                c.section("Story", t);
+                c.section(if n.work.is_some() { "Steps" } else { "Story" }, t);
                 for (k, s) in n.steps.iter().rev().enumerate() {
                     let what = paint::wrapped(c.ui, &s.what, theme::sans(14.0), t.ink, c.w - 22.0);
                     let meta = paint::line(c.ui, &format!("{} · {}", name_of(&s.who, me), time_label(&s.at, day)), theme::sans(11.5), t.ink3, c.w - 22.0);
@@ -369,7 +378,21 @@ fn is_bullet(line: &str) -> bool {
     s.starts_with("- ") || s.starts_with("* ")
 }
 
-/// `code` and **bold** spans inside one line.
+/// `[text](url)` at the start of `s`: the text, the url's host, and the bytes the link spans.
+fn link(s: &str) -> Option<(&str, &str, usize)> {
+    let close = s.find("](")?;
+    let text = &s[1..close];
+    let end = s[close + 2..].find(')')?;
+    let url = &s[close + 2..close + 2 + end];
+    if text.is_empty() || text.contains('[') || url.contains(char::is_whitespace) {
+        return None;
+    }
+    let host = url.split("://").nth(1).unwrap_or(url).split('/').next().unwrap_or(url);
+    Some((text, host, close + 2 + end + 1))
+}
+
+/// `code`, **bold** and [link](url) spans inside one line. A link shows its text underlined and
+/// its host, since a detail panel line is not clickable.
 fn inline(text: &str, size: f32, t: &Tokens, heading: bool) -> LayoutJob {
     let base = if heading { theme::bold(size) } else { theme::sans(size) };
     let mut job = LayoutJob::default();
@@ -377,14 +400,22 @@ fn inline(text: &str, size: f32, t: &Tokens, heading: bool) -> LayoutJob {
     while !rest.is_empty() {
         let tick = rest.find('`');
         let star = rest.find("**");
-        let next = match (tick, star) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
+        let bracket = rest.match_indices('[').map(|(i, _)| i).find(|&i| link(&rest[i..]).is_some());
+        let next = [tick, star, bracket].into_iter().flatten().min();
         let Some(at) = next else {
             job.append(rest, 0.0, paint::fmt(base.clone(), t.ink));
             break;
         };
+        if Some(at) == bracket {
+            let (label, host, len) = link(&rest[at..]).expect("checked above");
+            job.append(&rest[..at], 0.0, paint::fmt(base.clone(), t.ink));
+            let mut f = paint::fmt(base.clone(), t.ink);
+            f.underline = Stroke::new(1.0, t.ink3);
+            job.append(label, 0.0, f);
+            job.append(&format!(" ({host})"), 0.0, paint::fmt(theme::sans(size * 0.85), t.ink3));
+            rest = &rest[at + len..];
+            continue;
+        }
         let (marker, close) = if rest[at..].starts_with('`') { ("`", "`") } else { ("**", "**") };
         match rest[at + marker.len()..].find(close).filter(|&n| n > 0) {
             Some(n) => {
@@ -420,5 +451,13 @@ mod tests {
         assert_eq!(parts, ["run ", "cargo test", " then ", "ship", " it"]);
         let open = inline("a ` b", 14.0, &crate::theme::LIGHT, false);
         assert_eq!(open.text, "a ` b");
+    }
+
+    #[test]
+    fn links_show_their_text_and_host() {
+        let job = inline("match the [hook contract](https://code.claude.com/docs/en/hooks). Done", 14.0, &crate::theme::LIGHT, false);
+        assert_eq!(job.text, "match the hook contract (code.claude.com). Done");
+        let plain = inline("a [b] (c) and [x](y z)", 14.0, &crate::theme::LIGHT, false);
+        assert_eq!(plain.text, "a [b] (c) and [x](y z)", "not links: left as written");
     }
 }

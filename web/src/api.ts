@@ -27,7 +27,21 @@ export interface GraphNode {
   summary: string;
   touches: number;
   steps: Step[];
+  /** Work lens reading, on items only: stage, who it waits on, and a story from the ledger. */
+  work?: Work;
 }
+
+export type WorkLane = 'asked' | 'progress' | 'review' | 'changes' | 'done';
+export interface Work { lane: WorkLane; waiting_on?: string; story: string }
+
+/** The Work lens columns, in board order, with what each one means. */
+export const WORK_LANES: { lane: WorkLane; title: string; explain: string }[] = [
+  { lane: 'asked', title: 'Asked', explain: 'Named in chat, nobody has picked it up yet.' },
+  { lane: 'progress', title: 'In progress', explain: 'Someone claimed it, or a branch implements it.' },
+  { lane: 'review', title: 'In review', explain: 'A review was asked for and no verdict has come back since.' },
+  { lane: 'changes', title: 'Changes', explain: 'The last verdict asked for changes: the work is back with its author.' },
+  { lane: 'done', title: 'Done', explain: 'Passed review, or every branch that implements it is merged.' },
+];
 
 export interface Edge { from: string; to: string; kind: string }
 

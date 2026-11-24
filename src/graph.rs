@@ -34,6 +34,19 @@ pub struct WorkItem {
     pub title: String,
     pub touches: u32,
     pub steps: Vec<Step>,
+    /// The latest message that asked for a review of this item: when, by whom, and of whom.
+    #[serde(skip)]
+    pub review_asked: Option<ReviewAsk>,
+    /// Time of the latest verdict, so a later review request reads as "in review" again.
+    #[serde(skip)]
+    pub verdict_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReviewAsk {
+    pub at: String,
+    pub by: String,
+    pub of: Vec<String>,
 }
 
 impl Entity for WorkItem {
@@ -105,6 +118,8 @@ impl Graph {
             title: String::new(),
             touches: 0,
             steps: Vec::new(),
+            review_asked: None,
+            verdict_at: String::new(),
         })
     }
 
@@ -156,16 +171,32 @@ pub trait Deriver: Send + Sync {
     fn apply(&self, e: &Event, first_time: bool, g: &mut Graph);
 }
 
+/// Phrases that ask for a review even without an @mention.
+const REVIEW_ASKS: &[&str] = &["please review", "please re-review", "ready for review", "up for review", "for your review", "fixed: re-review", "design for review"];
+
 /// Messages create items for the ids they mention and record a step on each.
 pub struct ItemDeriver;
 impl Deriver for ItemDeriver {
     fn apply(&self, e: &Event, _first: bool, g: &mut Graph) {
-        let Body::Message { items, .. } = &e.body else { return };
+        let Body::Message { items, mentions, .. } = &e.body else { return };
         let summary = e.summary();
+        // "@codex please review P0a" asks for a review of every item it names.
+        let mut of: Vec<String> = mentions.iter().filter(|m| **m != e.from).cloned().collect();
+        // A message that reports a verdict is an answer, not a request. Posts files often ask
+        // without an @mention ("A1-A4 ready for review"): that request goes to the other agent.
+        let lower = summary.to_ascii_lowercase();
+        let phrased = REVIEW_ASKS.iter().any(|p| lower.contains(p));
+        let asks_review = !lower.contains("verdict") && ((!of.is_empty() && lower.contains("review")) || phrased);
+        if asks_review && of.is_empty() {
+            of.push("both".into());
+        }
         for id in items {
             let it = g.item(id, &e.at, &e.from);
             if it.title.is_empty() || summary.contains(id.as_str()) {
                 it.title = clip(&summary, 90);
+            }
+            if asks_review && it.review_asked.as_ref().is_none_or(|r| r.at <= e.at) {
+                it.review_asked = Some(ReviewAsk { at: e.at.clone(), by: e.from.clone(), of: of.clone() });
             }
             g.step(id, e, summary.clone());
             g.edge(&e.from, id, "touched");
@@ -202,6 +233,9 @@ impl Deriver for ReviewDeriver {
         let it = g.item(item, &e.at, &e.from);
         if e.at.as_str() >= it.last.as_str() || matches!(it.state.as_str(), "open" | "claimed" | "branch") {
             it.state = state.into();
+        }
+        if e.at > it.verdict_at {
+            it.verdict_at = e.at.clone();
         }
         g.step(item, e, format!("{} review: {state}", e.from));
         g.edge(&e.from, item, &format!("review:{state}"));

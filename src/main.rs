@@ -20,6 +20,7 @@ mod roomid;
 mod server;
 mod setup;
 mod source;
+mod work;
 
 use std::hash::{BuildHasher, RandomState};
 use std::path::PathBuf;

@@ -70,7 +70,28 @@ pub struct Node {
     pub touches: u32,
     #[serde(default)]
     pub steps: Vec<Step>,
+    /// Items only: the Work lens stage, who it waits on, and its one-paragraph story.
+    #[serde(default)]
+    pub work: Option<Work>,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Work {
+    pub lane: String,
+    #[serde(default)]
+    pub waiting_on: Option<String>,
+    #[serde(default)]
+    pub story: String,
+}
+
+/// The Work lens stages in order, with the caption explain mode shows under each (web: WORK_LANES).
+pub const WORK_LANES: [(&str, &str, &str); 5] = [
+    ("asked", "Asked", "Named in chat, nobody has picked it up yet."),
+    ("progress", "In progress", "Someone claimed it, or a branch implements it."),
+    ("review", "In review", "A review was asked for and no verdict has come back since."),
+    ("changes", "Changes", "The last verdict asked for changes: the work is back with its author."),
+    ("done", "Done", "Passed review, or every branch that implements it is merged."),
+];
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Edge {

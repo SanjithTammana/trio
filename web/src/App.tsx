@@ -218,6 +218,7 @@ function PanelBody({ snap, panel, me, go, openMessage }: {
       <div className="eyebrow"><State state={state} />{STATE_LABEL[state] ?? state} · <Who who={n.lane} me={me} />{nameOf(n.lane, me)} · {n.touches} update{n.touches === 1 ? '' : 's'}</div>
       <h3><span className="mono">{n.id}</span></h3>
       {n.summary && <p className="lede">{n.summary}</p>}
+      {n.work && <p className="work-story">{n.work.story}</p>}
       {linked.length > 0 && (
         <>
           <div className="section">{isBranch ? 'Implements' : 'Branches'}</div>
@@ -237,7 +238,7 @@ function PanelBody({ snap, panel, me, go, openMessage }: {
           </div>
         </>
       )}
-      <div className="section">Story</div>
+      <div className="section">{n.work ? 'Steps' : 'Story'}</div>
       <ol className="story">
         {n.steps.slice().reverse().map((s, i) => (
           <li key={`${s.event}-${i}`}>

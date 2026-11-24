@@ -152,10 +152,10 @@ impl TrioApp {
 
     fn keys(&mut self, ctx: &egui::Context, now: f64) {
         let typing = ctx.egui_wants_keyboard_input();
-        let (esc, slash, g, c) = ctx.input(|i| {
+        let (esc, slash, g, c, ask) = ctx.input(|i| {
             let plain = !i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.command;
             let text = |s: &str| i.events.iter().any(|e| matches!(e, egui::Event::Text(t) if t == s));
-            (i.key_pressed(egui::Key::Escape), plain && text("/"), plain && text("g"), plain && text("c"))
+            (i.key_pressed(egui::Key::Escape), plain && text("/"), plain && text("g"), plain && text("c"), plain && text("?"))
         });
         if esc {
             if self.island {
@@ -176,6 +176,10 @@ impl TrioApp {
             self.view = View::Map;
         } else if c {
             self.view = View::Chat;
+        } else if ask && self.view == View::Map {
+            // `?` explains the map in place (captions on the lens, columns and strip).
+            let empty = self.snap.as_ref().is_none_or(|s| s.graph.items.is_empty());
+            self.map.toggle_explain(empty);
         }
     }
 }
@@ -415,9 +419,20 @@ impl TrioApp {
         let cx = center_x.unwrap_or(top.left() + 16.0 + w / 2.0);
         let capsule = Rect::from_center_size(pos2(cx, top.center().y), vec2(w, 32.0));
 
+        // The open card's rows are laid out here first: a status that wraps makes its row taller,
+        // and the card must grow with it or the budget row and buttons fall outside it.
         let open_w = 440f32.min(top.width() * 0.92);
-        let open_rows_h = 3.0 * 22.0 + 8.0 * 2.0;
-        let open_h = 12.0 + open_rows_h + 8.0 + 8.0 + 26.0 + 12.0;
+        let rows: Vec<String> = lane
+            .iter()
+            .map(|wn| {
+                let (_, text) = status(wn);
+                let at = snap.graph.now.get(wn.as_str()).map(|n| n.at.clone()).unwrap_or_default();
+                if at.is_empty() { text } else { format!("{text} · {}", time_label(&at, day)) }
+            })
+            .collect();
+        let row_w = open_w - 32.0 - 88.0;
+        let rows_h: f32 = rows.iter().map(|r| paint::wrapped(ui, r, theme::sans(12.5), t.bg, row_w).size().y.max(20.0) + 8.0).sum();
+        let open_h = 12.0 + rows_h + 8.0 + 26.0 + 12.0;
         let open_x = if narrow { (top.left() + 16.0).min(top.right() - open_w - 8.0) } else { cx - open_w / 2.0 };
         let open_rect = Rect::from_min_size(pos2(open_x, top.center().y - 16.0 - 2.0), vec2(open_w, open_h));
 
@@ -494,14 +509,11 @@ impl TrioApp {
         iu.multiply_opacity(content_alpha);
         let p = iu.painter().clone();
         let mut y = inner.top();
-        for wn in &lane {
-            let (_, text) = status(wn);
-            let at = snap.graph.now.get(wn.as_str()).map(|n| n.at.clone()).unwrap_or_default();
-            let full = if at.is_empty() { text } else { format!("{text} · {}", time_label(&at, day)) };
+        for (wn, full) in lane.iter().zip(&rows) {
             glyph::who(&p, Rect::from_min_size(pos2(inner.left() + 2.0, y + 5.0), vec2(10.0, 10.0)), wn, me, false, t.bg);
             let ng = paint::line(&iu, &name_of(wn, me), theme::sans(12.5), t.bg, 58.0);
             p.galley(pos2(inner.left() + 22.0, y + 1.0), ng, t.bg);
-            let sg = paint::wrapped(&iu, &full, theme::sans(12.5), ink_on(0.72), inner.width() - 88.0);
+            let sg = paint::wrapped(&iu, full, theme::sans(12.5), ink_on(0.72), inner.width() - 88.0);
             let h = sg.size().y.max(20.0);
             p.galley(pos2(inner.left() + 88.0, y + 1.0), sg, t.bg);
             y += h + 8.0;

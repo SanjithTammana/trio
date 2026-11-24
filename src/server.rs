@@ -70,15 +70,20 @@ impl View for GraphView {
         use crate::model::{Entity, Summarized, Timed};
         let mut items: Vec<_> = room.graph.items.values().collect();
         items.sort_by(|a, b| a.at().cmp(b.at()));
+        let work = crate::work::all(&room.graph, &room.me());
         // Serialized through the Node interface, so any future node type renders the same way.
         let nodes: Vec<_> = items
             .iter()
             .map(|n| {
-                serde_json::json!({
+                let mut v = serde_json::json!({
                     "id": n.id(), "kind": n.kind(), "lane": n.lane(), "state": n.state(),
                     "first": n.at(), "last": n.last, "summary": n.summary(),
                     "touches": n.touches, "steps": n.steps,
-                })
+                });
+                if let Some(w) = work.get(n.id()) {
+                    v["work"] = serde_json::json!(w);
+                }
+                v
             })
             .collect();
         // Clients draw only these; the other derived edges stay server-side (85% of the list).

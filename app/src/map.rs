@@ -6,21 +6,54 @@
 //! Layout is O(V + E log E): fixed row height, one barycentre pass per column (the classic
 //! one-sided crossing-minimization heuristic), no force simulation. The model is rebuilt only
 //! when the snapshot revision or the scope changes, not per frame.
+//!
+//! v3 puts lenses over the same data, as the web map does: Work (default: items in stage lanes,
+//! cards waiting on you first), Code (the routing map) and Time (the activity strip at full
+//! height). Explain mode (`?`) captions the lens, its columns and the strip in place.
 
 use crate::app::{Open, Panel, Pick, TrioApp};
-use crate::model::{components, iso, lanes, ms, name_of, time_label, Component, Node, Snapshot};
+use crate::model::{components, iso, lanes, ms, name_of, time_label, Component, Node, Snapshot, WORK_LANES};
 use crate::paint::{self, Hit};
 use crate::theme::{self, fade, Tokens};
 use crate::glyph;
-use eframe::egui::{self, epaint::CubicBezierShape, pos2, vec2, Color32, Id, Rect, Stroke, StrokeKind, UiBuilder};
+use eframe::egui::{self, epaint::CubicBezierShape, pos2, vec2, Color32, CornerRadius, Id, Pos2, Rect, Stroke, StrokeKind, UiBuilder, WidgetInfo};
 use std::collections::{HashMap, HashSet};
 
 const ROW: f32 = 30.0;
 const GAP: f32 = 56.0;
+/// Column minimum widths: items, branches, components.
+const MINS: [f32; 3] = [200.0, 180.0, 150.0];
 const ACTIVE_HOURS: i64 = 36;
 const MAX_COMPONENTS: usize = 28;
 const PRIORITY: [&str; 6] = ["changes", "blocked", "review", "claimed", "open", "pass"];
 const HEADER: f32 = 41.0;
+/// Work lens: done cards stay 24 h in the In flight scope; lanes show 12 cards before "+N more".
+const DONE_HOURS: i64 = 24;
+const LANE_CAP: usize = 12;
+const LANE_MIN: f32 = 180.0;
+const LANE_GAP: f32 = 12.0;
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub enum Lens {
+    #[default]
+    Work,
+    Code,
+    Time,
+}
+
+const LENSES: [(Lens, &str, &str); 3] = [
+    (Lens::Work, "Work", "What is happening, and who it is waiting on"),
+    (Lens::Code, "Code", "Where in the code the work lands"),
+    (Lens::Time, "Time", "When each step happened, per participant"),
+];
+
+fn lens_explain(l: Lens) -> &'static str {
+    match l {
+        Lens::Work => "Work: every item by stage. A card waiting on you has a carmine edge and sorts first. Click a card for its story; nothing here costs a wake.",
+        Lens::Code => "Code: items (left) link to the branches that implement them (middle); branches link to the parts of the code they change since their merge-base (right). A part that two open branches change is a hot spot, a likely conflict.",
+        Lens::Time => "Time: one row per participant, one tick per recorded step (a claim, commit, verdict or message). Hover a node in another lens to light its ticks.",
+    }
+}
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
@@ -34,6 +67,18 @@ pub struct MapState {
     scope: Scope,
     hover: Option<String>,
     model: Option<(u64, String, Scope, Model)>,
+    lens: Lens,
+    /// None until toggled: explain is then on while the room is empty (where people learn).
+    explain: Option<bool>,
+}
+
+impl MapState {
+    pub fn explain(&self, empty: bool) -> bool {
+        self.explain.unwrap_or(empty)
+    }
+    pub fn toggle_explain(&mut self, empty: bool) {
+        self.explain = Some(!self.explain(empty));
+    }
 }
 
 #[derive(Clone, Default)]
@@ -154,7 +199,7 @@ fn lit(focus: Option<&str>, m: &Model, snap: &Snapshot) -> HashSet<String> {
 
 /// Column widths for `minmax(230px,1.25fr) 56px minmax(210px,1fr) 56px minmax(170px,.85fr)`.
 fn columns(width: f32) -> [f32; 3] {
-    let mins = [230.0, 210.0, 170.0];
+    let mins = MINS;
     let fr = [1.25, 1.0, 0.85];
     let free = (width - 2.0 * GAP).max(mins.iter().sum());
     let mut fixed = [false; 3];
@@ -194,7 +239,13 @@ pub fn show(ui: &mut egui::Ui, app: &mut TrioApp, snap: &Snapshot, t: &Tokens, d
     let bar = Rect::from_min_size(area.min, vec2(area.width(), 38.0));
     let p = ui.painter().clone();
     p.line_segment([bar.left_bottom(), bar.right_bottom()], Stroke::new(1.0, t.line));
-    let mut x = bar.left() + 16.0;
+    let lens = app.map.lens;
+    let explain = app.map.explain(all.is_empty());
+    let (seg, picked) = segmented(ui, &p, pos2(bar.left() + 16.0, bar.center().y - 14.0), lens, t);
+    if let Some(l) = picked {
+        app.map.lens = l;
+    }
+    let mut x = seg.right() + 12.0;
     for (s, label) in [(Scope::Active, "In flight"), (Scope::All, "Everything")] {
         let on = scope == s;
         let g = paint::line(ui, label, theme::sans(12.5), if on { t.ink } else { t.ink3 }, 200.0);
@@ -210,25 +261,81 @@ pub fn show(ui: &mut egui::Ui, app: &mut TrioApp, snap: &Snapshot, t: &Tokens, d
             app.map.scope = s;
         }
     }
-    // Legend, right-aligned.
-    let legend: Vec<(&str, &str, bool)> = vec![("open", "open", false), ("claimed", "claimed", false), ("review", "review", false), ("changes", "changes", false), ("pass", "pass", false), ("branch", "branch", false), ("component", "hot spot", true)];
+    // Explain toggle: a pill with its key, like the web's `?` button.
+    {
+        let kg = paint::line(ui, "?", theme::mono(10.5), if explain { t.ink } else { t.ink3 }, 50.0);
+        let lg = paint::line(ui, "Explain", theme::sans(12.0), if explain { t.ink } else { t.ink3 }, 200.0);
+        let r = Rect::from_min_size(pos2(x + 10.0, bar.center().y - 11.0), vec2(20.0 + kg.size().x + 6.0 + lg.size().x, 22.0));
+        x = r.right();
+        let resp = ui.interact(r, Id::unique("explain-toggle"), egui::Sense::click());
+        resp.widget_info(|| WidgetInfo::selected(egui::Role::Button, true, explain, "Explain (?)"));
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if explain {
+            p.rect_filled(r, 11.0, t.sunk);
+        }
+        p.rect_stroke(r, 11.0, Stroke::new(1.0, if explain { t.line2 } else { t.line }), StrokeKind::Inside);
+        p.galley(pos2(r.left() + 10.0, r.center().y - kg.size().y / 2.0), kg.clone(), t.ink3);
+        p.galley(pos2(r.left() + 10.0 + kg.size().x + 6.0, r.center().y - lg.size().y / 2.0), lg, t.ink3);
+        paint::focus_ring(&p, &resp, t, 11.0);
+        let resp = resp.on_hover_text("Explain every column, glyph and the strip (?)");
+        if resp.clicked() {
+            app.map.toggle_explain(all.is_empty());
+        }
+    }
+    // Legend, right-aligned: who is who on every lens, plus the lens's own marks.
+    let mut legend: Vec<(&str, &str, bool)> = vec![("@me", "you", false), ("@claude", "Claude", false), ("@codex", "Codex", false)];
+    match lens {
+        Lens::Code => legend.extend([("open", "open", false), ("claimed", "claimed", false), ("review", "review", false), ("changes", "changes", false), ("pass", "pass", false), ("branch", "branch", false), ("component", "hot spot", true)]),
+        Lens::Work => legend.push(("|you", "waiting on you", false)),
+        Lens::Time => {}
+    }
     let lg: Vec<_> = legend.iter().map(|(_, l, _)| paint::line(ui, l, theme::sans(12.5), t.ink3, 200.0)).collect();
     let lw: f32 = lg.iter().map(|g| 15.0 + g.size().x).sum::<f32>() + 12.0 * (lg.len() as f32 - 1.0);
     if bar.right() - 16.0 - lw > x + 16.0 {
         let mut lx = bar.right() - 16.0 - lw;
-        for ((state, _, hot), g) in legend.iter().zip(lg) {
-            glyph::state(&p, Rect::from_min_size(pos2(lx, bar.center().y - 5.0), vec2(10.0, 10.0)), state, *hot, t.ink3, t.accent);
+        for ((mark, _, hot), g) in legend.iter().zip(lg) {
+            let r = Rect::from_min_size(pos2(lx, bar.center().y - 5.0), vec2(10.0, 10.0));
+            if let Some(who) = mark.strip_prefix('@') {
+                glyph::who(&p, r, if who == "me" { me } else { who }, me, false, t.ink3);
+            } else if *mark == "|you" {
+                p.rect_filled(Rect::from_center_size(r.center(), vec2(3.0, 12.0)), 2.0, t.accent);
+            } else {
+                glyph::state(&p, r, mark, *hot, t.ink3, t.accent);
+            }
             p.galley(pos2(lx + 15.0, bar.center().y - g.size().y / 2.0), g.clone(), t.ink3);
             lx += 15.0 + g.size().x + 12.0;
         }
     }
 
+    // ---------- explain caption ----------
+    let mut below = bar.bottom();
+    if explain {
+        let g = paint::wrapped(ui, lens_explain(lens), italic(12.0), t.ink2, area.width() - 32.0);
+        p.galley(pos2(area.left() + 16.0, below + 8.0), g.clone(), t.ink2);
+        below += g.size().y + 16.0;
+        p.line_segment([pos2(area.left(), below), pos2(area.right(), below)], Stroke::new(1.0, t.line));
+    }
+
     // ---------- strip ----------
-    let strip_nodes: Vec<&Node> = m.items.iter().chain(m.branches.iter()).map(|&i| &all[i]).collect();
-    let strip_h = strip(ui, area, &strip_nodes, &lit, snap, t, day);
+    let strip_nodes: Vec<&Node> = if lens == Lens::Code { m.items.iter().chain(m.branches.iter()).map(|&i| &all[i]).collect() } else { all.iter().collect() };
+    if lens == Lens::Time {
+        let r = Rect::from_min_max(pos2(area.left(), below), area.max);
+        if strip(ui, r, &strip_nodes, &lit, snap, t, day, true, explain) == 0.0 {
+            let g = paint::wrapped(ui, "No activity yet. Each claim, commit, verdict or message adds a tick on its author's row.", theme::sans(14.0), t.ink3, (r.width() - 32.0).min(640.0));
+            ui.painter().galley(pos2(r.center().x - g.size().x / 2.0, r.top() + 48.0), g, t.ink3);
+        }
+        return finish(ui, app, hover_now, None);
+    }
+    let strip_h = strip(ui, area, &strip_nodes, &lit, snap, t, day, false, explain);
+    let body = Rect::from_min_max(pos2(area.left(), below), pos2(area.right(), area.bottom() - strip_h));
+    if lens == Lens::Work {
+        let open = work(ui, body, app, snap, t, day, explain, selected, &mut hover_now);
+        return finish(ui, app, hover_now, open);
+    }
 
     // ---------- columns ----------
-    let body = Rect::from_min_max(pos2(area.left(), bar.bottom()), pos2(area.right(), area.bottom() - strip_h));
     let mut cu = ui.new_child(UiBuilder::new().max_rect(body).id_salt("map-body"));
     cu.set_clip_rect(body);
     let empty = m.items.len() + m.branches.len() == 0;
@@ -241,15 +348,18 @@ pub fn show(ui: &mut egui::Ui, app: &mut TrioApp, snap: &Snapshot, t: &Tokens, d
             return;
         }
         // Size from the viewport: a both-ways scroll area's inner rect is not bounded by it.
-        let width = (body.width() - 32.0).max(780.0);
+        // Columns shrink to their minimums before the map scrolls sideways, so a side panel next to
+        // a narrow window cuts labels with an ellipsis instead of clipping them at its edge.
+        let width = (body.width() - 32.0).max(MINS.iter().sum::<f32>() + 2.0 * GAP);
         let [w1, w2, w3] = columns(width);
         let x1 = full.left() + 16.0;
         let x2 = x1 + w1 + GAP;
         let x3 = x2 + w2 + GAP;
         let rows = m.items.len().max(m.branches.len()).max(m.comps.len()).max(1) as f32;
-        let height = HEADER + rows * ROW + 24.0;
+        let hh = if explain { HEADER + 12.0 } else { HEADER };
+        let height = hh + rows * ROW + 24.0;
         let (content, _) = ui.allocate_exact_size(vec2(width + 32.0, height), egui::Sense::hover());
-        let top = content.top() + HEADER;
+        let top = content.top() + hh;
         let y_of = |k: usize| top + k as f32 * ROW + ROW / 2.0;
         let iy: HashMap<&str, f32> = m.items.iter().enumerate().map(|(k, &i)| (all[i].id.as_str(), y_of(k))).collect();
         let by: HashMap<&str, f32> = m.branches.iter().enumerate().map(|(k, &i)| (all[i].id.as_str(), y_of(k))).collect();
@@ -379,7 +489,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut TrioApp, snap: &Snapshot, t: &Tokens, d
         let clip = ui.clip_rect();
         let hy = clip.top().max(content.top());
         let hp = p.with_clip_rect(clip);
-        hp.rect_filled(Rect::from_min_size(pos2(content.left(), hy), vec2(content.width(), HEADER - 6.0)), 0.0, t.bg);
+        hp.rect_filled(Rect::from_min_size(pos2(content.left(), hy), vec2(content.width(), hh - 6.0)), 0.0, t.bg);
         let header = |x: f32, w: f32, label: &str, n: String, hot: usize| {
             let mut job = paint::caps(label, 11.0, t.ink3);
             job.append(&n, 6.0, paint::fmt(theme::mono(11.0), t.ink3));
@@ -389,7 +499,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut TrioApp, snap: &Snapshot, t: &Tokens, d
             paint::elide(&mut job, w);
             let g = paint::job(ui, job);
             hp.galley(pos2(x, hy + 12.0), g, t.ink3);
-            hp.line_segment([pos2(x, hy + HEADER - 6.0), pos2(x + w, hy + HEADER - 6.0)], Stroke::new(1.0, t.line));
+            hp.line_segment([pos2(x, hy + hh - 6.0), pos2(x + w, hy + hh - 6.0)], Stroke::new(1.0, t.line));
         };
         header(x1, w1, "Items", m.items.len().to_string(), 0);
         header(x1 + w1, GAP, "", String::new(), 0);
@@ -397,13 +507,246 @@ pub fn show(ui: &mut egui::Ui, app: &mut TrioApp, snap: &Snapshot, t: &Tokens, d
         header(x2 + w2, GAP, "", String::new(), 0);
         let cn = if m.hidden_comps > 0 { format!("{}+{}", m.comps.len(), m.hidden_comps) } else { m.comps.len().to_string() };
         header(x3, w3, "Components", cn, m.hot);
+        if explain {
+            // Captions sit in the header band's spare height, one line each.
+            for (x, w, text) in [(x1, w1, "Work named in chat (P0a, XF29)"), (x2, w2, "Git branches whose commits name an item"), (x3, w3, "Folders each branch changes, in lines")] {
+                let g = paint::line(ui, text, italic(11.0), t.ink3, w);
+                hp.galley(pos2(x, hy + 28.0), g, t.ink3);
+            }
+        }
     });
+    finish(ui, app, hover_now, open)
+}
+
+/// Store this frame's hover (so the strip and dimming follow it) and hand back what to open.
+fn finish(ui: &egui::Ui, app: &mut TrioApp, hover_now: Option<String>, open: Option<Open>) -> Option<Open> {
     if app.map.hover != hover_now {
         app.map.hover = hover_now;
         ui.ctx().request_repaint();
     }
-    let _ = StrokeKind::Inside;
     open
+}
+
+fn italic(size: f32) -> egui::FontId {
+    // egui has no italic face by default; the caption reads as one by size and colour alone.
+    theme::sans(size)
+}
+
+/// Lens switch, ported from Astryx's SegmentedControl (MIT, Meta; see web/src/astryx/LICENSE):
+/// a radio group whose selection indicator slides between segments, Arrow keys / Home / End move
+/// the selection while a segment has focus, and the ends wrap.
+fn segmented(ui: &mut egui::Ui, p: &egui::Painter, at: Pos2, lens: Lens, t: &Tokens) -> (Rect, Option<Lens>) {
+    let gal: Vec<_> = LENSES.iter().map(|(_, l, _)| paint::line(ui, l, theme::sans(12.5), t.ink, 200.0)).collect();
+    let widths: Vec<f32> = gal.iter().map(|g| g.size().x + 20.0).collect();
+    let total = widths.iter().sum::<f32>() + 2.0 * (LENSES.len() as f32 - 1.0) + 6.0;
+    let outer = Rect::from_min_size(at, vec2(total, 28.0));
+    p.rect_stroke(outer, 8.0, Stroke::new(1.0, t.line), StrokeKind::Inside);
+    // The segments sit in a radiogroup node, as role="radiogroup" does on the web.
+    let ui = &ui.new_child(UiBuilder::new().max_rect(outer).id_salt("lens-group"));
+    ui.ctx().accesskit_node_builder(ui.unique_id(), |n| {
+        n.set_role(egui::accesskit::Role::RadioGroup);
+        n.set_label("Lens");
+        n.set_bounds(egui::accesskit::Rect { x0: outer.left().into(), y0: outer.top().into(), x1: outer.right().into(), y1: outer.bottom().into() });
+    });
+    let mut rects = Vec::with_capacity(LENSES.len());
+    let mut x = outer.left() + 3.0;
+    for w in &widths {
+        rects.push(Rect::from_min_size(pos2(x, outer.top() + 3.0), vec2(*w, 22.0)));
+        x += w + 2.0;
+    }
+    let cur = LENSES.iter().position(|(l, _, _)| *l == lens).unwrap_or(0);
+    // The indicator animates from the old segment's rect to the new one (instant under reduced motion).
+    let ctx = ui.ctx();
+    let dur = if app_reduce(ctx) { 0.0 } else { 0.22 };
+    let left = ctx.animate_value_with_time(Id::unique("lens-pill-x"), rects[cur].left(), dur);
+    let width = ctx.animate_value_with_time(Id::unique("lens-pill-w"), rects[cur].width(), dur);
+    let pill = Rect::from_min_size(pos2(left, outer.top() + 3.0), vec2(width, 22.0));
+    p.rect_filled(pill, 6.0, t.surface);
+    p.rect_stroke(pill, 6.0, Stroke::new(1.0, t.line), StrokeKind::Outside);
+    let ids: Vec<Id> = LENSES.iter().map(|(_, l, _)| Id::unique(("lens", *l))).collect();
+    let mut out = None;
+    let mut focused = None;
+    for (i, ((l, label, hint), g)) in LENSES.iter().zip(gal).enumerate() {
+        let r = rects[i];
+        let on = i == cur;
+        let resp = ui.interact(r, ids[i], egui::Sense::click());
+        resp.widget_info(|| WidgetInfo::selected(egui::Role::RadioButton, true, on, *label));
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if resp.has_focus() {
+            focused = Some(i);
+            ui.memory_mut(|m| m.set_focus_lock_filter(ids[i], egui::EventFilter { horizontal_arrows: true, vertical_arrows: true, ..Default::default() }));
+        }
+        let color = if on || resp.hovered() { t.ink } else { t.ink3 };
+        p.galley(pos2(r.left() + 10.0, r.center().y - g.size().y / 2.0), g, color);
+        paint::focus_ring(p, &resp, t, 6.0);
+        let resp = resp.on_hover_text(*hint);
+        if resp.clicked() {
+            out = Some(*l);
+        }
+    }
+    if let Some(i) = focused {
+        let n = LENSES.len();
+        let to = ui.input(|inp| {
+            if inp.key_pressed(egui::Key::ArrowRight) || inp.key_pressed(egui::Key::ArrowDown) {
+                Some((i + 1) % n)
+            } else if inp.key_pressed(egui::Key::ArrowLeft) || inp.key_pressed(egui::Key::ArrowUp) {
+                Some((i + n - 1) % n)
+            } else if inp.key_pressed(egui::Key::Home) {
+                Some(0)
+            } else if inp.key_pressed(egui::Key::End) {
+                Some(n - 1)
+            } else {
+                None
+            }
+        });
+        if let Some(to) = to {
+            out = Some(LENSES[to].0);
+            ui.memory_mut(|m| m.request_focus(ids[to]));
+        }
+    }
+    (outer, out)
+}
+
+/// Work lens: items in five stage lanes, cards waiting on you first. Returns what to open.
+#[allow(clippy::too_many_arguments)]
+fn work(ui: &mut egui::Ui, body: Rect, app: &mut TrioApp, snap: &Snapshot, t: &Tokens, day: &str, explain: bool, selected: Option<&str>, hover_now: &mut Option<String>) -> Option<Open> {
+    let me = snap.me.as_str();
+    let all = &snap.graph.items;
+    let scope = app.map.scope;
+    let lanes = work_lanes(all, me, scope);
+    let total: usize = lanes.iter().map(Vec::len).sum();
+    let mut cu = ui.new_child(UiBuilder::new().max_rect(body).id_salt("work-body"));
+    cu.set_clip_rect(body);
+    if total == 0 {
+        let g = paint::wrapped(&cu, "No work yet. When a message names an item (P0a, XF29), it shows here in its stage: asked, in progress, in review, changes or done.", theme::sans(14.0), t.ink3, (body.width() - 32.0).min(640.0));
+        cu.painter().galley(pos2(body.center().x - g.size().x / 2.0, body.top() + 48.0), g, t.ink3);
+        return None;
+    }
+    let mut open = None;
+    egui::ScrollArea::both().id_salt("work-scroll").auto_shrink([false, false]).show(&mut cu, |ui| {
+        let full = ui.max_rect();
+        let width = (body.width() - 32.0).max(5.0 * LANE_MIN + 4.0 * LANE_GAP);
+        let lw = (width - 4.0 * LANE_GAP) / 5.0;
+        let inner = lw - 20.0;
+        // Captions share one height so the first cards line up across lanes.
+        let caps: Vec<_> = WORK_LANES.iter().map(|(_, _, c)| explain.then(|| paint::wrapped(ui, c, italic(12.0), t.ink2, lw))).collect();
+        let cap_h = caps.iter().flatten().map(|g| g.size().y).fold(0.0, f32::max);
+        // Lay every card out once to size the scroll content, then draw.
+        let cards: Vec<Vec<(&Node, std::sync::Arc<egui::Galley>, f32)>> = lanes
+            .iter()
+            .map(|list| {
+                list.iter()
+                    .take(if scope == Scope::All { usize::MAX } else { LANE_CAP })
+                    .map(|n| {
+                        let mut job = egui::text::LayoutJob::default();
+                        job.append(&n.id, 0.0, paint::fmt(theme::mono(12.0), t.ink));
+                        job.append(&n.summary, 6.0, paint::fmt(theme::sans(12.5), t.ink));
+                        job.wrap.max_width = inner;
+                        job.wrap.max_rows = 2;
+                        job.wrap.overflow_character = Some('…');
+                        let g = paint::job(ui, job);
+                        let h = 8.0 + g.size().y + 4.0 + 16.0 + 8.0;
+                        (*n, g, h)
+                    })
+                    .collect()
+            })
+            .collect();
+        let head = 24.0 + if explain { cap_h + 8.0 } else { 0.0 };
+        let lane_h = |k: usize| cards[k].iter().map(|c| c.2 + 8.0).sum::<f32>() + if lanes[k].len() > cards[k].len() { 22.0 } else { 0.0 };
+        let height = 14.0 + head + (0..5).map(lane_h).fold(0.0, f32::max) + 14.0;
+        let (content, _) = ui.allocate_exact_size(vec2(width + 32.0, height.max(full.height())), egui::Sense::hover());
+        let p = ui.painter().clone();
+        for (k, (lane, title, _)) in WORK_LANES.iter().enumerate() {
+            let x = content.left() + 16.0 + k as f32 * (lw + LANE_GAP);
+            let mut y = content.top() + 14.0;
+            let label = if *lane == "done" && scope == Scope::Active { format!("{title} · 24h") } else { title.to_string() };
+            let hg = paint::job(ui, paint::caps(&label, 11.0, t.ink3));
+            p.galley(pos2(x, y), hg, t.ink3);
+            let ng = paint::line(ui, &lanes[k].len().to_string(), theme::mono(11.0), t.ink3, 60.0);
+            p.galley(pos2(x + lw - ng.size().x, y), ng, t.ink3);
+            y += 24.0;
+            if let Some(g) = &caps[k] {
+                p.galley(pos2(x, y - 4.0), g.clone(), t.ink2);
+                y += cap_h + 8.0;
+            }
+            for (n, g, h) in &cards[k] {
+                let rect = Rect::from_min_size(pos2(x, y), vec2(lw, *h));
+                y += h + 8.0;
+                let w = n.work.as_ref().expect("work lane cards have work");
+                let key = format!("i:{}", n.id);
+                let you = w.waiting_on.as_deref() == Some(me);
+                let hit = Hit::new(ui, rect, Id::unique(("card", &n.id)), &format!("{} {}", n.id, n.summary));
+                let lit = hit.hot() || selected == Some(key.as_str());
+                if hit.hot() {
+                    *hover_now = Some(key.clone());
+                }
+                p.rect_filled(rect, 8.0, if lit { t.sunk } else { t.surface });
+                p.rect_stroke(rect, 8.0, Stroke::new(1.0, if lit { t.line2 } else { t.line }), StrokeKind::Inside);
+                if you {
+                    p.rect_filled(Rect::from_min_size(rect.min, vec2(3.0, rect.height())), CornerRadius { nw: 8, sw: 8, ne: 0, se: 0 }, t.accent);
+                }
+                p.galley(pos2(rect.left() + 10.0, rect.top() + 8.0), g.clone(), t.ink);
+                // Meta row: who it waits on (or its state), and when it last moved.
+                let my = rect.bottom() - 8.0 - 8.0;
+                let mark = Rect::from_min_size(pos2(rect.left() + 10.0, my - 5.0), vec2(10.0, 10.0));
+                let tg = paint::line(ui, &time_label(&n.last, day), theme::sans(11.5), t.ink3, 120.0);
+                let meta_c = if you { t.accent } else { t.ink3 };
+                let text = match (&w.waiting_on, w.lane.as_str()) {
+                    (Some(who), _) => {
+                        glyph::who(&p, mark, who, me, false, meta_c);
+                        if you { "waiting on you".to_string() } else { name_of(who, me) }
+                    }
+                    (None, "done") => {
+                        glyph::state(&p, mark, "pass", false, t.ink3, t.accent);
+                        "done".to_string()
+                    }
+                    (None, _) => {
+                        glyph::state(&p, mark, &n.state, false, t.ink3, t.accent);
+                        n.state.clone()
+                    }
+                };
+                let mg = paint::line(ui, &text, theme::sans(11.5), meta_c, inner - tg.size().x - 24.0);
+                p.galley(pos2(mark.right() + 5.0, my - mg.size().y / 2.0), mg, meta_c);
+                p.galley(pos2(rect.right() - 10.0 - tg.size().x, my - tg.size().y / 2.0), tg, t.ink3);
+                paint::focus_ring(&p, &hit.resp, t, 8.0);
+                app.anchors.insert(key, rect);
+                if !w.story.is_empty() {
+                    hit.resp.clone().on_hover_text(w.story.clone());
+                }
+                if hit.clicked() {
+                    open = Some(Open { panel: Panel::Pick(Pick::Item(n.id.clone())), from: rect, pointer: hit.pointer() });
+                }
+            }
+            if lanes[k].len() > cards[k].len() {
+                let g = paint::line(ui, &format!("+{} more in Everything", lanes[k].len() - cards[k].len()), theme::sans(12.0), t.ink3, lw);
+                p.galley(pos2(x + 2.0, y), g, t.ink3);
+            }
+        }
+    });
+    open
+}
+
+/// Items per Work lane, filtered by scope (old done and old asked items leave In flight) and
+/// sorted with cards waiting on `me` first, then newest. O(n log n).
+fn work_lanes<'a>(all: &'a [Node], me: &str, scope: Scope) -> Vec<Vec<&'a Node>> {
+    let newest = all.iter().map(|n| ms(&n.last)).max().unwrap_or(0);
+    let mut lanes: Vec<Vec<&Node>> = vec![Vec::new(); WORK_LANES.len()];
+    for n in all.iter().filter(|n| n.kind == "item") {
+        let Some(w) = &n.work else { continue };
+        let Some(k) = WORK_LANES.iter().position(|l| l.0 == w.lane) else { continue };
+        let age = newest - ms(&n.last);
+        if scope == Scope::Active && ((w.lane == "done" && age > DONE_HOURS * 3_600_000) || (w.lane == "asked" && age > ACTIVE_HOURS * 3_600_000)) {
+            continue;
+        }
+        lanes[k].push(n);
+    }
+    let mine = |n: &Node| n.work.as_ref().and_then(|w| w.waiting_on.as_deref()) == Some(me);
+    for l in &mut lanes {
+        l.sort_by(|a, b| mine(b).cmp(&mine(a)).then_with(|| b.last.cmp(&a.last)));
+    }
+    lanes
 }
 
 fn app_reduce(ctx: &egui::Context) -> bool {
@@ -412,7 +755,9 @@ fn app_reduce(ctx: &egui::Context) -> bool {
 
 /// Every recorded step of the visible work, one row per participant, on a shared time axis.
 /// The focused node's steps stand out, so you can see when its work happened. Returns its height.
-fn strip(ui: &mut egui::Ui, area: Rect, nodes: &[&Node], lit: &HashSet<String>, snap: &Snapshot, t: &Tokens, day: &str) -> f32 {
+/// `tall` is the Time lens: 40 px rows from the top of `area` instead of 14 px rows at its foot.
+#[allow(clippy::too_many_arguments)]
+fn strip(ui: &mut egui::Ui, area: Rect, nodes: &[&Node], lit: &HashSet<String>, snap: &Snapshot, t: &Tokens, day: &str, tall: bool, explain: bool) -> f32 {
     let me = snap.me.as_str();
     let rows = lanes(me);
     let lane_of = |who: &str| rows.iter().position(|r| r == who).unwrap_or(0);
@@ -429,25 +774,34 @@ fn strip(ui: &mut egui::Ui, area: Rect, nodes: &[&Node], lit: &HashSet<String>, 
     }
     let lo = ticks.iter().map(|k| k.0).min().unwrap_or(0);
     let hi = ticks.iter().map(|k| k.0).max().unwrap_or(0);
-    let h = 8.0 + rows.len() as f32 * 14.0 + 16.0 + 6.0;
-    let r = Rect::from_min_max(pos2(area.left(), area.bottom() - h), area.max);
+    let rh = if tall { 40.0 } else { 14.0 };
+    let note = explain.then(|| paint::line(ui, "Activity: one row per participant, one tick per recorded step. Hover or select a node to light its ticks.", italic(11.5), t.ink2, area.width() - 32.0));
+    let note_h = note.as_ref().map_or(0.0, |g| g.size().y + 6.0);
+    let h = 8.0 + note_h + rows.len() as f32 * rh + 16.0 + 6.0;
+    let r = if tall { Rect::from_min_size(area.min, vec2(area.width(), h)) } else { Rect::from_min_max(pos2(area.left(), area.bottom() - h), area.max) };
     let p = ui.painter();
     p.rect_filled(r, 0.0, t.bg);
-    p.line_segment([r.left_top(), r.right_top()], Stroke::new(1.0, t.line));
-    let plot = Rect::from_min_max(pos2(r.left() + 16.0 + 70.0 + 10.0, r.top() + 8.0), pos2(r.right() - 16.0, r.top() + 8.0 + rows.len() as f32 * 14.0));
+    if !tall {
+        p.line_segment([r.left_top(), r.right_top()], Stroke::new(1.0, t.line));
+    }
+    if let Some(g) = note {
+        p.galley(pos2(r.left() + 16.0, r.top() + 6.0), g, t.ink2);
+    }
+    let top = r.top() + 8.0 + note_h;
+    let plot = Rect::from_min_max(pos2(r.left() + 16.0 + 70.0 + 10.0, top), pos2(r.right() - 16.0, top + rows.len() as f32 * rh));
     for (i, who) in rows.iter().enumerate() {
-        let y = plot.top() + i as f32 * 14.0;
-        glyph::who(p, Rect::from_min_size(pos2(r.left() + 16.0, y + 2.0), vec2(10.0, 10.0)), who, me, false, t.ink3);
+        let y = plot.top() + i as f32 * rh;
+        glyph::who(p, Rect::from_min_size(pos2(r.left() + 16.0, y + rh / 2.0 - 5.0), vec2(10.0, 10.0)), who, me, false, t.ink3);
         let g = paint::line(ui, &name_of(who, me), theme::sans(11.0), t.ink3, 55.0);
-        p.galley(pos2(r.left() + 31.0, y + 7.0 - g.size().y / 2.0), g, t.ink3);
-        p.line_segment([pos2(plot.left(), y + 7.0), pos2(plot.right(), y + 7.0)], Stroke::new(1.0, t.line));
+        p.galley(pos2(r.left() + 31.0, y + rh / 2.0 - g.size().y / 2.0), g, t.ink3);
+        p.line_segment([pos2(plot.left(), y + rh / 2.0), pos2(plot.right(), y + rh / 2.0)], Stroke::new(1.0, t.line));
     }
     let x = |ms: i64| if hi == lo { plot.center().x } else { plot.left() + (ms - lo) as f32 / (hi - lo) as f32 * plot.width() };
     ticks.sort_by_key(|k| k.2);
     for (ms, row, on) in ticks {
         let xx = x(ms);
-        let y = plot.top() + row as f32 * 14.0;
-        p.line_segment([pos2(xx, y + 2.0), pos2(xx, y + 12.0)], Stroke::new(2.0, if on { t.ink } else { t.line2 }));
+        let y = plot.top() + row as f32 * rh;
+        p.line_segment([pos2(xx, y + 2.0), pos2(xx, y + rh - 2.0)], Stroke::new(2.0, if on { t.ink } else { t.line2 }));
     }
     let lg = paint::line(ui, &time_label(&iso(lo), day), theme::mono(10.0), t.ink3, 200.0);
     let hg = paint::line(ui, &time_label(&iso(hi), day), theme::mono(10.0), t.ink3, 200.0);
@@ -464,7 +818,7 @@ mod tests {
     fn columns_honour_minimums_and_fractions() {
         let [a, b, c] = columns(780.0);
         assert!((a + b + c - (780.0 - 2.0 * GAP)).abs() < 0.01);
-        assert!(a >= 230.0 && b >= 210.0 && c >= 170.0);
+        assert!(a >= MINS[0] && b >= MINS[1] && c >= MINS[2]);
         let [a, b, _] = columns(2000.0);
         assert!((a / b - 1.25).abs() < 0.01);
     }
