@@ -101,9 +101,18 @@ pub fn epoch_now() -> i64 {
 
 /// Combine a window reading, a limit stop, today's spend and the budget into one state.
 pub fn assess(reading: Option<&Reading>, stop: Option<&Stop>, spent: f64, budget: Option<f64>, now: i64) -> Usage {
-    // A window whose reset has passed is empty again, whatever the stale reading says.
+    // A window whose reset has passed is empty again, whatever the stale reading says. A full
+    // window that names no reset is trusted for COOLDOWN_MIN after it was read, no longer.
     let windows: Vec<Window> = reading
-        .map(|r| r.windows.iter().map(|w| if w.resets_epoch.is_some_and(|t| t <= now) { Window { used: 0.0, resets: None, resets_epoch: None, ..w.clone() } } else { w.clone() }).collect())
+        .map(|r| {
+            r.windows
+                .iter()
+                .map(|w| {
+                    let ends = w.resets_epoch.or_else(|| (w.used >= 100.0).then_some(r.observed + COOLDOWN_MIN * 60));
+                    if ends.is_some_and(|t| t <= now) { Window { used: 0.0, resets: None, resets_epoch: None, ..w.clone() } } else { Window { resets_epoch: ends, resets: ends.map(clock), ..w.clone() } }
+                })
+                .collect()
+        })
         .unwrap_or_default();
     let full = windows.iter().filter(|w| w.used >= 100.0).max_by_key(|w| w.resets_epoch.unwrap_or(i64::MAX));
     let high = windows.iter().filter(|w| w.used >= LOW_AT).max_by(|a, b| a.used.total_cmp(&b.used));
@@ -154,15 +163,20 @@ pub struct ClaudeCopy {
     pub rate_limits: serde_json::Value,
 }
 
-/// Read `rate_limits` from a status-line JSON object (the documented field names).
+/// Read `rate_limits` from a status-line JSON object (the documented field names): the
+/// subscription windows, and the spend limit a Claude apps gateway sets.
 pub fn claude_windows(rate_limits: &serde_json::Value) -> Vec<Window> {
-    [("five_hour", "5h"), ("seven_day", "7d")]
+    [("five_hour", "5h"), ("seven_day", "7d"), ("spend_limit", "spend")]
         .iter()
         .filter_map(|(key, label)| {
             let w = rate_limits.get(key)?;
             let used = w.get("used_percentage").and_then(serde_json::Value::as_f64)?;
             let resets_epoch = w.get("resets_at").and_then(epoch_of);
-            Some(Window { label: label.to_string(), used: used.clamp(0.0, 100.0), resets: resets_epoch.map(clock), resets_epoch })
+            let label = match w.get("period").and_then(serde_json::Value::as_str) {
+                Some(p) if *key == "spend_limit" => format!("{p} spend"),
+                _ => label.to_string(),
+            };
+            Some(Window { label, used: used.clamp(0.0, 100.0), resets: resets_epoch.map(clock), resets_epoch })
         })
         .collect()
 }
@@ -218,7 +232,11 @@ pub fn codex_reading(log: &Path) -> Option<Reading> {
 
 fn codex_line(line: &str) -> Option<Reading> {
     // Only event records whose payload is a token count; chat text is never parsed.
-    let head = &line[..line.len().min(256)];
+    let mut cut = line.len().min(256);
+    while !line.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let head = &line[..cut];
     if !head.contains("\"event_msg\"") || !head.contains("\"token_count\"") {
         return None;
     }
@@ -353,11 +371,18 @@ pub fn limit_stop(text: &str, now: DateTime<Local>) -> Option<Stop> {
 }
 
 /// "3:45pm", "3pm", "15:00", "3:45 pm", "mon 9am" -> the next such local time after `now`.
+/// "nov 25th, 2026 12:05 am" (how Codex names a reset on another day) -> that time.
 fn reset_time(s: &str, now: DateTime<Local>) -> Option<DateTime<Local>> {
     let mut words = s.split_whitespace();
     let mut w = words.next()?.trim_end_matches([',', '.', ')']);
     let day = w.parse::<chrono::Weekday>().ok();
+    let mut on: Option<chrono::NaiveDate> = None;
     if day.is_some() {
+        w = words.next()?.trim_end_matches([',', '.', ')']);
+    } else if let Ok(month) = w.parse::<chrono::Month>() {
+        let d = words.next()?.trim_end_matches(',').trim_end_matches(|c: char| c.is_ascii_alphabetic()).parse::<u32>().ok()?;
+        let y = words.next()?.trim_end_matches(',').parse::<i32>().ok()?;
+        on = Some(chrono::NaiveDate::from_ymd_opt(y, month.number_from_month(), d)?);
         w = words.next()?.trim_end_matches([',', '.', ')']);
     }
     let mut t = w.to_string();
@@ -386,6 +411,9 @@ fn reset_time(s: &str, now: DateTime<Local>) -> Option<DateTime<Local>> {
         _ => h,
     };
     let time = NaiveTime::from_hms_opt(h, m, 0)?;
+    if let Some(date) = on {
+        return Local.from_local_datetime(&date.and_time(time)).earliest();
+    }
     let mut date = now.date_naive();
     if let Some(d) = day {
         while date.weekday() != d {
@@ -416,6 +444,11 @@ mod tests {
         assert_eq!(clock(s.until), "2026-11-25T09:05", "already past today: tomorrow");
         let s = limit_stop("You've hit your weekly limit \u{b7} resets Mon 9am", now).unwrap();
         assert_eq!(clock(s.until), "2026-11-30T09:00");
+        let late = Local.with_ymd_and_hms(2026, 11, 24, 23, 58, 0).single().unwrap();
+        let s = limit_stop("You\u{2019}ve hit your usage limit. Upgrade to Pro, or try again at Nov 25th, 2026 12:05 AM.", late).unwrap();
+        assert_eq!(clock(s.until), "2026-11-25T00:05", "a reset on another day names its date");
+        let s = limit_stop("You\u{2019}ve hit your usage limit. Try again at Dec 1st, 2026 9:30 AM.", now).unwrap();
+        assert_eq!(clock(s.until), "2026-12-01T09:30");
         let s = limit_stop("stream error: usage limit exceeded", now).unwrap();
         assert_eq!(s.until, now.timestamp() + 3600, "no time named: a cooldown");
         assert!(s.reason.contains("retry in 60 min"));
@@ -435,6 +468,9 @@ mod tests {
         assert_eq!(assess(Some(&r(100.0, now - 60)), None, 0.0, None, now).state, "ok", "the window has reset since the reading");
         let stop = Stop { until: now + 600, reason: "session limit".into() };
         assert_eq!(assess(None, Some(&stop), 0.0, None, now).why(), "out until 13:10 (session limit)");
+        let no_reset = Reading { windows: vec![Window { label: "5h".into(), used: 100.0, resets: None, resets_epoch: None }], observed: now - 60, source: "Claude status line" };
+        assert_eq!(assess(Some(&no_reset), None, 0.0, None, now).state, "out");
+        assert_eq!(assess(Some(&no_reset), None, 0.0, None, now + 3600).state, "ok", "a full window with no reset expires");
         let broke = assess(None, None, 5.2, Some(5.0), now);
         assert_eq!((broke.state, broke.until.as_deref()), ("out", Some("2026-11-25T00:00")));
     }
@@ -446,6 +482,9 @@ mod tests {
         assert_eq!(w.iter().map(|w| (w.label.as_str(), w.used)).collect::<Vec<_>>(), vec![("5h", 42.5), ("7d", 18.0)]);
         assert_eq!(w[0].resets_epoch, Some(DateTime::parse_from_rfc3339("2026-11-24T15:00:00Z").unwrap().timestamp()));
         assert_eq!(w[1].resets_epoch, Some(1_795_600_000));
+        let gateway = serde_json::json!({ "spend_limit": { "used_percentage": 104.0, "resets_at": 1795600000, "period": "monthly" } });
+        let w = claude_windows(&gateway);
+        assert_eq!((w[0].label.as_str(), w[0].used), ("monthly spend", 100.0), "a gateway spend limit is a window too");
     }
 
     #[test]
@@ -456,7 +495,9 @@ mod tests {
         std::fs::create_dir_all(&day).unwrap();
         let log = day.join("rollout-2026-11-24T12-00-00-abc.jsonl");
         let chat = r#"{"type":"response_item","payload":{"text":"\"token_count\" in a message"}}"#;
-        std::fs::write(&log, format!("{}\n{}\n{chat}\n", line(30.0), line(55.0))).unwrap();
+        // A multibyte character across byte 256 of a line must not stop the read.
+        let wide = format!(r#"{{"type":"response_item","payload":{{"text":"{}"}}}}"#, "\u{e9}".repeat(200));
+        std::fs::write(&log, format!("{}\n{}\n{chat}\n{wide}\n", line(30.0), line(55.0))).unwrap();
         assert_eq!(codex_latest_log(&dir).as_deref(), Some(log.as_path()));
         let r = codex_reading(&log).unwrap();
         assert_eq!(r.windows.iter().map(|w| (w.label.as_str(), w.used)).collect::<Vec<_>>(), vec![("5h", 55.0), ("7d", 12.0)]);
