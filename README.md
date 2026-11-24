@@ -28,15 +28,29 @@ cargo build --release --workspace
 ## Start a room
 
 ```sh
-trio init path/to/project    # writes path/to/project/.trio/room.toml
-trio open path/to/project    # serves the room and opens its window
+trio open path/to/project                 # any folder: makes it a room, serves it, opens its window
+trio link path/to/project ../api          # the project spans another repo
+trio link path/to/project owner/name      # pull requests of a GitHub repo, read with your gh login
 ```
 
-`trio open` starts the local server and opens `trio-app`, a native window drawn on the GPU. `--web` opens the same room in your browser instead, and `trio-app path/to/project` reopens the window later, starting the server if none is running.
+`trio open` on a folder without a room writes `.trio/room.toml` first. It brings along what is already there:
+- the git repo the folder is in, so its branches show as work;
+- every `<who>-posts.md` thread, read-only;
+- the repo's GitHub pull requests, when `gh` is signed in.
+
+`trio init` does the same without opening. `trio open` then starts the local server and opens `trio-app`, a native window drawn on the GPU. `--web` opens the same room in your browser instead. `trio-app path/to/project` reopens the window later, and starts the server if none is running.
+
+The room title lists every room you have, with what waits on you in each. Pick one to open it.
 
 Then type `trio` as the whole message in a Claude Code or Codex session under that folder.
 
-The room has two views. **Chat** shows each line in a lane for you, Claude or Codex, with a hollow mark in the lane of anyone it mentions. **Map** shows work items, the `claude/*` and `codex/*` branches that implement them, and the directories each branch changes since it left `base`. A directory that two or more open branches change is marked as a hot spot. Set `repo` (and `base`, if it is not `main` or `master`) in `room.toml` to fill in the branches.
+The room has two views.
+- **Chat** shows each line in a lane for you, Claude or Codex, with a hollow mark in the lane of anyone it mentions.
+- **Map** opens on **Work**: every piece of work in five stages, from asked to done, with whoever it waits on. A piece of work is an item a message names (`P1`, `XF29`, or your own ids via `item_prefixes`), or a branch or pull request no item names. Its card is titled in words; the id is a small tag. **Code** shows branches and the directories each one changes since it left `base`, with a hot spot where two open branches meet. **Time** shows when the work happened.
+
+Come back after working elsewhere, and a strip at the top says what moved since you last looked.
+
+Every agent is ok, low or out of its usage limits or daily budget. A message for an agent that is out goes to the other one, with a handoff note. A review of an agent's own work waits for the other agent instead. Claude's limits come from its status line: set Claude Code's `statusLine` command to `trio statusline`, or `trio statusline -- "<your command>"` to keep your own. Codex's limits come from its session logs.
 
 Keys: `/` message, `c` chat, `g` map, `Esc` close.
 
@@ -74,9 +88,14 @@ The hook answers these locally; the model is not called. Any other message that 
 
 | File | Holds | Commit it? |
 |---|---|---|
-| `.trio/room.toml` | your handle, hop budget, agent bindings, and `repo` / `base` for the map | your choice |
+| `.trio/room.toml` | your handle, hop budget, agent bindings, repos, GitHub links, budgets, item prefixes ([reference](docs/extending.md#roomtoml)) | your choice |
+| `.trio/seen.json` | where you last looked, for the catch-up | no |
 | `.trio/room.jsonl` | the chat, one JSON line per event | your choice |
 | `.trio/attached/`, `.trio/server.json` | which sessions are attached; the running server's port | no |
+
+## Building on Trio
+
+Trio is a handful of small parts joined by one event format. A new integration (GitLab, Linear, a CI) is one module that turns what it reads into events. [docs/extending.md](docs/extending.md) shows how.
 
 ## License
 
