@@ -40,6 +40,10 @@ pub struct RoomCfg {
     /// Branch that work merges into (default: `main`, else `master`).
     #[serde(default)]
     pub base: Option<String>,
+    /// More repos the project spans: `[[repos]] path = "../api"` (name defaults to the folder).
+    /// With more than one repo, branches show as `<name>:<branch>`.
+    #[serde(default)]
+    pub repos: Vec<RepoCfg>,
     #[serde(default)]
     pub agents: HashMap<String, AgentConfig>,
     /// Daily spend caps in dollars: `[budget] claude_usd_day = 5.0`, `codex_usd_day = 3.0`.
@@ -96,6 +100,43 @@ pub struct Import {
     pub from: String,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct RepoCfg {
+    pub path: PathBuf,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub base: Option<String>,
+}
+
+/// One watched repo: its label (None when the room has only one) and its watcher.
+struct GitSource {
+    label: Option<String>,
+    watch: crate::gitwatch::GitWatch,
+}
+
+/// Every repo a room watches, labelled when there is more than one: `repo` (or the work tree
+/// the room sits in), then `[[repos]]`. A repo listed twice is watched once.
+pub fn repos_of(cfg: &RoomCfg, root: &Path) -> Vec<(Option<String>, PathBuf, Option<String>)> {
+    let first = match &cfg.repo {
+        Some(r) if r.as_os_str().is_empty() => None,
+        Some(r) => Some(root.join(r)),
+        None if cfg.repos.is_empty() => git_root(root),
+        None => None,
+    };
+    let mut all: Vec<(String, PathBuf, Option<String>)> = Vec::new();
+    for (name, path, base) in first.map(|p| (String::new(), p, cfg.base.clone())).into_iter().chain(cfg.repos.iter().map(|r| (r.name.clone(), root.join(&r.path), r.base.clone()))) {
+        let key = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if all.iter().any(|(_, p, _)| p.canonicalize().unwrap_or_else(|_| p.clone()) == key) {
+            continue;
+        }
+        let name = if name.is_empty() { path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "repo".into()) } else { name };
+        all.push((name, path, base));
+    }
+    let many = all.len() > 1;
+    all.into_iter().map(|(name, path, base)| (many.then_some(name), path, base)).collect()
+}
+
 #[derive(Default)]
 struct Window {
     rows: Vec<(u64, Event)>,
@@ -147,7 +188,7 @@ pub struct Room {
     hop: u32,
     live: bool,
     /// Branch tips for the map, read off the room lock (None without `repo`).
-    git: Option<crate::gitwatch::GitWatch>,
+    git: Vec<GitSource>,
     git_seeded: bool,
     /// Failed writes stay in order for the next tick.
     pending_git: VecDeque<Event>,
@@ -208,12 +249,10 @@ impl Room {
             })
             .collect();
         let trio_exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "trio".into());
-        let repo = match &cfg.repo {
-            Some(r) if r.as_os_str().is_empty() => None,
-            Some(r) => Some(root.join(r)),
-            None => git_root(&root),
-        };
-        let git = repo.map(|r| crate::gitwatch::GitWatch::start(r, cfg.base.clone()));
+        let git = repos_of(&cfg, &root)
+            .into_iter()
+            .map(|(label, path, base)| GitSource { watch: crate::gitwatch::GitWatch::start(path, base, label.clone()), label })
+            .collect();
         let restored = crate::seen::load(&root);
         Ok(Self {
             root,
@@ -369,13 +408,23 @@ impl Room {
         } else {
             changed = self.apply_batch(fresh);
         }
-        let seed = (self.git.is_some() && !self.git_seeded).then(|| crate::gitwatch::Seed {
-            serials: self.graph.git_serials.clone(),
-            tips: self.graph.items.values().filter(|b| !b.tip_sha.is_empty())
-                .map(|b| (b.id.clone(), b.tip_sha.clone(), b.title.clone(), self.graph.merged.contains(&b.id))).collect(),
-        });
-        self.git_seeded |= seed.is_some();
-        let polls = self.git.as_mut().map(|g| g.take(seed)).unwrap_or_default();
+        // Each watcher is seeded once with the branches replay already knows under its label.
+        let seeded = self.git_seeded;
+        self.git_seeded = true;
+        let mut polls = Vec::new();
+        for s in &mut self.git {
+            let mine = |id: &str| match (&s.label, id.rsplit_once(':')) {
+                (Some(l), Some((p, _))) => p == l,
+                (None, None) => true,
+                _ => false,
+            };
+            let seed = (!seeded).then(|| crate::gitwatch::Seed {
+                serials: self.graph.git_serials.iter().filter(|(b, _)| mine(b)).map(|(b, n)| (b.clone(), *n)).collect(),
+                tips: self.graph.items.values().filter(|b| !b.tip_sha.is_empty() && mine(&b.id))
+                    .map(|b| (b.id.clone(), b.tip_sha.clone(), b.title.clone(), self.graph.merged.contains(&b.id))).collect(),
+            });
+            polls.extend(s.watch.take(seed));
+        }
         for p in polls {
             changed |= self.apply_git_poll(p);
         }
@@ -975,11 +1024,46 @@ mod tests {
     }
 
     fn poll_git(room: &mut Room) -> Vec<Event> {
-        let poll = room.git.as_mut().unwrap().wait(Duration::from_secs(20)).unwrap();
+        let poll = room.git[0].watch.wait(Duration::from_secs(20)).unwrap();
         let durable = poll.durable.clone();
         room.apply_git_poll(poll);
         room.tick();
         durable
+    }
+
+    #[test]
+    fn a_room_over_two_repos_labels_their_branches() {
+        let api = git_room("repo-api");
+        let web = git_room("repo-web");
+        for (r, subject) in [(&api, "XF1 endpoint"), (&web, "Login form")] {
+            git(r, &["checkout", "-qb", "feature/login"]);
+            git(r, &["commit", "--allow-empty", "-qm", subject]);
+        }
+        let room = temp_room("two-repos");
+        let path = |p: &Path| toml::Value::String(p.display().to_string());
+        std::fs::write(room.join(".trio/room.toml"), format!(
+            "me = 'sanjith'\nrepo = ''\n[[repos]]\npath = {}\nname = 'api'\n[[repos]]\npath = {}\nname = 'web'\n[[repos]]\npath = {}\n",
+            path(&api), path(&web), path(&web),
+        )).unwrap();
+        let mut r = Room::open(&room).unwrap();
+        assert_eq!(r.git.iter().map(|s| s.label.clone().unwrap()).collect::<Vec<_>>(), ["api", "web"], "the same repo twice is watched once");
+        r.tick();
+        for i in 0..2 {
+            let poll = r.git[i].watch.wait(Duration::from_secs(20)).unwrap();
+            r.apply_git_poll(poll);
+        }
+        r.tick();
+        let work = crate::work::all(&r.graph, &r.me());
+        assert_eq!(r.graph.items["web:feature/login"].title, "Login form");
+        assert!(work.contains_key("web:feature/login"), "an unlinked branch is its own card");
+        assert!(!work.contains_key("api:feature/login"), "it implements XF1");
+        assert_eq!(work["XF1"].lane, "progress");
+        assert_eq!(r.graph.items["api:feature/login"].owner, "sanjith", "a branch without an agent prefix is the person's");
+        // A single repo keeps plain names.
+        assert_eq!(repos_of(&toml::from_str(&format!("repo = {}", path(&api))).unwrap(), &room)[0].0, None);
+        for d in [api, web, room] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 
     fn ledger_rows(room: &Room) -> Vec<Event> {

@@ -105,6 +105,13 @@ const COMPONENT_DEPTH: usize = 3;
 /// The component a changed path belongs to: its directory, cut to `COMPONENT_DEPTH` levels, or
 /// `(root)` for top-level files. Rename notation from `git diff --numstat` (`a/{x => y}/z`,
 /// `x => y`) resolves to the new path.
+/// The owner prefix of a branch name, past any repo label: `claude/x` and `api:claude/x` -> `claude`.
+/// Git refuses `:` in ref names, so the label separator is unambiguous.
+pub fn branch_prefix(name: &str) -> &str {
+    let bare = name.rsplit_once(':').map_or(name, |(_, b)| b);
+    bare.split('/').next().unwrap_or("")
+}
+
 pub fn component_of(path: &str) -> String {
     let path = match (path.find('{'), path.find('}')) {
         (Some(o), Some(c)) if o < c => {

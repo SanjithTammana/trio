@@ -746,7 +746,7 @@ impl Deriver for BranchDeriver {
             g.merged.remove(branch);
             g.touches.insert(branch.clone(), touches.clone());
         }
-        let owner = branch.split('/').next().unwrap_or("").to_string();
+        let owner = Some(crate::model::branch_prefix(branch)).filter(|p| ["claude", "codex"].contains(p)).map_or_else(|| e.from.clone(), str::to_string);
         let seq = g.seq;
         let it = g.item(branch, &e.at, &owner);
         it.tip_sha.clone_from(sha);

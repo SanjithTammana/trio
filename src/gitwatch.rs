@@ -40,11 +40,13 @@ pub struct GitWatch {
 
 impl GitWatch {
     /// Start the worker. It ends when the watch (and so the request channel) is dropped.
-    pub fn start(repo: PathBuf, base: Option<String>) -> Self {
+    /// With a `label`, branches are named `<label>:<branch>`, so several repos share one graph.
+    pub fn start(repo: PathBuf, base: Option<String>, label: Option<String>) -> Self {
         let (req, req_rx) = mpsc::channel::<Option<Seed>>();
         let (res_tx, res) = mpsc::channel();
         let _ = std::thread::Builder::new().name("trio-git".into()).spawn(move || {
             let mut tips = Tips::new(repo, base);
+            tips.label = label;
             while let Ok(seed) = req_rx.recv() {
                 if let Some(seed) = seed {
                     tips.restore(seed);
@@ -93,6 +95,8 @@ pub struct Tips {
     /// What each branch looked like when it was last emitted.
     seen: HashMap<String, Tip>,
     serials: HashMap<String, u64>,
+    /// Prefix for branch names when the room watches several repos.
+    label: Option<String>,
 }
 
 #[derive(Clone)]
@@ -106,7 +110,7 @@ struct Tip {
 
 impl Tips {
     pub fn new(repo: PathBuf, base: Option<String>) -> Self {
-        Self { repo, configured_base: base, base: None, seen: HashMap::new(), serials: HashMap::new() }
+        Self { repo, configured_base: base, base: None, seen: HashMap::new(), serials: HashMap::new(), label: None }
     }
 
     fn restore(&mut self, seed: Seed) {
@@ -140,7 +144,10 @@ impl Tips {
                 continue;
             }
             let subject = p.next().unwrap_or("");
-            listed.insert(branch);
+            // Git runs on the ref's own name; the graph sees the labelled one.
+            let name = self.label.as_deref().map(|l| format!("{l}:{branch}"));
+            let branch = name.as_deref().unwrap_or(branch);
+            listed.insert(branch.to_string());
             let key = format!("{sha}:{base_tip}");
             let mut was = self.seen.get(branch).cloned();
             if was.as_ref().is_some_and(|w| w.key == key) {
@@ -199,7 +206,7 @@ impl Tips {
 /// The agent a branch belongs to by its prefix; any other branch is the person's (`""`, which
 /// the room fills in with its human).
 fn owner(branch: &str) -> String {
-    branch.split('/').next().filter(|o| ["claude", "codex"].contains(o)).unwrap_or("").to_string()
+    Some(crate::model::branch_prefix(branch)).filter(|o| ["claude", "codex"].contains(o)).unwrap_or("").to_string()
 }
 
 fn action(e: &Event) -> Option<&str> {
@@ -393,7 +400,7 @@ mod tests {
     fn the_watch_polls_off_thread() {
         let r = Repo::new();
         r.run(&["branch", "claude/a"]);
-        let mut w = GitWatch::start(r.0.clone(), None);
+        let mut w = GitWatch::start(r.0.clone(), None, None);
         assert_eq!(summary(w.wait(Duration::from_secs(20))), vec![("claude/a".into(), true, false)]);
         assert!(w.take(None).is_empty(), "the next poll is not due for 30 s");
     }

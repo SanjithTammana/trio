@@ -112,7 +112,7 @@ fn branch_work(b: &WorkItem, me: &str) -> Work {
 
 /// The agent a branch belongs to, from its prefix (`claude/hooks-p0a` -> claude).
 fn agent_of(node: &str) -> Option<String> {
-    node.split_once('/').map(|(o, _)| o).filter(|o| AGENTS.contains(o)).map(str::to_string)
+    node.contains('/').then(|| crate::model::branch_prefix(node)).filter(|o| AGENTS.contains(o)).map(str::to_string)
 }
 
 /// Who wrote item `id`, by the same rule as the Work lens.
