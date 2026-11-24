@@ -82,6 +82,10 @@ impl Budget {
 struct Held {
     agent: String,
     event: Event,
+    /// The handoff note of a rerouted message ("this was for Claude, who is out..."), so the
+    /// wake that finally goes out still says why the agent is taking it.
+    #[serde(default)]
+    handoff: Vec<String>,
 }
 
 fn held_path(root: &Path) -> PathBuf {
@@ -630,6 +634,15 @@ impl Room {
         fresh.ingest();
         if cut {
             fresh.route_from = fresh.ledger_read;
+            for h in &mut fresh.held {
+                h.event.id = format!("{}@cut{}", h.event.id, self.rev);
+            }
+            fresh.save_held();
+            fresh.delivered.clear();
+            fresh.delivered_order.clear();
+            for h in fresh.held.clone() {
+                fresh.deliver(&h.event.id, &h.agent);
+            }
         }
         fresh.rev = self.rev + 1;
         *self = fresh;
@@ -900,7 +913,7 @@ impl Room {
         let me = self.me();
         if e.from == me {
             self.hop = 0;
-        } else {
+        } else if !e.id.starts_with("gh:") {
             self.hop += 1;
         }
         let mut targets: Vec<String> = mentions.iter().filter(|m| m.as_str() != "both" && m.as_str() != me).cloned().collect();
@@ -980,10 +993,10 @@ impl Room {
                 self.record("trio", Body::Status { text: clip(&format!("{t} is low ({}); woken anyway", u.reason.as_deref().unwrap_or("")), 120) });
             }
             let d = self.wake(t, e, recent, detail, &[]);
-            self.queue_if_busy(t, e, &d);
+            self.queue_if_busy(t, e, &d, &[]);
             return;
         }
-        let other = other_agent(t).filter(|o| self.agents.get(*o).is_some_and(|a| a.cfg.enabled) && !self.usage(o).out());
+        let other = other_agent(t).filter(|o| *o != e.from && self.agents.get(*o).is_some_and(|a| a.cfg.enabled) && !self.usage(o).out());
         match other {
             Some(o) if self.has(&e.id, o) => {
                 self.record("trio", Body::Status { text: clip(&format!("{t} is {}; {} already has this", u.why(), cap(o)), 120) });
@@ -992,17 +1005,17 @@ impl Room {
                 self.record("trio", Body::Status { text: clip(&format!("routed to {}: {} is {}", cap(o), cap(t), u.why()), 120) });
                 let note = self.handoff(t, &u, e);
                 let d = self.wake(o, e, recent, detail, &note);
-                if !self.queue_if_busy(o, e, &d) && !matches!(d, WakeDecision::Started | WakeDecision::Paused) {
-                    self.hold(t, e);
+                if !self.queue_if_busy(o, e, &d, &note) && matches!(d, WakeDecision::Failed(_)) {
+                    self.hold(t, e, &[]);
                     self.record("trio", Body::Status { text: clip(&format!("held for {}: {} could not take it", cap(t), cap(o)), 120) });
                 }
             }
             Some(o) => {
-                self.hold(t, e);
+                self.hold(t, e, &[]);
                 self.record("trio", Body::Status { text: clip(&format!("held for {}: {} wrote it, so its review waits until {} is back ({})", cap(t), cap(o), cap(t), u.why()), 120) });
             }
             None => {
-                self.hold(t, e);
+                self.hold(t, e, &[]);
                 self.record("trio", Body::Status { text: clip(&format!("held for {}: {} is {}", cap(t), cap(t), u.why()), 120) });
             }
         }
@@ -1034,24 +1047,51 @@ impl Room {
 
     /// A wake that found `t` mid-run (or its own session busy) waits for that to end. True when
     /// it was queued.
-    fn queue_if_busy(&mut self, t: &str, e: &Event, d: &WakeDecision) -> bool {
+    fn queue_if_busy(&mut self, t: &str, e: &Event, d: &WakeDecision, handoff: &[String]) -> bool {
         if !matches!(d, WakeDecision::Running | WakeDecision::Busy) {
             return false;
         }
-        self.hold(t, e);
+        self.hold(t, e, handoff);
         self.record("trio", Body::Status { text: format!("held for {} until its current run ends", cap(t)) });
         true
     }
 
-    fn hold(&mut self, t: &str, e: &Event) {
+    fn hold(&mut self, t: &str, e: &Event, handoff: &[String]) {
         self.deliver(&e.id, t);
         if !self.held.iter().any(|h| h.agent == t && h.event.id == e.id) {
-            self.held.push(Held { agent: t.to_string(), event: e.clone() });
+            self.held.push(Held { agent: t.to_string(), event: e.clone(), handoff: handoff.to_vec() });
             if self.held.len() > HELD_MAX {
-                self.held.remove(0);
+                let old = self.held.remove(0);
+                self.undeliver(&old.event.id, &old.agent);
+                self.record("trio", Body::Status { text: format!("dropped the oldest held message for {}: the queue is full", cap(&old.agent)) });
             }
             self.save_held();
         }
+    }
+
+    /// A held wake whose agent is out goes to the other agent once that one can take it, by the
+    /// same rules as a live reroute. True when it went out.
+    fn reroute_held(&mut self, i: usize) -> bool {
+        let h = self.held[i].clone();
+        let me = self.me();
+        let over = h.event.from != me && self.hop > self.cfg.hop_budget;
+        let Some(o) = other_agent(&h.agent).filter(|o| {
+            *o != h.event.from && !over && self.agents.get(*o).is_some_and(|a| a.ready()) && !self.usage(o).out() && !self.has(&h.event.id, o) && !self.reviews_own_work(&h.event, o)
+        }) else {
+            return false;
+        };
+        let u = self.usage(&h.agent);
+        self.record("trio", Body::Status { text: clip(&format!("routed to {}: {} is {}", cap(o), cap(&h.agent), u.why()), 120) });
+        let note = self.handoff(&h.agent, &u, &h.event);
+        let recent = self.recent();
+        let detail = h.event.detail().map(str::to_string);
+        if !matches!(self.wake(o, &h.event, &recent, detail.as_deref(), &note), WakeDecision::Started) {
+            return false;
+        }
+        self.undeliver(&h.event.id, &h.agent);
+        self.held.retain(|x| !(x.agent == h.agent && x.event.id == h.event.id));
+        self.save_held();
+        true
     }
 
     /// Held wakes outlive a restart: write them through on every change.
@@ -1095,14 +1135,18 @@ impl Room {
                 changed = true;
                 continue;
             }
-            if self.usage(agent).out() || !self.agents.get(agent).is_some_and(|a| a.ready()) {
+            if self.usage(agent).out() {
+                changed |= self.reroute_held(i);
+                continue;
+            }
+            if !self.agents.get(agent).is_some_and(|a| a.ready()) {
                 continue;
             }
             let h = self.held[i].clone();
             let recent: Vec<String> = self.recent();
             self.record("trio", Body::Status { text: format!("{} is back: waking it for the held message", cap(&h.agent)) });
             let detail = h.event.detail().map(str::to_string);
-            let decision = self.wake(&h.agent, &h.event, &recent, detail.as_deref(), &[]);
+            let decision = self.wake(&h.agent, &h.event, &recent, detail.as_deref(), &h.handoff);
             if matches!(decision, WakeDecision::Running | WakeDecision::Busy | WakeDecision::Paused) {
                 continue;
             }
@@ -1781,8 +1825,10 @@ mod tests {
     async fn a_ledger_cut_while_open_replays_without_waking_anyone() {
         let (root, mut room) = room_with("cut-live", &[("codex", "On it.", 0)]);
         room.tick();
-        room.say(&room.me(), "just a note about XF1", None).unwrap();
+        room.say(&room.me(), "@codex XF1", None).unwrap();
         room.tick();
+        settle(&mut room).await;
+        assert!(!room.delivered.is_empty());
         let ledger = root.join(".trio/room.jsonl");
         std::fs::write(&ledger, "").unwrap();
         append(&ledger, &message("", "2026-11-23T09:00", "sanjith", "@codex XF2")).unwrap();
@@ -1792,7 +1838,8 @@ mod tests {
         assert!(!room.any_running(), "rows in a replaced ledger are not routed");
         let text = std::fs::read_to_string(&ledger).unwrap();
         assert!(text.contains("cut or replaced"), "{text}");
-        // A message written after the replay routes as usual, though its offset id was used before.
+        assert!(room.delivered.is_empty(), "the old file's delivery record does not carry over: its ids are reused");
+        // A message written after the replay routes as usual.
         room.say(&room.me(), "@codex XF3", None).unwrap();
         room.tick();
         assert!(room.any_running(), "rows after the cut are routed");
@@ -1815,12 +1862,48 @@ mod tests {
         room.say(&room.me(), "@claude look at XF2", None).unwrap();
         room.tick();
         assert_eq!(room.held_for("codex"), 1, "Codex is mid-run: the rerouted message waits for it");
+        assert!(room.held[0].handoff.iter().any(|l| l.contains("You are taking it instead")), "the note waits with it");
         settle(&mut room).await;
         room.tick();
         settle(&mut room).await;
         assert_eq!(room.held_for("codex"), 0);
         let ledger = std::fs::read_to_string(root.join(".trio").join("room.jsonl")).unwrap();
         assert_eq!(ledger.matches("\"agent\":\"codex\",\"hop\"").count(), 2, "{ledger}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_reroute_over_the_hop_budget_is_dropped_not_held() {
+        let (root, mut room) = room_with("reroute-budget", &[("claude", "Done.", 0), ("codex", "On it.", 0)]);
+        room.tick();
+        room.stops.insert("claude".into(), stop());
+        room.hop = 9;
+        append(&room.ledger, &message("", "2026-11-24T09:00", "bo", "@claude look at XF1")).unwrap();
+        room.tick();
+        assert_eq!((room.held_for("claude"), room.held_for("codex")), (0, 0), "the hop budget stops it, as it would with nobody out");
+        assert!(!room.any_running());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_message_queued_behind_a_run_goes_to_the_other_agent_if_its_agent_runs_out() {
+        #[cfg(windows)]
+        let slow = "Done.& ping -n 3 127.0.0.1 >nul";
+        #[cfg(unix)]
+        let slow = "Done.'; sleep 2; echo '";
+        let (root, mut room) = room_with("queued-out", &[("claude", slow, 0), ("codex", "On it.", 0)]);
+        room.tick();
+        room.say(&room.me(), "@claude look at XF1", None).unwrap();
+        room.tick();
+        assert!(room.any_running());
+        room.say(&room.me(), "@claude and XF2", None).unwrap();
+        room.tick();
+        assert_eq!(room.held_for("claude"), 1, "queued behind Claude's run");
+        room.stops.insert("claude".into(), stop());
+        settle(&mut room).await;
+        assert_eq!(room.held_for("claude"), 0);
+        let ledger = std::fs::read_to_string(root.join(".trio").join("room.jsonl")).unwrap();
+        assert_eq!(ledger.matches("\"agent\":\"codex\",\"hop\"").count(), 1, "{ledger}");
         let _ = std::fs::remove_dir_all(root);
     }
 
