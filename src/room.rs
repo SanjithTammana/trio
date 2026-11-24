@@ -4,7 +4,7 @@
 //! - tick: one `stat` per source, O(sources); bytes read only when a file grew, O(delta).
 //! - apply: O(1) amortized per event (hash index into the window; the window is trimmed in
 //!   batches, so the O(n) re-index runs once per `WINDOW / 4` events).
-//! - memory: at most `WINDOW * 1.25` events plus the graph, O(V + E) with capped step lists.
+//! - memory: two independent windows of at most `WINDOW * 1.25` events, plus the graph.
 
 use crate::agent::{wake_prompt, Agent, AgentConfig, CliAgent, Guard, WakeDecision};
 use crate::graph::{derivers, Deriver, Graph};
@@ -12,7 +12,7 @@ use crate::model::{clip, split_reply, Body, Event, Summarized, SUMMARY_MAX};
 use crate::source::{append, mentions_in, PostsFile, RoomLedger, Source};
 use crate::work::cap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -95,13 +95,47 @@ pub struct Import {
     pub from: String,
 }
 
+#[derive(Default)]
+struct Window {
+    rows: Vec<(u64, Event)>,
+    index: HashMap<String, usize>,
+    dropped: u64,
+}
+
+impl Window {
+    fn get(&self, id: &str) -> Option<&Event> {
+        self.index.get(id).map(|&i| &self.rows[i].1)
+    }
+
+    fn push(&mut self, e: Event, arrival: u64) {
+        if let Some(&i) = self.index.get(&e.id) {
+            self.rows[i] = (arrival, e);
+            return;
+        }
+        self.index.insert(e.id.clone(), self.rows.len());
+        self.rows.push((arrival, e));
+        if self.rows.len() > WINDOW + WINDOW / 4 {
+            let cut = self.rows.len() - WINDOW;
+            for (arrival, _) in self.rows.drain(..cut) {
+                self.dropped = self.dropped.max(arrival);
+            }
+            self.index = self.rows.iter().enumerate().map(|(i, (_, e))| (e.id.clone(), i)).collect();
+        }
+    }
+
+    fn events(&self) -> impl DoubleEndedIterator<Item = &Event> {
+        self.rows.iter().map(|(_, e)| e)
+    }
+}
+
 pub struct Room {
     pub root: PathBuf,
     pub ledger: PathBuf,
     pub cfg: RoomCfg,
     sources: Vec<Box<dyn Source + Send>>,
-    events: Vec<Event>,
-    index: HashMap<String, usize>,
+    chat: Window,
+    git_events: Window,
+    arrival: u64,
     pub graph: Graph,
     derivers: Vec<Box<dyn Deriver>>,
     pub rev: u64,
@@ -113,9 +147,10 @@ pub struct Room {
     live: bool,
     /// Branch tips for the map, read off the room lock (None without `repo`).
     git: Option<crate::gitwatch::GitWatch>,
-    /// The first git listing was compared with the replayed ledger.
-    git_listed: bool,
-    /// Per source (then git): how many events it has yielded, for stable positions.
+    git_seeded: bool,
+    /// Failed writes stay in order for the next tick.
+    pending_git: VecDeque<Event>,
+    /// Per source: how many ids it has yielded, for stable positions.
     counts: Vec<u64>,
     trio_exe: String,
     /// When the human was last here, for the catch-up (`seen.rs`).
@@ -171,14 +206,14 @@ impl Room {
             .collect();
         let trio_exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "trio".into());
         let git = cfg.repo.clone().map(|r| crate::gitwatch::GitWatch::start(r, cfg.base.clone()));
-        let seen = crate::seen::load(&root);
         Ok(Self {
             root,
             ledger,
             cfg,
             sources,
-            events: Vec::new(),
-            index: HashMap::new(),
+            chat: Window::default(),
+            git_events: Window::default(),
+            arrival: 0,
             graph: Graph::default(),
             derivers: derivers(),
             rev: 0,
@@ -188,10 +223,11 @@ impl Room {
             hop: 0,
             live: false,
             git,
-            git_listed: false,
+            git_seeded: false,
+            pending_git: VecDeque::new(),
             counts: Vec::new(),
             trio_exe,
-            seen,
+            seen: None,
             readings: HashMap::new(),
             read_at: None,
             stops: HashMap::new(),
@@ -200,18 +236,27 @@ impl Room {
         })
     }
 
-    pub fn events(&self) -> &[Event] {
-        &self.events
+    fn activity(&self) -> impl Iterator<Item = &(u64, Event)> + Clone {
+        self.chat.rows.iter().chain(&self.git_events.rows)
+    }
+
+    pub fn catchup(&self, work: &HashMap<String, crate::work::Work>) -> Option<crate::seen::Catchup> {
+        let seen = self.seen.as_ref()?;
+        let partial = self.chat.dropped.max(self.git_events.dropped) > seen.position;
+        crate::seen::catchup(seen, &self.graph, work, self.activity(), &self.me(), partial)
     }
 
     /// Move the seen mark to now, with every item's current lane, and publish the change.
-    pub fn mark_seen(&mut self) {
-        let s = crate::seen::mark(&now(), &crate::work::all(&self.graph, &self.me()));
-        if let Err(e) = crate::seen::save(&self.root, &s) {
-            eprintln!("trio: could not save the seen mark: {e}");
-        }
+    pub fn mark_seen(&mut self) -> io::Result<()> {
+        let s = self.seen_now();
+        crate::seen::save(&self.root, &s)?;
         self.seen = Some(s);
         self.rev += 1;
+        Ok(())
+    }
+
+    fn seen_now(&self) -> crate::seen::Seen {
+        crate::seen::mark(&now(), self.arrival, &crate::work::all(&self.graph, &self.me()))
     }
 
     /// The human's handle: `me` from room.toml when usable, else the OS user name.
@@ -255,10 +300,13 @@ impl Room {
         changed
     }
 
-    /// Stable position for the next event from source `i` (git is `sources.len()`): sources in
+    /// Stable position for an event from source `i`: sources in
     /// config order, then each source's own order. Same-minute events from different sources
     /// therefore order the same way live and on replay; within a file, file order decides.
-    fn position(&mut self, i: usize) -> u64 {
+    fn position(&mut self, i: usize, id: &str) -> u64 {
+        if let Some(pos) = self.graph.position(id) {
+            return pos;
+        }
         if self.counts.len() <= i {
             self.counts.resize(i + 1, 0);
         }
@@ -273,37 +321,63 @@ impl Room {
         for i in 0..n {
             self.poll_source(i, &mut fresh);
         }
-        let polls = self.git.as_mut().map(|g| g.take()).unwrap_or_default();
-        for p in polls {
-            for e in p.tips {
-                let pos = self.position(n);
-                fresh.push((e, false, pos));
-            }
-            let mut durable = p.durable;
-            if !self.git_listed {
-                // Branches the ledger says merged but git no longer lists were deleted while the
-                // room was closed: retire them, so their items keep Done through the archive.
-                self.git_listed = true;
-                for b in self.graph.merged.iter().filter(|b| !p.listed.contains(b)) {
-                    durable.push(crate::gitwatch::gone_event(b, ""));
-                }
-            }
-            if !durable.is_empty() {
-                for e in &durable {
-                    if let Err(err) = append(&self.ledger, e) {
-                        eprintln!("trio: could not record {}: {err}", e.id);
-                    }
-                }
-                self.poll_source(n - 1, &mut fresh);
-            }
+        let mut changed = self.apply_batch(fresh);
+        if self.seen.is_none() {
+            // Replay positions start over in each process. History is the first baseline.
+            self.seen = Some(self.seen_now());
         }
-        let changed = !fresh.is_empty();
-        fresh.sort_by(|a, b| a.0.at.cmp(&b.0.at).then(a.2.cmp(&b.2)));
+        let seed = (self.git.is_some() && !self.git_seeded).then(|| crate::gitwatch::Seed {
+            serials: self.graph.git_serials.clone(),
+            tips: self.graph.items.values().filter(|b| !b.tip_sha.is_empty())
+                .map(|b| (b.id.clone(), b.tip_sha.clone(), b.title.clone(), self.graph.merged.contains(&b.id))).collect(),
+        });
+        self.git_seeded |= seed.is_some();
+        let polls = self.git.as_mut().map(|g| g.take(seed)).unwrap_or_default();
+        for p in polls {
+            changed |= self.apply_git_poll(p);
+        }
+        let mut fresh = Vec::new();
+        self.flush_git(n - 1, &mut fresh);
+        changed | self.apply_batch(fresh)
+    }
+
+    fn apply_git_poll(&mut self, poll: crate::gitwatch::Poll) -> bool {
+        self.pending_git.extend(poll.durable);
+        let mut changed = false;
+        for e in poll.tips {
+            let pos = self.position(self.sources.len(), &e.id);
+            changed |= self.apply(e, pos);
+        }
+        changed
+    }
+
+    fn flush_git(&mut self, ledger_index: usize, fresh: &mut Vec<(Event, bool, u64)>) {
+        let mut appended = std::collections::HashSet::new();
+        while let Some(e) = self.pending_git.front() {
+            if !self.graph.has_event(&e.id) && !appended.contains(&e.id) {
+                if let Err(err) = append(&self.ledger, e) {
+                    eprintln!("trio: could not record {}: {err}", e.id);
+                    break;
+                }
+                appended.insert(e.id.clone());
+            }
+            self.pending_git.pop_front();
+        }
+        if !appended.is_empty() {
+            self.poll_source(ledger_index, fresh);
+        }
+    }
+
+    fn apply_batch(&mut self, mut fresh: Vec<(Event, bool, u64)>) -> bool {
+        let mut changed = false;
+        fresh.sort_by(|a, b| crate::gitwatch::replay_at(&a.0).cmp(crate::gitwatch::replay_at(&b.0)).then(a.2.cmp(&b.2)));
         for (e, from_ledger, pos) in fresh {
-            let route = self.live && from_ledger && matches!(e.body, Body::Message { .. }) && !self.index.contains_key(&e.id);
-            self.apply(e.clone(), pos);
+            let route = self.live && from_ledger && matches!(e.body, Body::Message { .. }) && !self.graph.has_event(&e.id);
             if route {
+                changed |= self.apply(e.clone(), pos);
                 self.route(&e);
+            } else {
+                changed |= self.apply(e, pos);
             }
         }
         changed
@@ -313,25 +387,39 @@ impl Room {
         let from_ledger = i == self.sources.len() - 1;
         if let Ok(evs) = self.sources[i].poll() {
             for e in evs {
-                let pos = self.position(i);
+                let pos = self.position(i, &e.id);
                 fresh.push((e, from_ledger, pos));
             }
         }
     }
 
-    fn apply(&mut self, e: Event, pos: u64) {
+    fn apply(&mut self, e: Event, pos: u64) -> bool {
+        if let Body::Commit { branch, sha, touches, .. } = &e.body
+            && crate::gitwatch::is_refresh(&e)
+        {
+            if self.graph.items.get(branch).is_none_or(|b| b.tip_sha != *sha || b.merged_at.is_some())
+                || self.graph.touches.get(branch) == Some(touches)
+            {
+                return false;
+            }
+            self.graph.apply_at(&e, Some(pos), &self.derivers);
+            return true;
+        }
+        let window = if matches!(e.body, Body::Commit { .. }) {
+            if crate::gitwatch::is_transition(&e) && self.graph.has_event(&e.id) {
+                return false;
+            }
+            &mut self.git_events
+        } else {
+            &mut self.chat
+        };
+        if window.get(&e.id) == Some(&e) {
+            return false;
+        }
         self.graph.apply_at(&e, Some(pos), &self.derivers);
-        if let Some(&i) = self.index.get(&e.id) {
-            self.events[i] = e;
-            return;
-        }
-        self.index.insert(e.id.clone(), self.events.len());
-        self.events.push(e);
-        if self.events.len() > WINDOW + WINDOW / 4 {
-            let cut = self.events.len() - WINDOW;
-            self.events.drain(..cut);
-            self.index = self.events.iter().enumerate().map(|(i, e)| (e.id.clone(), i)).collect();
-        }
+        self.arrival += 1;
+        window.push(e, self.arrival);
+        true
     }
 
     /// Append to the ledger (the file is the source of truth; the next tick reads it back).
@@ -372,8 +460,7 @@ impl Room {
         targets.retain(|t| t != &e.from);
         targets.dedup();
         let recent: Vec<String> = self
-            .events
-            .iter()
+            .chat.events()
             .rev()
             .filter(|x| matches!(x.body, Body::Message { .. }))
             .take(8)
@@ -434,7 +521,7 @@ impl Room {
         let room = self.root.display().to_string();
         let guard = Guard { paused: self.cfg.paused, hop: self.hop, budget: self.cfg.hop_budget, from_human: e.from == me };
         let mut since = handoff.to_vec();
-        since.extend(crate::seen::digest(&self.events, t));
+        since.extend(crate::seen::digest(self.activity(), t));
         let prompt = wake_prompt(t, &me, &room, recent, &since, detail);
         let decision = match self.agents.get_mut(t) {
             Some(a) => a.wake_if_allowed(&prompt, &guard),
@@ -480,7 +567,7 @@ impl Room {
 
     /// The newest eight chat lines, oldest first, for a wake prompt.
     fn recent(&self) -> Vec<String> {
-        let mut v: Vec<String> = self.events.iter().rev().filter(|x| matches!(x.body, Body::Message { .. })).take(8).map(|x| format!("{}: {}", x.from, x.summary())).collect();
+        let mut v: Vec<String> = self.chat.events().rev().filter(|x| matches!(x.body, Body::Message { .. })).take(8).map(|x| format!("{}: {}", x.from, x.summary())).collect();
         v.reverse();
         v
     }
@@ -489,7 +576,7 @@ impl Room {
     fn reviews_own_work(&self, e: &Event, author: &str) -> bool {
         let Body::Message { items, .. } = &e.body else { return false };
         items.iter().any(|id| {
-            self.graph.items.get(id).is_some_and(|it| it.review_asked.as_ref().is_some_and(|r| r.at == e.at && r.by == e.from))
+            self.graph.items.get(id).is_some_and(|it| it.review_request(&e.id))
                 && crate::work::author_of(&self.graph, id).as_deref() == Some(author)
         })
     }
@@ -526,8 +613,7 @@ impl Room {
     /// Dollars this room's runs of `agent` cost today (estimated for Codex).
     fn spent_today(&self, agent: &str) -> f64 {
         let today = &now()[..10];
-        self.events
-            .iter()
+        self.chat.events()
             .filter(|e| e.at.starts_with(today))
             .filter_map(|e| match &e.body {
                 Body::RunFinished { agent: a, cost: Some(c), .. } if a == agent => Some(*c),
@@ -598,12 +684,16 @@ impl Room {
     }
 
     pub fn detail(&self, id: &str) -> Option<&str> {
-        self.index.get(id).and_then(|&i| self.events[i].detail())
+        self.chat.get(id).and_then(Event::detail)
     }
 
     /// The chat view: the newest `limit` messages and run events, oldest first.
     pub fn messages(&self, limit: usize) -> Vec<MessageView<'_>> {
-        let mut out: Vec<&Event> = self.events.iter().filter(|e| !matches!(e.body, Body::Claim { .. } | Body::Verdict { .. } | Body::Commit { .. })).collect();
+        let mut out: Vec<&Event> = self.chat.events().filter(|e| match &e.body {
+            Body::Claim { .. } | Body::Verdict { .. } => false,
+            Body::Status { text } if text.is_empty() && e.id.ends_with("#status") => false,
+            _ => true,
+        }).collect();
         out.sort_by(|a, b| a.at.cmp(&b.at));
         let skip = out.len().saturating_sub(limit);
         out[skip..]
@@ -685,6 +775,262 @@ pub fn now() -> String {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    fn temp_room(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("trio-room-{name}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(root.join(".trio")).unwrap();
+        root
+    }
+
+    fn message(id: &str, at: &str, from: &str, summary: &str) -> Event {
+        Event { id: id.into(), at: at.into(), from: from.into(), body: Body::Message {
+            summary: summary.into(), detail: None, mentions: vec![], items: crate::model::item_ids(summary),
+        } }
+    }
+
+    fn commit(id: &str, at: &str, branch: &str, sha: &str, subject: &str, merged: bool, gone: bool) -> Event {
+        Event { id: id.into(), at: at.into(), from: "claude".into(), body: Body::Commit {
+            branch: branch.into(), sha: sha.into(), subject: subject.into(), touches: vec![], merged, gone,
+        } }
+    }
+
+    #[test]
+    fn a_growing_import_retracts_its_ask_live_and_on_cold_replay() {
+        use std::io::Write;
+        let root = temp_room("grow");
+        std::fs::write(root.join(".trio/room.toml"), "me = 'sanjith'\n[[import]]\nfile = 'claude-posts.md'\nfrom = 'claude'\n").unwrap();
+        let file = root.join("claude-posts.md");
+        std::fs::write(&file, "## 2026-11-23 09:00 @codex please review XF1\nStatus: awaiting review\n").unwrap();
+        let mut live = Room::open(&root).unwrap();
+        live.tick();
+        assert_eq!(crate::work::all(&live.graph, "sanjith")["XF1"].lane, "review");
+        assert_eq!(live.graph.now["claude"].text, "awaiting review");
+        writeln!(std::fs::OpenOptions::new().append(true).open(file).unwrap(), "verdict XF2: pass").unwrap();
+        live.tick();
+        let mut cold = Room::open(&root).unwrap();
+        cold.tick();
+        for room in [&live, &cold] {
+            let work = crate::work::all(&room.graph, "sanjith");
+            assert_eq!((work["XF1"].lane, work["XF2"].lane), ("asked", "done"));
+            assert!(!room.graph.now.contains_key("claude"));
+        }
+        assert_eq!(serde_json::to_value(&live.graph).unwrap(), serde_json::to_value(&cold.graph).unwrap());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_seen_mark_keeps_same_minute_and_backdated_arrivals() {
+        let root = temp_room("arrival");
+        let mut room = Room::open(&root).unwrap();
+        room.tick();
+        room.mark_seen().unwrap();
+        let at = room.seen.as_ref().unwrap().at.clone();
+        append(&room.ledger, &message("same", &at, "claude", "XF1 just arrived")).unwrap();
+        append(&room.ledger, &message("late", "2026-01-01T09:00", "claude", "XF2 was imported late")).unwrap();
+        room.tick();
+        let work = crate::work::all(&room.graph, &room.me());
+        let c = room.catchup(&work).unwrap();
+        assert_eq!((c.messages, c.moved.len(), c.partial), (2, 2, false));
+        assert_eq!(room.seen.as_ref().unwrap().position, 0, "ingest cannot advance the mark");
+        room.mark_seen().unwrap();
+        assert!(room.catchup(&work).is_none());
+        let mut cold = Room::open(&root).unwrap();
+        cold.tick();
+        assert_eq!(cold.seen.as_ref().unwrap().position, 2);
+        assert!(cold.catchup(&work).is_none(), "start from a new replay baseline");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn git_churn_keeps_chat_and_runs_and_marks_catchup_partial() {
+        let root = temp_room("windows");
+        let mut room = Room::open(&root).unwrap();
+        room.tick();
+        let at = "2026-11-23T09:00";
+        room.apply(message("chat", at, "claude", "still here"), 1);
+        room.apply(Event { id: "run".into(), at: at.into(), from: "claude".into(),
+            body: Body::RunStarted { agent: "codex".into(), hop: 1, trigger: "chat".into() },
+        }, 2);
+        room.mark_seen().unwrap();
+        for i in 1..=WINDOW + WINDOW / 4 + 1 {
+            room.apply(commit(&format!("git:claude/x:tip:{i}"), at, "claude/x", &i.to_string(), "work", false, false), i as u64 + 2);
+        }
+        assert_eq!(room.messages(10).iter().map(|m| m.id).collect::<Vec<_>>(), ["chat", "run"]);
+        let c = room.catchup(&crate::work::all(&room.graph, &room.me())).unwrap();
+        assert_eq!((c.commits, c.branches, c.messages, c.partial), (WINDOW, 1, 0, true));
+        assert_eq!(crate::seen::digest(room.activity(), "codex").len(), 6, "the run survived to anchor the digest");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn two_durable_merge_rows_use_the_second_sha_and_clock_on_replay() {
+        let root = temp_room("second-merge");
+        let mut room = Room::open(&root).unwrap();
+        let ledger = room.ledger.clone();
+        append(&ledger, &commit("git:claude/x:merged:old", "2026-11-23T09:00", "claude/x", "old", "XF1 work", true, false)).unwrap();
+        append(&ledger, &Event { id: "changes".into(), at: "2026-11-23T10:00".into(), from: "codex".into(),
+            body: Body::Verdict { item: "XF1".into(), outcome: "changes".into() },
+        }).unwrap();
+        append(&ledger, &commit("git:claude/x:merged:new", "2026-11-23T12:00", "claude/x", "new", "XF1 more", true, false)).unwrap();
+        room.tick();
+        assert_eq!(room.graph.items["claude/x"].merged_at.as_ref().unwrap().0, "2026-11-23T12:00");
+        assert_eq!(crate::work::all(&room.graph, &room.me())["XF1"].lane, "done");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        crate::gitwatch::git(root, args).unwrap_or_else(|| panic!("git {args:?}"))
+    }
+
+    fn git_room(name: &str) -> PathBuf {
+        let root = temp_room(name);
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.email", "test@example.com"]);
+        git(&root, &["config", "user.name", "Test"]);
+        git(&root, &["config", "commit.gpgsign", "false"]);
+        git(&root, &["commit", "--allow-empty", "-qm", "base"]);
+        let repo = toml::Value::String(root.display().to_string());
+        std::fs::write(root.join(".trio/room.toml"), format!("repo = {repo}\nme = 'sanjith'\n")).unwrap();
+        root
+    }
+
+    fn poll_git(room: &mut Room) -> Vec<Event> {
+        let poll = room.git.as_mut().unwrap().wait(Duration::from_secs(20)).unwrap();
+        let durable = poll.durable.clone();
+        room.apply_git_poll(poll);
+        room.tick();
+        durable
+    }
+
+    fn ledger_rows(room: &Room) -> Vec<Event> {
+        RoomLedger::new(room.ledger.clone()).poll().unwrap()
+    }
+
+    #[test]
+    fn a_first_sight_merge_is_durable_through_deletion_and_restart() {
+        let root = git_room("first-merge");
+        git(&root, &["checkout", "-qb", "claude/x"]);
+        let output = std::process::Command::new("git").arg("-C").arg(&root)
+            .env("GIT_COMMITTER_DATE", "2026-01-02T12:00:00+00:00")
+            .args(["commit", "--allow-empty", "-qm", "XF1 implemented"]).output().unwrap();
+        assert!(output.status.success());
+        git(&root, &["checkout", "-q", "main"]);
+        git(&root, &["merge", "-q", "--ff-only", "claude/x"]);
+        let mut live = Room::open(&root).unwrap();
+        live.tick();
+        let rows = poll_git(&mut live);
+        assert_eq!(rows.len(), 1);
+        assert!(crate::gitwatch::is_merge(&rows[0]));
+        let stamp = git(&root, &["for-each-ref", "--format=%(committerdate:format-local:%Y-%m-%dT%H:%M)", "refs/heads/claude/x"]);
+        assert_eq!(rows[0].at, stamp);
+        git(&root, &["branch", "-D", "claude/x"]);
+        assert_eq!(poll_git(&mut live).len(), 1);
+        assert_eq!(ledger_rows(&live).len(), 2);
+        drop(live);
+        let mut cold = Room::open(&root).unwrap();
+        cold.tick();
+        assert!(poll_git(&mut cold).is_empty());
+        assert!(!cold.graph.items.contains_key("claude/x"));
+        let work = crate::work::all(&cold.graph, &cold.me());
+        assert_eq!((work["XF1"].lane, work["XF1"].last.as_str()), ("done", stamp.as_str()));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_second_observed_merge_after_changes_survives_cold_replay() {
+        let root = git_room("merge-again");
+        git(&root, &["checkout", "-qb", "claude/x"]);
+        git(&root, &["commit", "--allow-empty", "-qm", "XF1 work"]);
+        git(&root, &["checkout", "-q", "main"]);
+        let mut live = Room::open(&root).unwrap();
+        live.tick();
+        poll_git(&mut live);
+        git(&root, &["merge", "-q", "--ff-only", "claude/x"]);
+        let first = poll_git(&mut live).pop().unwrap();
+        assert!(crate::gitwatch::is_merge(&first));
+        append(&live.ledger, &Event { id: "changes".into(), at: first.at.clone(), from: "codex".into(),
+            body: Body::Verdict { item: "XF1".into(), outcome: "changes".into() },
+        }).unwrap();
+        live.tick();
+        assert_eq!(crate::work::all(&live.graph, &live.me())["XF1"].lane, "changes");
+        git(&root, &["checkout", "-q", "claude/x"]);
+        git(&root, &["commit", "--allow-empty", "-qm", "XF1 fixes"]);
+        git(&root, &["checkout", "-q", "main"]);
+        poll_git(&mut live);
+        git(&root, &["merge", "-q", "--ff-only", "claude/x"]);
+        let second = poll_git(&mut live).pop().unwrap();
+        assert!(crate::gitwatch::is_merge(&second));
+        assert_ne!(first.id, second.id);
+        assert_eq!(crate::work::all(&live.graph, &live.me())["XF1"].lane, "done");
+        let mut cold = Room::open(&root).unwrap();
+        cold.tick();
+        assert_eq!(crate::work::all(&cold.graph, &cold.me())["XF1"].lane, "done");
+        assert_eq!(cold.graph.items["claude/x"].merged_at, live.graph.items["claude/x"].merged_at);
+        let _ = poll_git(&mut cold);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_recreated_ref_retires_its_old_generation_and_keeps_ledger_ids_unique() {
+        let root = git_room("recreate");
+        let base = git(&root, &["rev-parse", "HEAD"]);
+        git(&root, &["checkout", "-qb", "claude/x"]);
+        git(&root, &["commit", "--allow-empty", "-qm", "XF1 implemented"]);
+        git(&root, &["checkout", "-q", "main"]);
+        git(&root, &["merge", "-q", "--ff-only", "claude/x"]);
+        let old_sha = git(&root, &["rev-parse", "claude/x"]);
+        let mut first = Room::open(&root).unwrap();
+        first.tick();
+        poll_git(&mut first);
+        append(&first.ledger, &Event { id: "branch-pass".into(), at: now(), from: "codex".into(),
+            body: Body::Verdict { item: "claude/x".into(), outcome: "pass".into() },
+        }).unwrap();
+        first.tick();
+        drop(first);
+
+        git(&root, &["branch", "-D", "claude/x"]);
+        git(&root, &["checkout", "-qb", "claude/x", &base]);
+        git(&root, &["commit", "--allow-empty", "-qm", "XF2 implemented"]);
+        git(&root, &["checkout", "-q", "main"]);
+        let mut second = Room::open(&root).unwrap();
+        second.tick();
+        let rows = poll_git(&mut second);
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(rows[0].body, Body::Commit { gone: true, .. }));
+        assert!(crate::gitwatch::is_tip(&rows[1]));
+        let work = crate::work::all(&second.graph, &second.me());
+        assert_eq!((work["XF1"].lane, work["XF2"].lane), ("done", "progress"));
+        assert_eq!(work["XF1"].state, "pass");
+        assert!(second.graph.items["claude/x"].verdicts.is_empty());
+        let targets: Vec<_> = second.graph.edges.iter().filter(|e| e.kind == "implements").map(|e| e.to.as_str()).collect();
+        assert_eq!(targets, ["XF2"]);
+        second.apply_git_poll(crate::gitwatch::Poll { durable: rows, ..Default::default() });
+        second.tick();
+        let count = ledger_rows(&second).len();
+        assert_eq!(count, 4, "a repeated poll must not append known rows");
+        drop(second);
+
+        let mut cold = Room::open(&root).unwrap();
+        cold.tick();
+        assert!(poll_git(&mut cold).is_empty());
+        assert_eq!(ledger_rows(&cold).len(), count, "an unchanged restart must not append rows");
+        let work = crate::work::all(&cold.graph, &cold.me());
+        assert_eq!((work["XF1"].lane, work["XF2"].lane), ("done", "progress"));
+        git(&root, &["branch", "-D", "claude/x"]);
+        poll_git(&mut cold);
+        for _ in 0..2 {
+            git(&root, &["branch", "claude/x", &old_sha]);
+            poll_git(&mut cold);
+            git(&root, &["branch", "-D", "claude/x"]);
+            poll_git(&mut cold);
+        }
+        let git_rows = ledger_rows(&cold);
+        let ids: std::collections::HashSet<_> = git_rows.iter().map(|e| &e.id).collect();
+        assert_eq!(ids.len(), git_rows.len());
+        assert_eq!(git_rows.iter().filter(|e| matches!(&e.body, Body::Commit { sha, gone: true, .. } if sha == &old_sha)).count(), 3);
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     /// A room whose claude agent is a shell command printing `reply` and exiting with `code`.
     fn room_with_claude(name: &str, reply: &str, code: i32) -> (PathBuf, Room) {

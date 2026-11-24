@@ -2,7 +2,7 @@
 //!
 //! `Node` inherits `Timed + Summarized`. Each `Deriver` owns one kind of fact and updates the
 //! graph incrementally, so applying an event costs O(1) amortized (hash lookups) and the whole
-//! graph is O(V + E) memory with per-item step lists capped at `STEPS_MAX`.
+//! graph keeps contributions by id, with per-item step lists capped at `STEPS_MAX`.
 
 use crate::model::{clip, definition, Body, Entity, Event, Summarized, Timed, Touch};
 use serde::Serialize;
@@ -12,7 +12,6 @@ const STEPS_MAX: usize = 60;
 
 pub trait Node: Timed + Summarized {
     fn lane(&self) -> &str;
-    fn state(&self) -> &str;
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -22,6 +21,8 @@ pub struct Step {
     pub what: String,
     /// Event id, so the UI can open the message behind a step.
     pub event: String,
+    #[serde(skip)]
+    seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -30,13 +31,14 @@ pub struct WorkItem {
     pub first: String,
     pub last: String,
     pub owner: String,
-    pub state: String,
     pub title: String,
     pub touches: u32,
     pub steps: Vec<Step>,
-    /// The latest message that asked for a review of this item: when, by whom, and of whom.
+    /// Requests keyed by the message that made them.
     #[serde(skip)]
-    pub review_asked: Option<ReviewAsk>,
+    review_asks: HashMap<String, ReviewAsk>,
+    #[serde(skip)]
+    latest_ask: Option<String>,
     /// Every verdict on this node (newest kept, at most VERDICTS_MAX), with who gave it and when.
     #[serde(skip)]
     pub verdicts: Vec<Verdict>,
@@ -44,24 +46,51 @@ pub struct WorkItem {
     #[serde(skip)]
     pub raised_by: String,
     #[serde(skip)]
+    first_seq: u64,
+    #[serde(skip)]
     pub claimed_by: Option<String>,
+    #[serde(skip)]
+    claim_key: Option<Key>,
     /// Branches: when the branch was first seen merged, as an order key.
     #[serde(skip)]
     pub merged_at: Option<Key>,
+    #[serde(skip)]
+    merge_sha: String,
+    #[serde(skip)]
+    pub tip_sha: String,
     /// Items: implementing branches that merged and were later deleted, so Done survives cleanup.
     #[serde(skip)]
     pub merged_gone: Vec<Gone>,
+    #[serde(skip)]
+    pub branches: BranchFacts,
+    #[serde(skip)]
+    work_lane: Option<&'static str>,
+    #[serde(skip)]
+    pub moved_by: String,
     /// Where the title's definition came from ("XF32 \u{2014} Limit the clean claim"): 0 none,
     /// 1 a message body, 2 a message summary or post title. A definition replaces the title
     /// only from a stronger place, so later status lines ("XF1: fixed, ready") never rename it,
     /// while a heading can still correct a definition guessed from a body.
     #[serde(skip)]
     pub defined: u8,
+    #[serde(skip)]
+    title_key: Key,
+    #[serde(skip)]
+    title_from_summary: bool,
 }
 
 /// Order of an event: its minute, then its stable position (`Graph::order`). Comparing keys
 /// instead of timestamps keeps same-minute events in source order, live and on replay alike.
 pub type Key = (String, u64);
+
+/// Keep branch lookups out of the message path. Ref and branch review events update this.
+#[derive(Debug, Clone, Default)]
+pub struct BranchFacts {
+    pub count: usize,
+    pub unmerged: usize,
+    pub verdict: Option<Verdict>,
+    pub merged: Option<Key>,
+}
 
 #[derive(Debug, Clone)]
 pub struct ReviewAsk {
@@ -70,6 +99,12 @@ pub struct ReviewAsk {
     pub seq: u64,
     pub by: String,
     pub of: Vec<String>,
+}
+
+impl ReviewAsk {
+    pub fn key(&self) -> (&str, u64) {
+        (&self.at, self.seq)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -96,15 +131,17 @@ impl Verdict {
 pub struct Gone {
     pub branch: String,
     pub merged: Key,
+    pub last: String,
 }
 
 const VERDICTS_MAX: usize = 32;
-/// Merged-and-deleted branches remembered per item (a reused branch name replaces its record).
+/// Merged-and-deleted branches remembered per item.
 const GONE_MAX: usize = 16;
 
-/// Add a verdict once per (line, node) and keep the newest VERDICTS_MAX by key.
+/// Replace a verdict from the same line and keep the newest VERDICTS_MAX by key.
 fn keep_verdict(list: &mut Vec<Verdict>, v: Verdict) {
-    if list.iter().any(|x| x.line == v.line && x.on == v.on) {
+    if let Some(old) = list.iter_mut().find(|x| x.line == v.line && x.on == v.on) {
+        *old = v;
         return;
     }
     list.push(v);
@@ -136,8 +173,55 @@ impl Node for WorkItem {
     fn lane(&self) -> &str {
         &self.owner
     }
-    fn state(&self) -> &str {
-        &self.state
+}
+
+impl WorkItem {
+    pub fn base_state(&self) -> &'static str {
+        if self.kind() == "branch" && !self.tip_sha.is_empty() {
+            "branch"
+        } else if self.claimed_by.is_some() {
+            "claimed"
+        } else {
+            "open"
+        }
+    }
+
+    pub fn first_key(&self) -> (&str, u64) {
+        (&self.first, self.first_seq)
+    }
+
+    pub fn claim_key(&self) -> Option<(&str, u64)> {
+        self.claim_key.as_ref().map(|(at, seq)| (at.as_str(), *seq))
+    }
+
+    pub fn review_request(&self, id: &str) -> bool {
+        self.review_asks.contains_key(id)
+    }
+
+    pub fn latest_request(&self) -> Option<&ReviewAsk> {
+        self.latest_ask.as_ref().and_then(|id| self.review_asks.get(id))
+    }
+
+    fn add_ask(&mut self, id: &str, ask: ReviewAsk) {
+        if self.latest_request().is_none_or(|old| old.key() <= ask.key()) {
+            self.latest_ask = Some(id.into());
+        } else if self.latest_ask.as_deref() == Some(id) {
+            self.review_asks.insert(id.into(), ask);
+            self.select_ask();
+            return;
+        }
+        self.review_asks.insert(id.into(), ask);
+    }
+
+    fn remove_ask(&mut self, id: &str) {
+        self.review_asks.remove(id);
+        if self.latest_ask.as_deref() == Some(id) {
+            self.select_ask();
+        }
+    }
+
+    fn select_ask(&mut self) {
+        self.latest_ask = self.review_asks.iter().max_by_key(|(_, ask)| ask.key()).map(|(id, _)| id.clone());
     }
 }
 
@@ -154,8 +238,30 @@ pub struct Graph {
     pub edges: Vec<Edge>,
     #[serde(skip)]
     edge_set: HashSet<Edge>,
+    #[serde(skip)]
+    ask_targets: HashMap<String, Vec<String>>,
+    #[serde(skip)]
+    review_events: HashMap<String, ReviewFact>,
+    #[serde(skip)]
+    review_edges: HashMap<Edge, usize>,
+    #[serde(skip)]
+    retired: HashMap<String, u64>,
+    #[serde(skip)]
+    step_events: HashSet<(String, String)>,
+    #[serde(skip)]
+    implementers: HashMap<String, HashSet<String>>,
+    #[serde(skip)]
+    implemented: HashMap<String, Vec<String>>,
+    #[serde(skip)]
+    dirty: Vec<String>,
+    #[serde(skip)]
+    pub git_serials: HashMap<String, u64>,
     /// Latest status line per participant.
     pub now: HashMap<String, Status>,
+    #[serde(skip)]
+    status_lines: HashMap<String, StatusLines>,
+    #[serde(skip)]
+    first_run: HashMap<String, String>,
     /// What each unmerged branch changes, replaced whenever its tip moves.
     pub touches: BTreeMap<String, Vec<Touch>>,
     /// Branches whose tip is already in the base branch.
@@ -179,39 +285,89 @@ pub struct Status {
     pub running: bool,
 }
 
+#[derive(Debug, Default)]
+struct StatusLines {
+    lines: HashMap<String, (Key, String)>,
+    latest: Option<String>,
+}
+
+impl StatusLines {
+    fn replace(&mut self, id: &str, key: Key, text: &str) {
+        let head = self.latest.as_ref().and_then(|id| self.lines.get(id));
+        let newest = head.is_none_or(|(old, _)| old <= &key);
+        if text.is_empty() && id.ends_with("#status") {
+            self.lines.remove(id);
+        } else {
+            self.lines.insert(id.into(), (key, clip(text, 120)));
+            if newest {
+                self.latest = Some(id.into());
+                return;
+            }
+        }
+        if self.latest.as_deref() == Some(id) {
+            self.latest = self.lines.iter().max_by_key(|(_, (key, _))| key).map(|(id, _)| id.clone());
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ReviewFact {
+    edge: Edge,
+    line: String,
+    generation: u64,
+}
+
 impl Graph {
     fn item(&mut self, id: &str, at: &str, who: &str) -> &mut WorkItem {
-        self.items.entry(id.to_string()).or_insert_with(|| WorkItem {
+        self.dirty.push(id.to_string());
+        let it = self.items.entry(id.to_string()).or_insert_with(|| WorkItem {
             id: id.to_string(),
             first: at.to_string(),
             last: at.to_string(),
             owner: who.to_string(),
-            state: "open".into(),
             title: String::new(),
             touches: 0,
             steps: Vec::new(),
-            review_asked: None,
+            review_asks: HashMap::new(),
+            latest_ask: None,
             verdicts: Vec::new(),
             raised_by: who.to_string(),
+            first_seq: self.seq,
             claimed_by: None,
+            claim_key: None,
             merged_at: None,
+            merge_sha: String::new(),
+            tip_sha: String::new(),
             merged_gone: Vec::new(),
+            branches: BranchFacts::default(),
+            work_lane: None,
+            moved_by: String::new(),
             defined: 0,
-        })
+            title_key: (String::new(), 0),
+            title_from_summary: false,
+        });
+        if (at, self.seq) < it.first_key() {
+            it.first = at.to_string();
+            it.first_seq = self.seq;
+            it.raised_by = who.to_string();
+            if it.claimed_by.is_none() {
+                it.owner = who.to_string();
+            }
+        }
+        it
     }
 
     /// Forget an item and its edges (a deleted branch). A merged branch hands its merge and its
     /// verdicts to the items it implemented first, so their Done and story survive the cleanup.
     fn drop_item(&mut self, id: &str) {
-        if self.merged.contains(id)
-            && let Some(b) = self.items.get(id).cloned()
-        {
-            let targets: Vec<String> = self.edges.iter().filter(|e| e.kind == "implements" && e.from == id).map(|e| e.to.clone()).collect();
-            let merged = b.merged_at.clone().unwrap_or_else(|| (b.last.clone(), 0));
-            for t in targets {
-                if let Some(it) = self.items.get_mut(&t) {
-                    it.merged_gone.retain(|g| g.branch != id);
-                    it.merged_gone.push(Gone { branch: id.to_string(), merged: merged.clone() });
+        *self.retired.entry(id.into()).or_default() += 1;
+        let targets = self.implemented.remove(id).unwrap_or_default();
+        if let Some(b) = self.items.remove(id) {
+            for target in &targets {
+                if let Some(it) = self.items.get_mut(target) {
+                    if let Some(merged) = &b.merged_at {
+                        it.merged_gone.push(Gone { branch: id.to_string(), merged: merged.clone(), last: b.last.clone() });
+                    }
                     if it.merged_gone.len() > GONE_MAX {
                         let oldest = (0..it.merged_gone.len()).min_by(|&a, &b| it.merged_gone[a].merged.cmp(&it.merged_gone[b].merged)).expect("non-empty");
                         it.merged_gone.remove(oldest);
@@ -222,33 +378,117 @@ impl Graph {
                 }
             }
         }
-        self.items.remove(id);
         self.touches.remove(id);
         self.merged.remove(id);
         self.edges.retain(|e| e.from != id && e.to != id);
         self.edge_set.retain(|e| e.from != id && e.to != id);
+        self.review_edges.retain(|e, _| e.to != id);
+        for target in targets {
+            if let Some(branches) = self.implementers.get_mut(&target) {
+                branches.remove(id);
+            }
+            self.refresh_branches(&target);
+        }
     }
 
-    fn edge(&mut self, from: &str, to: &str, kind: &str) {
+    fn edge(&mut self, from: &str, to: &str, kind: &str) -> bool {
         let e = Edge { from: from.into(), to: to.into(), kind: kind.into() };
         if self.edge_set.insert(e.clone()) {
             self.edges.push(e);
+            return true;
+        }
+        false
+    }
+
+    fn link(&mut self, branch: &str, item: &str) -> bool {
+        if self.edge(branch, item, "implements") {
+            self.implementers.entry(item.into()).or_default().insert(branch.into());
+            self.implemented.entry(branch.into()).or_default().push(item.into());
+            return true;
+        }
+        false
+    }
+
+    fn branch_changed(&mut self, branch: &str) {
+        if let Some(targets) = self.implemented.get(branch).cloned() {
+            for id in targets {
+                self.refresh_branches(&id);
+            }
+        }
+    }
+
+    fn refresh_branches(&mut self, id: &str) {
+        let mut facts = BranchFacts::default();
+        for branch in self.implementers.get(id).into_iter().flatten().filter_map(|b| self.items.get(b)) {
+            facts.count += 1;
+            facts.unmerged += usize::from(branch.merged_at.is_none());
+            if branch.merged_at > facts.merged {
+                facts.merged.clone_from(&branch.merged_at);
+            }
+            let newest = branch.verdicts.iter().max_by_key(|v| v.key());
+            if newest.map(Verdict::key) > facts.verdict.as_ref().map(Verdict::key) {
+                facts.verdict = newest.cloned();
+            }
+        }
+        self.items.get_mut(id).expect("linked item").branches = facts;
+        self.dirty.push(id.into());
+    }
+
+    fn review(&mut self, e: &Event, item: &str, state: &str) -> bool {
+        let generation = self.retired.get(item).copied().unwrap_or_default();
+        let edge = Edge { from: e.from.clone(), to: item.into(), kind: format!("review:{state}") };
+        if let Some(old) = self.review_events.get(&e.id).cloned() {
+            if old.edge.to == item && old.generation != generation {
+                return false; // This line belonged to the retired ref.
+            }
+            if old.edge == edge {
+                return true;
+            }
+            self.drop_review(&old);
+        }
+        self.edge(&edge.from, &edge.to, &edge.kind);
+        *self.review_edges.entry(edge.clone()).or_default() += 1;
+        self.review_events.insert(e.id.clone(), ReviewFact { edge, line: e.verdict_line(item).into(), generation });
+        true
+    }
+
+    fn drop_review(&mut self, fact: &ReviewFact) {
+        let edge = &fact.edge;
+        if self.retired.get(&edge.to).copied().unwrap_or_default() != fact.generation {
+            return;
+        }
+        if let Some(count) = self.review_edges.get_mut(edge) {
+            *count -= 1;
+            if *count == 0 {
+                self.review_edges.remove(edge);
+                self.edge_set.remove(edge);
+                self.edges.retain(|e| e != edge);
+            }
+        }
+        if let Some(it) = self.items.get_mut(&edge.to) {
+            it.verdicts.retain(|v| v.line != fact.line || v.on != edge.to);
+            self.dirty.push(edge.to.clone());
+            self.branch_changed(&edge.to);
         }
     }
 
     fn step(&mut self, item: &str, e: &Event, what: String) {
+        let first = self.step_events.insert((e.id.clone(), item.to_string()));
         let it = self.items.get_mut(item).expect("item exists");
         if e.at.as_str() > it.last.as_str() {
             it.last = e.at.clone();
         }
-        it.touches += 1;
+        it.touches += u32::from(first);
         if let Some(s) = it.steps.iter_mut().find(|s| s.event == e.id) {
             s.what = what; // a re-emitted post updates its step in place
             return;
         }
         // Insert in time order: O(log n) search instead of re-sorting the list on every step.
-        let pos = it.steps.partition_point(|s| s.at <= e.at);
-        it.steps.insert(pos, Step { at: e.at.clone(), who: e.from.clone(), what, event: e.id.clone() });
+        if !first {
+            return;
+        }
+        let pos = it.steps.partition_point(|s| (&s.at, s.seq) <= (&e.at, self.seq));
+        it.steps.insert(pos, Step { at: e.at.clone(), who: e.from.clone(), what, event: e.id.clone(), seq: self.seq });
         if it.steps.len() > STEPS_MAX {
             let cut = it.steps.len() - STEPS_MAX;
             it.steps.drain(..cut);
@@ -269,9 +509,37 @@ impl Graph {
             self.order.insert(e.id.clone(), pos.unwrap_or(self.next));
         }
         self.seq = self.order[&e.id];
+        if !matches!(e.body, Body::Verdict { .. }) && let Some(old) = self.review_events.remove(&e.id) {
+            self.drop_review(&old);
+        }
+        if !matches!(e.body, Body::Message { .. }) && let Some(old) = self.ask_targets.remove(&e.id) {
+            for id in old {
+                if let Some(it) = self.items.get_mut(&id) {
+                    it.remove_ask(&e.id);
+                    self.dirty.push(id);
+                }
+            }
+        }
         for d in derivers {
             d.apply(e, first_time, self);
         }
+        for id in self.dirty.drain(..) {
+            if let Some(it) = self.items.get_mut(&id) && it.kind() == "item" {
+                let lane = crate::work::reading(it).lane;
+                if it.work_lane != Some(lane) {
+                    it.work_lane = Some(lane);
+                    it.moved_by.clone_from(&e.from);
+                }
+            }
+        }
+    }
+
+    pub fn position(&self, id: &str) -> Option<u64> {
+        self.order.get(id).copied()
+    }
+
+    pub fn has_event(&self, id: &str) -> bool {
+        self.position(id).is_some()
     }
 }
 
@@ -320,20 +588,46 @@ impl Deriver for ItemDeriver {
             of.push("both".into());
         }
         let seq = g.seq;
+        if let Some(old) = g.ask_targets.remove(&e.id) {
+            let kept: HashSet<_> = if asks_review { items.iter().collect() } else { HashSet::new() };
+            for id in old {
+                if !kept.contains(&id) && let Some(it) = g.items.get_mut(&id) {
+                    it.remove_ask(&e.id);
+                    g.dirty.push(id);
+                }
+            }
+        }
+        if asks_review {
+            g.ask_targets.insert(e.id.clone(), items.clone());
+        }
         for id in items {
             let it = g.item(id, &e.at, &e.from);
             // A definition wins over plain mentions; until one arrives, the latest message naming it.
             let def = definition(&summary, id).map(|d| (2, d)).or_else(|| detail.as_deref().and_then(|d| definition(d, id)).map(|d| (1, d)));
+            let key = (&e.at, seq);
+            let old = (&it.title_key.0, it.title_key.1);
+            let in_summary = summary.contains(id.as_str());
+            let better_guess = match (in_summary, it.title_from_summary) {
+                (true, false) => true,
+                (false, true) => false,
+                (true, true) => key >= old,
+                (false, false) => key <= old,
+            };
             match def {
-                Some((rank, d)) if rank > it.defined => {
+                Some((rank, d)) if rank > it.defined || (rank == it.defined && key <= old) => {
                     it.title = d;
                     it.defined = rank;
+                    it.title_key = (e.at.clone(), seq);
                 }
-                _ if it.defined == 0 && (it.title.is_empty() || summary.contains(id.as_str())) => it.title = clip(&summary, 90),
+                _ if it.defined == 0 && (it.title.is_empty() || better_guess) => {
+                    it.title = clip(&summary, 90);
+                    it.title_key = (e.at.clone(), seq);
+                    it.title_from_summary = in_summary;
+                }
                 _ => {}
             }
-            if asks_review && it.review_asked.as_ref().is_none_or(|r| (r.at.as_str(), r.seq) <= (e.at.as_str(), seq)) {
-                it.review_asked = Some(ReviewAsk { at: e.at.clone(), seq, by: e.from.clone(), of: of.clone() });
+            if asks_review {
+                it.add_ask(&e.id, ReviewAsk { at: e.at.clone(), seq, by: e.from.clone(), of: of.clone() });
             }
             g.step(id, e, summary.clone());
             g.edge(&e.from, id, "touched");
@@ -346,11 +640,12 @@ pub struct ClaimDeriver;
 impl Deriver for ClaimDeriver {
     fn apply(&self, e: &Event, _first: bool, g: &mut Graph) {
         let Body::Claim { item } = &e.body else { return };
+        let seq = g.seq;
         let it = g.item(item, &e.at, &e.from);
-        it.owner = e.from.clone();
-        it.claimed_by = Some(e.from.clone());
-        if it.state == "open" {
-            it.state = "claimed".into();
+        if it.claim_key().is_none_or(|key| key <= (e.at.as_str(), seq)) {
+            it.owner = e.from.clone();
+            it.claimed_by = Some(e.from.clone());
+            it.claim_key = Some((e.at.clone(), seq));
         }
         g.step(item, e, format!("{} claimed it", e.from));
         g.edge(&e.from, item, "claimed");
@@ -368,23 +663,15 @@ impl Deriver for ReviewDeriver {
             "fail" | "blocked" => "blocked",
             _ => "review",
         };
-        let seq = g.seq;
-        let line = e.id.strip_suffix(&format!(":{item}")).unwrap_or(&e.id).to_string();
-        let it = g.item(item, &e.at, &e.from);
-        let newest = it.verdicts.iter().all(|v| v.key() < (e.at.as_str(), seq));
-        if newest {
-            it.state = state.into();
+        if !g.review(e, item, state) {
+            return;
         }
+        let seq = g.seq;
+        let line = e.verdict_line(item).to_string();
+        let it = g.item(item, &e.at, &e.from);
         keep_verdict(&mut it.verdicts, Verdict { at: e.at.clone(), seq, by: e.from.clone(), outcome: state.into(), on: item.clone(), line });
         g.step(item, e, format!("{} review: {state}", e.from));
-        g.edge(&e.from, item, &format!("review:{state}"));
-        // A newest pass on a branch carries to the items it implements (rare event, O(E)).
-        if state == "pass" && newest {
-            let targets: Vec<String> = g.edges.iter().filter(|x| x.kind == "implements" && &x.from == item).map(|x| x.to.clone()).collect();
-            for t in targets {
-                inherit_pass(g, &t, (&e.at, seq));
-            }
-        }
+        g.branch_changed(item);
     }
 }
 
@@ -395,6 +682,7 @@ impl Deriver for WakeDeriver {
         match &e.body {
             Body::RunStarted { agent, .. } => {
                 g.edge(&e.from, agent, "woke");
+                g.first_run.entry(agent.clone()).or_insert_with(|| e.at.clone());
                 let s = g.now.entry(agent.clone()).or_insert(Status { text: String::new(), at: e.at.clone(), running: true });
                 s.running = true;
             }
@@ -413,10 +701,18 @@ pub struct StatusDeriver;
 impl Deriver for StatusDeriver {
     fn apply(&self, e: &Event, _first: bool, g: &mut Graph) {
         let Body::Status { text } = &e.body else { return };
-        let s = g.now.entry(e.from.clone()).or_insert(Status { text: String::new(), at: String::new(), running: false });
-        if e.at.as_str() >= s.at.as_str() {
-            s.text = clip(text, 120);
-            s.at = e.at.clone();
+        let lines = g.status_lines.entry(e.from.clone()).or_default();
+        lines.replace(&e.id, (e.at.clone(), g.seq), text);
+        if let Some(((at, _), text)) = lines.latest.as_ref().and_then(|id| lines.lines.get(id)) {
+            let s = g.now.entry(e.from.clone()).or_insert(Status { text: String::new(), at: String::new(), running: false });
+            s.text.clone_from(text);
+            s.at.clone_from(at);
+        } else if let Some(at) = g.first_run.get(&e.from) {
+            let s = g.now.get_mut(&e.from).expect("a run creates a status");
+            s.text.clear();
+            s.at.clone_from(at);
+        } else {
+            g.now.remove(&e.from);
         }
     }
 }
@@ -425,8 +721,20 @@ impl Deriver for StatusDeriver {
 /// latest subject mentions.
 pub struct BranchDeriver;
 impl Deriver for BranchDeriver {
-    fn apply(&self, e: &Event, _first: bool, g: &mut Graph) {
+    fn apply(&self, e: &Event, first: bool, g: &mut Graph) {
         let Body::Commit { branch, sha, subject, touches, merged, gone } = &e.body else { return };
+        if !first && crate::gitwatch::is_transition(e) {
+            return;
+        }
+        if let Some(serial) = crate::gitwatch::serial(e) {
+            g.git_serials.entry(branch.clone()).and_modify(|n| *n = (*n).max(serial)).or_insert(serial);
+        }
+        if crate::gitwatch::is_refresh(e) {
+            if g.items.get(branch).is_some_and(|b| b.tip_sha == *sha && b.merged_at.is_none()) {
+                g.touches.insert(branch.clone(), touches.clone());
+            }
+            return;
+        }
         if *gone {
             g.drop_item(branch);
             return;
@@ -441,36 +749,24 @@ impl Deriver for BranchDeriver {
         let owner = branch.split('/').next().unwrap_or("").to_string();
         let seq = g.seq;
         let it = g.item(branch, &e.at, &owner);
+        it.tip_sha.clone_from(sha);
         it.title = clip(subject, 90);
+        let mut changed = false;
         if !*merged {
-            it.merged_at = None;
-        } else if it.merged_at.is_none() {
+            changed = it.merged_at.take().is_some();
+        } else if it.merged_at.is_none() || it.merge_sha != *sha {
             it.merged_at = Some((e.at.clone(), seq));
+            it.merge_sha.clone_from(sha);
+            changed = true;
         }
-        if it.state == "open" {
-            it.state = "branch".into(); // a reviewed branch keeps its verdict colour
-        }
-        // The branch's newest verdict, if a pass, carries to the items it links now.
-        let pass: Option<(String, u64)> = it.verdicts.iter().max_by(|a, b| a.key().cmp(&b.key())).filter(|v| v.outcome == "pass").map(|v| (v.at.clone(), v.seq));
         g.step(branch, e, format!("{} {}", &sha[..sha.len().min(8)], clip(subject, 80)));
         for id in crate::model::item_ids(subject) {
             g.item(&id, &e.at, &owner);
-            g.edge(branch, &id, "implements");
-            if let Some((at, s)) = &pass {
-                inherit_pass(g, &id, (at, *s));
-            }
+            changed |= g.link(branch, &id);
         }
-    }
-}
-
-/// An item implemented on a passed branch reads as passed, unless the item has a verdict of its
-/// own at or after the pass (`pass` is that verdict's key).
-fn inherit_pass(g: &mut Graph, id: &str, pass: (&str, u64)) {
-    if let Some(t) = g.items.get_mut(id)
-        && t.verdicts.iter().all(|v| v.key() < pass)
-        && matches!(t.state.as_str(), "open" | "claimed" | "review")
-    {
-        t.state = "pass".into();
+        if changed {
+            g.branch_changed(branch);
+        }
     }
 }
 
@@ -496,7 +792,7 @@ mod tests {
         g.apply(&ev("c1", "2026-11-23T10:01", "claude", Body::Claim { item: "P0a".into() }), &d);
         g.apply(&ev("v1", "2026-11-23T11:00", "codex", Body::Verdict { item: "P0a".into(), outcome: "changes".into() }), &d);
         let it = &g.items["P0a"];
-        assert_eq!(it.state, "changes");
+        assert_eq!(crate::work::all(&g, "sanjith")["P0a"].state, "changes");
         assert_eq!(it.owner, "claude");
         assert_eq!(it.steps.len(), 3);
         assert!(g.edges.iter().any(|e| e.from == "codex" && e.kind == "review:changes"));
@@ -510,8 +806,8 @@ mod tests {
         let mut g = Graph::default();
         g.apply(&ev("v1", "2026-11-23T10:00", "codex", Body::Verdict { item: "claude/hooks-p0a".into(), outcome: "pass".into() }), &d);
         g.apply(&ev("git:claude/hooks-p0a", "2026-11-23T09:00", "claude", Body::Commit { branch: "claude/hooks-p0a".into(), sha: "553f50d1".into(), subject: "P0a fixes".into(), touches: vec![], merged: false, gone: false }), &d);
-        assert_eq!(g.items["claude/hooks-p0a"].state, "pass");
-        assert_eq!(g.items["P0a"].state, "pass");
+        assert_eq!(crate::work::latest_verdict(&g.items["claude/hooks-p0a"]).unwrap().outcome, "pass");
+        assert_eq!(crate::work::all(&g, "sanjith")["P0a"].state, "pass");
     }
 
     #[test]

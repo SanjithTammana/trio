@@ -153,11 +153,12 @@ pub struct PostsFile {
     fence: Option<(u8, usize)>,
     /// The post being read: (offset of its header, header text, body lines).
     open: Option<(u64, String, Vec<String>)>,
+    published_status: Option<Event>,
 }
 
 impl PostsFile {
     pub fn new(path: PathBuf, from: &str, human: &str) -> Self {
-        Self { path, from: from.to_string(), human: human.to_string(), tail: Tail::default(), fence: None, open: None }
+        Self { path, from: from.to_string(), human: human.to_string(), tail: Tail::default(), fence: None, open: None, published_status: None }
     }
 
     fn close(&self, off: u64, head: &str, body: &[String]) -> Vec<Event> {
@@ -166,17 +167,16 @@ impl PostsFile {
         let (at, title) = split_header(head);
         let detail = body.join("\n").trim().to_string();
         let mut items = item_ids(title);
+        let mut seen: std::collections::HashSet<_> = items.iter().cloned().collect();
         for i in item_ids(&detail) {
-            if !items.contains(&i) {
+            if seen.insert(i.clone()) {
                 items.push(i);
             }
         }
-        // Title mentions come first: they say who the post is for; the body may only thank someone.
+        // The title names the reviewers when it addresses anyone, including @both.
         let mut named = mentions_in(title, &self.human);
-        for m in mentions_in(&detail, &self.human) {
-            if !named.contains(&m) {
-                named.push(m);
-            }
+        if named.is_empty() {
+            named = mentions_in(&detail, &self.human);
         }
         let mut out = vec![Event {
             id: id.clone(),
@@ -214,6 +214,17 @@ impl PostsFile {
         }
         out
     }
+
+    fn publish(&mut self, mut rows: Vec<Event>) -> Vec<Event> {
+        let status = rows.last().filter(|e| matches!(&e.body, Body::Status { .. })).cloned();
+        // The previous Status line can stop being terminal as this post grows.
+        if status.is_none() && let Some(mut old) = self.published_status.take() {
+            old.body = Body::Status { text: String::new() };
+            rows.push(old);
+        }
+        self.published_status = status;
+        rows
+    }
 }
 
 impl FileSource for PostsFile {
@@ -226,6 +237,7 @@ impl FileSource for PostsFile {
     fn reset(&mut self) {
         self.fence = None;
         self.open = None;
+        self.published_status = None;
     }
     fn parse(&mut self, lines: &str, base: u64) -> Vec<Event> {
         let mut out = Vec::new();
@@ -236,7 +248,9 @@ impl FileSource for PostsFile {
             self.fence = fence_step(line, self.fence);
             if !was_fenced && self.fence.is_none() && is_post_head(line) {
                 if let Some((o, h, b)) = self.open.take() {
-                    out.extend(self.close(o, &h, &b));
+                    let rows = self.close(o, &h, &b);
+                    out.extend(self.publish(rows));
+                    self.published_status = None;
                 }
                 self.open = Some((off, line[3..].to_string(), Vec::new()));
             } else if let Some((_, _, body)) = self.open.as_mut() {
@@ -248,10 +262,9 @@ impl FileSource for PostsFile {
     }
     fn flush(&mut self) -> Vec<Event> {
         // Re-emit the open post so a growing last post shows; ids are stable, so it replaces.
-        match &self.open {
-            Some((o, h, b)) => self.close(*o, h, b),
-            None => Vec::new(),
-        }
+        let Some((o, h, b)) = &self.open else { return Vec::new() };
+        let rows = self.close(*o, h, b);
+        self.publish(rows)
     }
 }
 

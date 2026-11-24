@@ -37,7 +37,7 @@ pub trait Summarized: Entity {
 }
 
 /// One line of `room.jsonl`, or one record derived from an imported file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     /// Stable identity. Ledger lines get `l<offset>`; imported posts get `<file>@<offset>`,
     /// so a re-read of the same post replaces it instead of duplicating it.
@@ -49,7 +49,7 @@ pub struct Event {
     pub body: Body,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Body {
     Message {
@@ -211,6 +211,62 @@ pub fn definition(text: &str, id: &str) -> Option<String> {
     if id.is_empty() {
         return None;
     }
+    let mut fence = None;
+    let (mut start, mut offset) = (0, 0);
+    for line in text.split_inclusive('\n') {
+        let was_fenced = fence.is_some();
+        fence = crate::source::fence_step(line.trim_end_matches(['\n', '\r']), fence);
+        if !was_fenced && fence.is_some()
+            && let Some(title) = definition_in_prose(&text[start..offset], id)
+        {
+            return Some(title);
+        }
+        offset += line.len();
+        if was_fenced && fence.is_none() {
+            start = offset;
+        }
+    }
+    if fence.is_some() { None } else { definition_in_prose(&text[start..], id) }
+}
+
+fn definition_in_prose(text: &str, id: &str) -> Option<String> {
+    without_code_spans(text).lines().find_map(|line| definition_on_line(line, id))
+}
+
+fn without_code_spans(line: &str) -> std::borrow::Cow<'_, str> {
+    let mut runs = Vec::new();
+    for (start, ticks) in line.match_indices('`') {
+        match runs.last_mut() {
+            Some((_, end)) if *end == start => *end += ticks.len(),
+            _ => runs.push((start, start + ticks.len())),
+        }
+    }
+    if runs.len() < 2 {
+        return line.into();
+    }
+    let mut next = std::collections::HashMap::new();
+    let mut closing = vec![None; runs.len()];
+    for (i, &(start, end)) in runs.iter().enumerate().rev() {
+        closing[i] = next.insert(end - start, i);
+    }
+    let mut out = String::new();
+    let (mut i, mut from) = (0, 0);
+    while i < runs.len() {
+        if let Some(j) = closing[i] {
+            out.push_str(&line[from..runs[i].0]);
+            out.push(' ');
+            out.extend(line[runs[i].0..runs[j].1].chars().filter(|&c| c == '\n'));
+            from = runs[j].1;
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+    out.push_str(&line[from..]);
+    out.into()
+}
+
+fn definition_on_line(text: &str, id: &str) -> Option<String> {
     let mut from = 0;
     while let Some(k) = text[from..].find(id) {
         let (s, e) = (from + k, from + k + id.len());
@@ -224,11 +280,6 @@ pub fn definition(text: &str, id: &str) -> Option<String> {
         // Only free-standing ids define: not inside a URL or path (`?ticket=P0a:x`), not after
         // other text glued to it.
         if before.is_some_and(|c| !(c.is_whitespace() || "*([>\"'".contains(c))) || next.is_some_and(word) || (next == Some('.') && after.next().is_some_and(|c| c.is_ascii_digit())) {
-            continue;
-        }
-        // Not inside an inline code span: an odd number of backticks earlier on the line.
-        let line_start = text[..s].rfind('\n').map_or(0, |i| i + 1);
-        if text[line_start..s].matches('`').count() % 2 == 1 {
             continue;
         }
         let bold = text[..s].ends_with("**");
@@ -272,9 +323,16 @@ fn title_text(x: &str) -> Option<String> {
     let end = ["**", "\n", ". ", "; ", " \u{2014} "].iter().filter_map(|m| x.find(m)).min().unwrap_or(x.len());
     let t: String = x[..end].chars().filter(|c| *c != '`' && *c != '*').collect();
     let t = t.trim().trim_end_matches(['.', ':', ',']).trim();
-    let words = t.split_whitespace().filter(|w| w.chars().all(|c| c.is_alphabetic() || "'-,".contains(c)) && w.chars().any(char::is_alphabetic)).count();
+    let mut tokens = t.split_whitespace().peekable();
+    let mut words = 0;
+    while let Some(w) = tokens.next() {
+        let numbered = w.eq_ignore_ascii_case("item") && tokens.peek().is_some_and(|n| n.starts_with(|c: char| c.is_ascii_digit()));
+        if !numbered && w.chars().all(|c| c.is_alphabetic() || "'-,".contains(c)) && w.chars().any(char::is_alphabetic) {
+            words += 1;
+        }
+    }
     // A list of ids (`item 16, item 17, item 18`) is not a description.
-    if words < 3 || t.len() < 10 || item_ids(t).len() >= 2 {
+    if words < 3 {
         return None;
     }
     let mut out: String = t.chars().take(80).collect();
@@ -297,8 +355,9 @@ fn title_text(x: &str) -> Option<String> {
 /// One pass over the bytes, O(n).
 pub fn item_ids(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let mut push = |s: String| {
-        if !out.contains(&s) {
+        if seen.insert(s.clone()) {
             out.push(s)
         }
     };
@@ -344,6 +403,12 @@ fn is_code_id(w: &str) -> bool {
     allowed.contains(&prefix) && (rest.is_empty() || (rest.len() == 1 && rest[0].is_ascii_lowercase()))
 }
 
+impl Event {
+    pub fn verdict_line(&self, item: &str) -> &str {
+        self.id.strip_suffix(item).and_then(|id| id.strip_suffix(':')).unwrap_or(&self.id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +431,16 @@ mod tests {
         assert_eq!(d("See https://example.test/?ticket=P0a:manual for the full report", "P0a"), None);
         assert_eq!(d("P0a: item 16, item 17, item 18", "P0a"), None);
         assert_eq!(d("anything at all", ""), None);
+    }
+
+    #[test]
+    fn definitions_accept_real_id_references_and_skip_code_examples() {
+        assert_eq!(definition("XF3: Keep XF1 and XF2 in sync", "XF3").as_deref(), Some("Keep XF1 and XF2 in sync"));
+        assert_eq!(definition("XF3: Do it now", "XF3").as_deref(), Some("Do it now"));
+        for example in ["Sample ``XF3: This title is code``", "Sample ``\nXF3: This title is code\n``", "```md\nXF3: This is code\n```", "~~~\nXF3: This is also code\n~~~"] {
+            assert_eq!(definition(example, "XF3"), None);
+        }
+        assert_eq!(definition("```\nXF3: This is code\n```\nXF3: Keep the branches synced", "XF3").as_deref(), Some("Keep the branches synced"));
     }
 
     #[test]
