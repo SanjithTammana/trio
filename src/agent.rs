@@ -141,18 +141,26 @@ struct Run {
     tree: crate::proctree::Tree,
     /// Captured stdout and whether it ended within `OUT_CAP` (false: truncated).
     out: tokio::task::JoinHandle<(String, bool)>,
+    /// The last ERR_TAIL bytes of stderr, read only for usage-limit messages.
+    err: tokio::task::JoinHandle<String>,
     file: Option<PathBuf>,
     exit: Option<(i32, Instant)>,
 }
 
 /// A finished run. `reply` is set only for a successful, complete answer; anything else is a
 /// `problem`, which the room shows as a status line and never posts as the agent.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub struct Reaped {
     pub exit: i32,
     pub reply: Option<String>,
     pub problem: Option<String>,
+    /// Dollars the run cost, when its output says (Claude) or its tokens price it (Codex).
+    pub cost: Option<f64>,
+    /// The run failed on a usage limit: out until then.
+    pub stop: Option<crate::usage::Stop>,
 }
+
+const ERR_TAIL: usize = 8 * 1024;
 
 impl Reaped {
     fn judge(exit: i32, reply: Option<(String, bool)>) -> Self {
@@ -162,7 +170,7 @@ impl Reaped {
             Some((t, true)) if !t.trim().is_empty() => (Some(t), None),
             _ => (None, Some("finished without a reply".into())),
         };
-        Self { exit, reply, problem }
+        Self { exit, reply, problem, cost: None, stop: None }
     }
 }
 
@@ -218,8 +226,27 @@ impl CliAgent {
             run.out.abort();
             None // the reader never finished: whatever it holds is incomplete
         };
+        let err = if run.err.is_finished() {
+            run.err.now_or_never().and_then(|r| r.ok()).unwrap_or_default()
+        } else {
+            run.err.abort();
+            String::new()
+        };
+        // Structured output (`--output-format json`, `--json`) carries the reply, the cost and
+        // any error; plain output is the reply itself.
+        let text: String = stdout.as_ref().map(|(t, _)| t.clone()).unwrap_or_default();
+        let complete = stdout.as_ref().is_none_or(|s| s.1);
+        let parsed = crate::usage::parse_output(&text, crate::usage::model_of(&self.cfg.wake).as_deref().and_then(crate::usage::codex_rates));
+        let stdout = if parsed.structured { parsed.reply.clone().map(|r| (r, complete)) } else { stdout };
+        let code = if parsed.error && code == 0 { 1 } else { code };
         let reply = run.file.as_deref().and_then(read_reply_file).or(stdout);
-        Some(Reaped::judge(code, reply))
+        let mut r = Reaped::judge(code, reply);
+        r.cost = parsed.cost;
+        if code != 0 {
+            let plain = if parsed.structured { "" } else { text.as_str() };
+            r.stop = crate::usage::limit_stop(&format!("{}\n{err}\n{plain}", parsed.error_text), chrono::Local::now());
+        }
+        Some(r)
     }
 
     /// Kill the run and everything it started (the CLI's own children included).
@@ -278,7 +305,7 @@ impl Agent for CliAgent {
         cmd.args(args)
             .stdin(if prompt_arg { Stdio::null() } else { Stdio::piped() })
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         if let Some(dir) = &self.cfg.cwd {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -293,6 +320,25 @@ impl Agent for CliAgent {
                 let _ = stdin.shutdown().await; // EOF ends the prompt
             });
         }
+        let stderr = child.stderr.take();
+        let err = tokio::spawn(async move {
+            // Drain it all (a full pipe would stall the run) and keep the tail.
+            let mut tail: Vec<u8> = Vec::new();
+            if let Some(mut se) = stderr {
+                let mut chunk = [0u8; 4096];
+                while let Ok(n) = se.read(&mut chunk).await {
+                    if n == 0 {
+                        break;
+                    }
+                    tail.extend_from_slice(&chunk[..n]);
+                    if tail.len() > 2 * ERR_TAIL {
+                        tail.drain(..tail.len() - ERR_TAIL);
+                    }
+                }
+            }
+            let cut = tail.len().saturating_sub(ERR_TAIL);
+            String::from_utf8_lossy(&tail[cut..]).into_owned()
+        });
         let stdout = child.stdout.take();
         let out = tokio::spawn(async move {
             let mut buf = Vec::new();
@@ -303,7 +349,7 @@ impl Agent for CliAgent {
             }
             (String::from_utf8_lossy(&buf).into_owned(), rest == 0)
         });
-        self.run = Some(Run { child, tree, out, file: if uses_file { file } else { None }, exit: None });
+        self.run = Some(Run { child, tree, out, err, file: if uses_file { file } else { None }, exit: None });
         Ok(())
     }
 }

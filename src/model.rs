@@ -62,7 +62,14 @@ pub enum Body {
         items: Vec<String>,
     },
     RunStarted { agent: String, hop: u32, trigger: String },
-    RunFinished { agent: String, exit: i32, secs: u64 },
+    RunFinished {
+        agent: String,
+        exit: i32,
+        secs: u64,
+        /// Dollars the run cost (Claude reports it; Codex is priced from its tokens).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost: Option<f64>,
+    },
     Verdict { item: String, outcome: String },
     Claim { item: String },
     Status { text: String },

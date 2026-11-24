@@ -21,6 +21,7 @@ mod server;
 mod setup;
 mod source;
 mod seen;
+mod usage;
 mod work;
 
 use std::hash::{BuildHasher, RandomState};
@@ -36,6 +37,11 @@ fn main() {
         Some("init") => cmd_init(&args[1..]),
         Some("bind") => cmd_bind(&args[1..]),
         Some("setup") => setup::cmd_setup(&args[1..]),
+        // Claude Code's status line: never fail it, whatever happens.
+        Some("statusline") => {
+            cmd_statusline(&args[1..]);
+            Ok(())
+        }
         Some("hook") => match (args.get(1), args.get(2)) {
             (Some(s), Some(e)) => hook::run(s, e).or_else(|err| {
                 // Never fail the user's turn over Trio: report and exit 0.
@@ -44,12 +50,54 @@ fn main() {
             }),
             _ => Err("usage: trio hook <claude|codex> <prompt|stop|session-start>".into()),
         },
-        _ => Err("usage: trio open <room-dir> | trio say --room <dir> --as <who> \"<summary>\" [--detail ..] | trio init <room-dir> | trio bind <room-dir> <claude|codex> | trio hook <claude|codex> <event> | trio setup".into()),
+        _ => Err("usage: trio open <room-dir> | trio say --room <dir> --as <who> \"<summary>\" [--detail ..] | trio init <room-dir> | trio bind <room-dir> <claude|codex> | trio hook <claude|codex> <event> | trio setup | trio statusline [-- \"<your status line command>\"]".into()),
     };
     if let Err(e) = code {
         eprintln!("trio: {e}");
         std::process::exit(2);
     }
+}
+
+/// Claude Code's `statusLine` command: copy the documented `rate_limits` from the status-line
+/// JSON to `~/.trio/usage/claude.json`, where rooms read Claude's windows. With
+/// `-- "<command>"` the existing status line runs on the same input and its output is shown;
+/// without one, a short window summary is.
+fn cmd_statusline(args: &[String]) {
+    use std::io::{Read, Write};
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+    let v: Option<serde_json::Value> = serde_json::from_str(&input).ok();
+    let limits = v.as_ref().and_then(|v| v.get("rate_limits")).cloned();
+    if let (Some(rate_limits), Some(path)) = (limits.clone(), usage::claude_file()) {
+        let copy = usage::ClaudeCopy { at: usage::epoch_now(), rate_limits };
+        if let (Some(dir), Ok(bytes)) = (path.parent(), serde_json::to_vec(&copy)) {
+            let tmp = path.with_extension("json.tmp");
+            let _ = std::fs::create_dir_all(dir).and_then(|_| std::fs::write(&tmp, bytes)).and_then(|_| std::fs::rename(&tmp, &path));
+        }
+    }
+    if let Some(cmd) = args.iter().position(|a| a == "--").and_then(|i| args.get(i + 1..)).filter(|c| !c.is_empty()) {
+        let line = cmd.join(" ");
+        #[cfg(windows)]
+        let mut c = std::process::Command::new("cmd");
+        #[cfg(windows)]
+        c.args(["/C", &line]);
+        #[cfg(not(windows))]
+        let mut c = std::process::Command::new("sh");
+        #[cfg(not(windows))]
+        c.args(["-c", &line]);
+        if let Ok(mut child) = c.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn() {
+            if let Some(mut si) = child.stdin.take() {
+                let _ = si.write_all(input.as_bytes());
+            }
+            if let Ok(out) = child.wait_with_output() {
+                let _ = std::io::stdout().write_all(&out.stdout);
+            }
+        }
+        return;
+    }
+    let windows = limits.as_ref().map(usage::claude_windows).unwrap_or_default();
+    let text: Vec<String> = windows.iter().map(|w| format!("{} {:.0}%", w.label, w.used)).collect();
+    println!("{}", if text.is_empty() { "trio".to_string() } else { text.join(" \u{b7} ") });
 }
 
 fn flag(args: &[String], name: &str) -> Option<String> {
@@ -144,7 +192,8 @@ fn cmd_bind(args: &[String]) -> Result<(), String> {
             first.extend(["--session-id".into(), id.clone()]);
             run_with_stdin(&first, &cwd, &intro)?;
             let mut wake: Vec<String> = base.iter().map(|s| s.to_string()).collect();
-            wake.extend(["--resume".into(), "{session}".into()]);
+            // JSON output carries the reply, total_cost_usd and is_error (usage.rs).
+            wake.extend(["--output-format".into(), "json".into(), "--resume".into(), "{session}".into()]);
             (id, wake)
         }
         "codex" => {
@@ -158,7 +207,8 @@ fn cmd_bind(args: &[String]) -> Result<(), String> {
                 .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
                 .find_map(|v| v.get("thread_id").and_then(|t| t.as_str()).map(str::to_string))
                 .ok_or("codex printed no thread_id")?;
-            let mut wake: Vec<String> = vec!["@codex".into(), "exec".into(), "resume".into(), "{session}".into()];
+            // --json: turn.completed carries token usage, priced in usage.rs.
+            let mut wake: Vec<String> = vec!["@codex".into(), "exec".into(), "resume".into(), "--json".into(), "{session}".into()];
             wake.extend(model.iter().map(|s| s.to_string()));
             wake.extend(["-c", "sandbox_mode=\"read-only\"", "--skip-git-repo-check", "-o", "{out}", "-"].iter().map(|s| s.to_string()));
             (id, wake)

@@ -71,6 +71,13 @@ fn agent_of(node: &str) -> Option<String> {
     node.split_once('/').map(|(o, _)| o).filter(|o| AGENTS.contains(o)).map(str::to_string)
 }
 
+/// Who wrote item `id`, by the same rule as the Work lens.
+pub fn author_of(g: &Graph, id: &str) -> Option<String> {
+    let it = g.items.get(id)?;
+    let live: Vec<&WorkItem> = g.edges.iter().filter(|e| e.kind == "implements" && e.to == id).filter_map(|e| g.items.get(&e.from)).collect();
+    author(it, &live)
+}
+
 /// Who wrote the work: the one agent whose branches implement it, else whoever claimed it.
 fn author(it: &WorkItem, live: &[&WorkItem]) -> Option<String> {
     let mut owners: Vec<String> = live.iter().map(|b| b.id.as_str()).chain(it.merged_gone.iter().map(|m| m.branch.as_str())).filter_map(agent_of).collect();
@@ -102,7 +109,7 @@ fn who(name: &str, me: &str) -> String {
 }
 
 /// Sentence case for a name that starts a sentence ("you" -> "You").
-fn cap(s: &str) -> String {
+pub fn cap(s: &str) -> String {
     let mut c = s.chars();
     c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
 }
