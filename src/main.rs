@@ -139,22 +139,49 @@ fn cmd_init(args: &[String]) -> Result<(), String> {
     if cfg.exists() {
         return Err(format!("{} already exists", cfg.display()));
     }
-    let mut imports = String::new();
+    init_room(&dir)
+}
+
+/// Write a room.toml for a folder, picking up what is already there: every `<who>-posts.md`
+/// thread is imported read-only, and the git work tree the folder sits in is watched.
+fn init_room(dir: &std::path::Path) -> Result<(), String> {
+    let cfg = dir.join(".trio").join("room.toml");
     let me = room::human(&room::RoomCfg::default());
-    let mine = format!("{me}-posts.md");
-    for (file, from) in [("claude-posts.md", "claude"), ("codex-posts.md", "codex"), (mine.as_str(), me.as_str())] {
-        if dir.join(file).exists() {
-            imports.push_str(&format!("[[import]]\nfile = \"{file}\"\nfrom = \"{from}\"\n\n"));
-        }
-    }
-    let body = format!(
-        "# Trio room. Agents stay off until you enable them and bind a session.\nme = \"{me}\"\nhop_budget = 3\npaused = false\n# repo = \"C:/path/to/repo\"\n\n{imports}[agents.claude]\nenabled = false\nsession = \"\"\nwake = []\n\n[agents.codex]\nenabled = false\nsession = \"\"\nwake = []\n"
-    );
+    let body = room_toml(&me, &posts_files(dir), room::git_root(dir).as_deref());
     std::fs::create_dir_all(cfg.parent().expect("parent")).map_err(|e| e.to_string())?;
     std::fs::write(&cfg, body).map_err(|e| e.to_string())?;
-    register(&dir);
+    register(dir);
     println!("wrote {}", cfg.display());
     Ok(())
+}
+
+/// `claude-posts.md`, `codex-posts.md`, `sanjith-posts.md`, ...: (file, who), sorted by file.
+fn posts_files(dir: &std::path::Path) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let file = e.file_name().to_string_lossy().into_owned();
+            let who = file.strip_suffix("-posts.md")?.to_ascii_lowercase();
+            let ok = !who.is_empty() && who.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+            (ok && e.path().is_file()).then_some((file, who))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+fn room_toml(me: &str, imports: &[(String, String)], repo: Option<&std::path::Path>) -> String {
+    let imports: String = imports.iter().map(|(file, from)| format!("[[import]]\nfile = \"{file}\"\nfrom = \"{from}\"\n\n")).collect();
+    // Detected here so the file says what the room watches; a room without the line detects it on open.
+    let repo = match repo {
+        Some(r) => format!("repo = {}\n", toml::Value::String(r.display().to_string().replace('\\', "/"))),
+        None => "# repo = \"C:/path/to/repo\"\n".into(),
+    };
+    format!(
+        "# Trio room. Agents stay off until you enable them and bind a session.\nme = \"{me}\"\nhop_budget = 3\npaused = false\n{repo}\n{imports}[agents.claude]\nenabled = false\nsession = \"\"\nwake = []\n\n[agents.codex]\nenabled = false\nsession = \"\"\nwake = []\n"
+    )
 }
 
 /// Create the agent's Trio-owned session and write its binding into room.toml.
@@ -331,6 +358,10 @@ fn uuid_v4() -> String {
 
 fn cmd_open(args: &[String]) -> Result<(), String> {
     let dir = positional(args).into_iter().next().ok_or("missing room dir")?;
+    // Opening any folder makes it a room: `trio open .` in an existing project just works.
+    if !PathBuf::from(&dir).join(".trio").join("room.toml").exists() {
+        init_room(&PathBuf::from(&dir))?;
+    }
     let port: u16 = flag(args, "--port").map(|p| p.parse().map_err(|_| "bad --port")).transpose()?.unwrap_or(8964);
     let no_browser = args.iter().any(|a| a == "--no-browser");
     let web = args.iter().any(|a| a == "--web");
@@ -416,6 +447,26 @@ fn cmd_open(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_room_imports_every_posts_file_and_watches_its_repo() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("trio-init-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in ["codex-posts.md", "claude-posts.md", "Ana-posts.md", "-posts.md", "notes.md"] {
+            std::fs::write(dir.join(f), "").unwrap();
+        }
+        let files = posts_files(&dir);
+        assert_eq!(files, vec![("Ana-posts.md".into(), "ana".into()), ("claude-posts.md".into(), "claude".into()), ("codex-posts.md".into(), "codex".into())]);
+        let text = room_toml("sanjith", &files, Some(std::path::Path::new("C:\\work\\app")));
+        let cfg: room::RoomCfg = toml::from_str(&text).unwrap();
+        assert_eq!(cfg.repo.as_deref(), Some(std::path::Path::new("C:/work/app")));
+        assert_eq!(cfg.import.len(), 3);
+        assert!(!cfg.agents["claude"].enabled && !cfg.agents["codex"].enabled, "agents stay off until bound");
+        let none: room::RoomCfg = toml::from_str(&room_toml("sanjith", &[], None)).unwrap();
+        assert!(none.repo.is_none() && none.import.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn rooms_with_one_folder_name_get_separate_session_keys() {

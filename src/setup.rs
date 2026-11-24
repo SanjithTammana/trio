@@ -33,7 +33,9 @@ pub fn cmd_setup(args: &[String]) -> Result<(), String> {
         "\nNext:\n\
          - Claude Code: /plugin marketplace add SanjithTammana/trio, then /plugin install trio@trio\n\
          - Codex: add the two hooks in adapters/codex/hooks.json (see docs/codex.md), then review them in Settings > Hooks\n\
-         - A room: trio init <project-dir>, then trio open <project-dir>; in a session, type: trio"
+         - Usage-aware routing for Claude: set Claude Code's statusLine command to `trio statusline`\n   \
+           (or `trio statusline -- \"<your current command>\"` to keep yours); Codex is read from its session logs\n\
+         - A room: trio open <project-dir> (any folder; it picks up the repo and *-posts.md files); in a session, type: trio"
     );
     Ok(())
 }

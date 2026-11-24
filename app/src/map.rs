@@ -698,7 +698,8 @@ fn work(ui: &mut egui::Ui, body: Rect, app: &mut TrioApp, snap: &Snapshot, t: &T
                 let rect = Rect::from_min_size(pos2(x, y), vec2(lw, *h));
                 y += h + 8.0;
                 let w = n.work.as_ref().expect("work lane cards have work");
-                let key = format!("i:{}", n.id);
+                let branch = n.kind == "branch";
+                let key = format!("{}:{}", if branch { "b" } else { "i" }, n.id);
                 let you = w.waiting_on.as_deref() == Some(me);
                 let hit = Hit::new(ui, rect, Id::unique(("card", &n.id)), &format!("{} {}", n.id, n.summary));
                 let lit = hit.hot() || selected == Some(key.as_str());
@@ -715,7 +716,7 @@ fn work(ui: &mut egui::Ui, body: Rect, app: &mut TrioApp, snap: &Snapshot, t: &T
                 let my = rect.bottom() - 8.0 - 8.0;
                 let mut mx = rect.left() + 10.0;
                 if !n.summary.is_empty() {
-                    let ig = paint::line(ui, &n.id, theme::mono(10.5), t.ink3, 90.0);
+                    let ig = paint::line(ui, &n.id, theme::mono(10.5), t.ink3, if branch { 140.0 } else { 90.0 });
                     let tag = Rect::from_min_size(pos2(mx, my - ig.size().y / 2.0 - 1.0), ig.size() + vec2(8.0, 2.0));
                     p.rect_stroke(tag, 4.0, Stroke::new(1.0, t.line), StrokeKind::Inside);
                     p.galley(tag.min + vec2(4.0, 1.0), ig, t.ink3);
@@ -749,7 +750,8 @@ fn work(ui: &mut egui::Ui, body: Rect, app: &mut TrioApp, snap: &Snapshot, t: &T
                     hit.resp.clone().on_hover_text(w.story.clone());
                 }
                 if hit.clicked() {
-                    open = Some(Open { panel: Panel::Pick(Pick::Item(n.id.clone())), from: rect, pointer: hit.pointer() });
+                    let pick = if branch { Pick::Branch(n.id.clone()) } else { Pick::Item(n.id.clone()) };
+                    open = Some(Open { panel: Panel::Pick(pick), from: rect, pointer: hit.pointer() });
                 }
             }
             if lanes[k].len() > cards[k].len() {
@@ -858,9 +860,10 @@ fn catchup(ui: &mut egui::Ui, body: Rect, app: &mut TrioApp, snap: &Snapshot, c:
 /// sorted with cards waiting on `me` first, then newest. O(n log n).
 fn work_lanes<'a>(all: &'a [Node], me: &str, scope: Scope) -> Vec<Vec<&'a Node>> {
     // Age is measured from the newest item, as on the web (branches do not count).
-    let newest = all.iter().filter(|n| n.kind == "item").map(|n| ms(moved(n))).max().unwrap_or(0);
+    let newest = all.iter().filter(|n| n.work.is_some()).map(|n| ms(moved(n))).max().unwrap_or(0);
     let mut lanes: Vec<Vec<&Node>> = vec![Vec::new(); WORK_LANES.len()];
-    for n in all.iter().filter(|n| n.kind == "item") {
+    // Items, plus branches no item names (an existing repo's own work), each with a Work reading.
+    for n in all.iter() {
         let Some(w) = &n.work else { continue };
         let Some(k) = WORK_LANES.iter().position(|l| l.0 == w.lane) else { continue };
         let age = newest - ms(moved(n));

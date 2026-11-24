@@ -33,7 +33,8 @@ pub struct RoomCfg {
     /// Existing thread files to show read-only: `{ file = "codex-posts.md", from = "codex" }`.
     #[serde(default)]
     pub import: Vec<Import>,
-    /// Git repo whose `claude/*` and `codex/*` branch tips appear in the graph.
+    /// Git repo whose branch tips appear in the graph. Unset: the work tree the room sits in.
+    /// `repo = ""` turns git off.
     #[serde(default)]
     pub repo: Option<PathBuf>,
     /// Branch that work merges into (default: `main`, else `master`).
@@ -170,7 +171,12 @@ impl Room {
             })
             .collect();
         let trio_exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "trio".into());
-        let git = cfg.repo.clone().map(|r| crate::gitwatch::GitWatch::start(r, cfg.base.clone()));
+        let repo = match &cfg.repo {
+            Some(r) if r.as_os_str().is_empty() => None,
+            Some(r) => Some(root.join(r)),
+            None => git_root(&root),
+        };
+        let git = repo.map(|r| crate::gitwatch::GitWatch::start(r, cfg.base.clone()));
         let seen = crate::seen::load(&root);
         Ok(Self {
             root,
@@ -666,6 +672,11 @@ impl Room {
 }
 
 /// The room's human handle. Agent names and `trio` are refused so routing stays unambiguous.
+/// The top of the git work tree `dir` is in, if any.
+pub fn git_root(dir: &Path) -> Option<PathBuf> {
+    crate::gitwatch::git(dir, &["rev-parse", "--show-toplevel"]).filter(|s| !s.is_empty()).map(PathBuf::from)
+}
+
 pub fn human(cfg: &RoomCfg) -> String {
     let clean = |s: &str| -> Option<String> {
         let s: String = s.trim().to_ascii_lowercase().chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();

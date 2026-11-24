@@ -314,7 +314,8 @@ const moved = (n: GraphNode) => n.work?.last || n.last;
 function WorkLens({ snap, scope, explain, selected, onSelect, onHover }: { snap: Snapshot; scope: 'active' | 'all'; explain: boolean; selected: string | null; onSelect: (p: Pick, el: Element, pointer: boolean) => void; onHover: (k: string | null) => void }) {
   const me = snap.me;
   const byLane = useMemo(() => {
-    const items = snap.graph.items.filter((n) => n.kind === 'item' && n.work);
+    // Items, plus branches no item names (an existing repo's own work), each with a Work reading.
+    const items = snap.graph.items.filter((n) => n.work);
     const newest = items.reduce((m, n) => Math.max(m, ms(moved(n))), 0);
     const out = new Map<WorkLane, GraphNode[]>(WORK_LANES.map((l) => [l.lane, []]));
     for (const n of items) {
@@ -353,10 +354,11 @@ function WorkLens({ snap, scope, explain, selected, onSelect, onHover }: { snap:
             {explain && <p className="explain">{caption}</p>}
             {list.slice(0, scope === 'all' ? list.length : LANE_CAP).map((n) => {
               const w = n.work!;
-              const key = `i:${n.id}`;
+              const branch = n.kind === 'branch';
+              const key = `${branch ? 'b' : 'i'}:${n.id}`;
               return (
                 <button key={n.id} className={`card ${w.waiting_on === me ? 'you' : ''} ${selected === key ? 'on' : ''}`} data-morph={key} title={w.story}
-                  onClick={(e) => onSelect({ kind: 'item', id: n.id }, e.currentTarget, e.detail > 0)}
+                  onClick={(e) => onSelect({ kind: branch ? 'branch' : 'item', id: n.id }, e.currentTarget, e.detail > 0)}
                   onMouseEnter={() => onHover(key)} onMouseLeave={() => onHover(null)} onFocus={() => onHover(key)} onBlur={() => onHover(null)}>
                   <span className="card-t">{n.summary || <b className="mono">{n.id}</b>}</span>
                   <span className="card-m">
