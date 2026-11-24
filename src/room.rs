@@ -90,7 +90,8 @@ struct Held {
     /// held, so it holds after a ledger cut re-keys the event.
     #[serde(default)]
     stay: bool,
-    /// A reroute of this entry already failed to start in this process: not tried again.
+    /// A reroute of this entry already failed to start: not tried again until a restart or a
+    /// replay. The entry still goes out when its own agent is back.
     #[serde(skip)]
     tried: bool,
 }
@@ -653,6 +654,9 @@ impl Room {
             for h in fresh.held.clone() {
                 fresh.deliver(&h.event.id, &h.agent);
             }
+            for (agent, e) in fresh.triggers.clone() {
+                fresh.deliver(&e.id, &agent);
+            }
         }
         fresh.rev = self.rev + 1;
         *self = fresh;
@@ -1021,6 +1025,9 @@ impl Room {
                 let d = self.wake(o, e, recent, detail, &note);
                 if !self.queue_if_busy(o, e, &d, &note) && matches!(d, WakeDecision::Failed(_)) {
                     self.hold(t, e, &[]);
+                    if let Some(h) = self.held.iter_mut().find(|h| h.agent == t && h.event.id == e.id) {
+                        h.tried = true;
+                    }
                     self.record("trio", Body::Status { text: clip(&format!("held for {}: {} could not take it", cap(t), cap(o)), 120) });
                 }
             }
@@ -1093,7 +1100,7 @@ impl Room {
         }
         let over = h.event.from != self.me() && self.hop > self.cfg.hop_budget;
         let Some(o) = other_agent(&h.agent).filter(|o| {
-            *o != h.event.from && !over && self.agents.get(*o).is_some_and(|a| a.ready()) && !self.usage(o).out() && !self.has(&h.event.id, o)
+            *o != h.event.from && !over && self.agents.get(*o).is_some_and(|a| a.ready()) && !self.usage(o).out() && !self.has(&h.event.id, o) && !self.reviews_own_work(&h.event, o)
         }) else {
             return false;
         };
@@ -1980,6 +1987,28 @@ mod tests {
         room.say(&room.me(), "@claude look at XF2", None).unwrap();
         room.tick();
         assert_eq!(room.held_for("claude"), 2, "the new message is held too, though it may reuse the old id");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_reroute_that_cannot_start_is_tried_once() {
+        let (root, room) = room_with("reroute-fail", &[("claude", "Done.", 0)]);
+        drop(room);
+        let path = root.join(".trio").join("room.toml");
+        let mut cfg = std::fs::read_to_string(&path).unwrap();
+        let cwd = toml::Value::String(root.join("cw-codex").display().to_string()).to_string();
+        cfg.push_str(&format!("[agents.codex]\nenabled = true\nsession = \"s\"\ncwd = {cwd}\nwake = [\"trio-no-such-binary-xyz\"]\n"));
+        std::fs::write(&path, cfg).unwrap();
+        let mut room = Room::open(&root).unwrap();
+        room.tick();
+        room.stops.insert("claude".into(), stop());
+        room.say(&room.me(), "@claude look at XF1", None).unwrap();
+        for _ in 0..5 {
+            room.tick();
+        }
+        assert_eq!(room.held_for("claude"), 1, "it waits for Claude");
+        let ledger = std::fs::read_to_string(&room.ledger).unwrap();
+        assert_eq!(ledger.matches("routed to Codex").count(), 1, "{ledger}");
         let _ = std::fs::remove_dir_all(root);
     }
 
