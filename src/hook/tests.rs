@@ -158,7 +158,7 @@ fn bind_inject_post_and_leave() {
 #[test]
 fn an_attached_session_speaks_as_the_rooms_agent_on_its_harness() {
     let f = Fixture::new("named");
-    std::fs::write(f.room.join(".trio").join("room.toml"), "hop_budget = 3\nme = \"sanjith\"\n[agents.sonnet]\nharness = \"claude\"\n").unwrap();
+    std::fs::write(f.room.join(".trio").join("room.toml"), "hop_budget = 3\nme = \"sanjith\"\n[agents.sonnet]\nharness = \"claude\"\nroles = [\"review\"]\n").unwrap();
     let a = answer(f.prompt("s1", "trio"));
     assert!(a.contains("as sonnet"), "{a}");
     assert_eq!(attached(&f.room, "claude").unwrap().session, "s1", "the marker stays keyed by harness");
@@ -166,9 +166,22 @@ fn an_attached_session_speaks_as_the_rooms_agent_on_its_harness() {
     let ctx = context(f.prompt("s1", "what's new?"));
     assert!(ctx.contains("sanjith -> you: @sonnet check P0a") && ctx.contains("    XF30 first."), "{ctx}");
     assert!(ctx.contains("as sonnet's message"), "{ctx}");
+    f.say("sanjith", "@review look at XF31", Some("Start at the hook."));
+    let ctx = context(f.prompt("s1", "and?"));
+    assert!(ctx.contains("sanjith -> @review (a role you hold): @review look at XF31") && ctx.contains("    Start at the hook."), "{ctx}");
     f.hook("s1", HookEvent::Stop, &f.room, None, Some("P0a passes."));
     assert!(f.ledger_messages().iter().any(|(from, s)| from == "sonnet" && s == "P0a passes."), "posted as sonnet");
     assert!(answer(f.prompt("s1", "trio status")).contains("as sonnet"));
+}
+
+#[test]
+fn a_session_does_not_join_as_an_agent_on_another_harness() {
+    let f = Fixture::new("clash");
+    std::fs::write(f.room.join(".trio").join("room.toml"), "me = \"sanjith\"\n[agents.claude]\nharness = \"command\"\n").unwrap();
+    let h = HookIn { surface: Surface::Claude, event: HookEvent::PromptSubmit, session_id: "s1".into(), cwd: f.room.clone(), prompt: Some("trio".into()), reply: None, turn_id: None };
+    let out = handle(&f.store, &h);
+    assert!(format!("{out:?}").contains("is an agent on command"), "{out:?}");
+    assert!(attached(&f.room, "claude").is_none());
 }
 
 #[test]

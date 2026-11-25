@@ -115,9 +115,34 @@ fn default_budget() -> u32 {
 /// The handle an attached session on `harness` speaks as: the first agent in room.toml on that
 /// harness (the one routing treats as attached, `Room::attached_to`), else the harness name.
 pub fn attached_handle(root: &Path, harness: &str) -> String {
-    let Ok(text) = std::fs::read_to_string(root.join(".trio").join("room.toml")) else { return harness.into() };
-    let Ok(cfg) = toml::from_str::<RoomCfg>(&text) else { return harness.into() };
-    agent_order(&text, &cfg).into_iter().find(|n| cfg.agents[n.as_str()].harness(n).name == harness).unwrap_or_else(|| harness.into())
+    attached_agent(root, harness).0
+}
+
+/// When no agent runs on `harness` but an agent is named after it on another harness (a
+/// `[agents.claude]` running a command), that harness: a session joining would post under a
+/// handle routing never treats as attached.
+pub fn handle_clash(root: &Path, harness: &str) -> Option<&'static str> {
+    let text = std::fs::read_to_string(root.join(".trio").join("room.toml")).ok()?;
+    let cfg = toml::from_str::<RoomCfg>(&text).ok()?;
+    if cfg.agents.iter().any(|(n, a)| a.harness(n).name == harness) {
+        return None;
+    }
+    cfg.agents.get(harness).map(|a| a.harness(harness).name)
+}
+
+/// As `attached_handle`, with the roles that agent holds (none for the bare harness name).
+pub fn attached_agent(root: &Path, harness: &str) -> (String, Vec<String>) {
+    let bare = || (harness.to_string(), Vec::new());
+    let Ok(text) = std::fs::read_to_string(root.join(".trio").join("room.toml")) else { return bare() };
+    let Ok(cfg) = toml::from_str::<RoomCfg>(&text) else { return bare() };
+    agent_order(&text, &cfg)
+        .into_iter()
+        .find(|n| cfg.agents[n.as_str()].harness(n).name == harness)
+        .map(|n| {
+            let roles = cfg.agents[n.as_str()].roles();
+            (n, roles)
+        })
+        .unwrap_or_else(bare)
 }
 
 fn agent_order(text: &str, cfg: &RoomCfg) -> Vec<String> {
