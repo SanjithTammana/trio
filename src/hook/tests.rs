@@ -156,6 +156,22 @@ fn bind_inject_post_and_leave() {
 }
 
 #[test]
+fn an_attached_session_speaks_as_the_rooms_agent_on_its_harness() {
+    let f = Fixture::new("named");
+    std::fs::write(f.room.join(".trio").join("room.toml"), "hop_budget = 3\nme = \"sanjith\"\n[agents.sonnet]\nharness = \"claude\"\n").unwrap();
+    let a = answer(f.prompt("s1", "trio"));
+    assert!(a.contains("as sonnet"), "{a}");
+    assert_eq!(attached(&f.room, "claude").unwrap().session, "s1", "the marker stays keyed by harness");
+    f.say("sanjith", "@sonnet check P0a", Some("XF30 first."));
+    let ctx = context(f.prompt("s1", "what's new?"));
+    assert!(ctx.contains("sanjith -> you: @sonnet check P0a") && ctx.contains("    XF30 first."), "{ctx}");
+    assert!(ctx.contains("as sonnet's message"), "{ctx}");
+    f.hook("s1", HookEvent::Stop, &f.room, None, Some("P0a passes."));
+    assert!(f.ledger_messages().iter().any(|(from, s)| from == "sonnet" && s == "P0a passes."), "posted as sonnet");
+    assert!(answer(f.prompt("s1", "trio status")).contains("as sonnet"));
+}
+
+#[test]
 fn ordinary_trio_sentence_reaches_the_model() {
     let f = Fixture::new("sentence");
     assert_eq!(f.prompt("s1", "trio is broken, can you look"), HookOut::Continue);

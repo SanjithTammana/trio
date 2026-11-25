@@ -112,6 +112,14 @@ fn default_budget() -> u32 {
 /// The other agent, for rerouting.
 /// The agents' handles in the order room.toml lists them (toml tables carry no order once
 /// parsed into a map, so it is read off the document itself). Handles it cannot place go last.
+/// The handle an attached session on `harness` speaks as: the first agent in room.toml on that
+/// harness (the one routing treats as attached, `Room::attached_to`), else the harness name.
+pub fn attached_handle(root: &Path, harness: &str) -> String {
+    let Ok(text) = std::fs::read_to_string(root.join(".trio").join("room.toml")) else { return harness.into() };
+    let Ok(cfg) = toml::from_str::<RoomCfg>(&text) else { return harness.into() };
+    agent_order(&text, &cfg).into_iter().find(|n| cfg.agents[n.as_str()].harness(n).name == harness).unwrap_or_else(|| harness.into())
+}
+
 fn agent_order(text: &str, cfg: &RoomCfg) -> Vec<String> {
     let mut order: Vec<String> = text
         .parse::<toml_edit::DocumentMut>()

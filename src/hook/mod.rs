@@ -306,11 +306,11 @@ fn run_command(store: &Store, h: &HookIn, cmd: Command) -> Result<String, String
         },
         Command::Status => match load(store, h).ok().flatten() {
             Some(b) if holds(&b, h) == Ok(true) => {
-                let unread = unread(&b, h.surface.agent()).map(|(m, _)| m.len()).unwrap_or(0);
+                let me = crate::room::attached_handle(&b.room, h.surface.agent());
+                let unread = unread(&b, &me).map(|(m, _)| m.len()).unwrap_or(0);
                 Ok(format!(
-                    "Trio: in room \"{}\" as {}; {unread} unread line(s) arrive with your next message. `trio off` leaves.",
+                    "Trio: in room \"{}\" as {me}; {unread} unread line(s) arrive with your next message. `trio off` leaves.",
                     room_name(&b.room),
-                    h.surface.agent()
                 ))
             }
             _ => Ok(format!("Trio: this session is not in a room.{}", rooms_hint(store))),
@@ -352,8 +352,9 @@ fn run_command(store: &Store, h: &HookIn, cmd: Command) -> Result<String, String
             let _ = store.register_room(&room);
             poke(&room);
             let took = if previous.is_some() { format!(" It replaces the {agent} session that held the room before.") } else { String::new() };
+            let handle = crate::room::attached_handle(&room, agent);
             Ok(format!(
-                "Trio: this session is in room \"{}\" as {agent}. Each message you send brings the room's new lines; each reply posts to the room.{took} `trio off` leaves.{stuck}",
+                "Trio: this session is in room \"{}\" as {handle}. Each message you send brings the room's new lines; each reply posts to the room.{took} `trio off` leaves.{stuck}",
                 room_name(&room)
             ))
         }
@@ -361,7 +362,9 @@ fn run_command(store: &Store, h: &HookIn, cmd: Command) -> Result<String, String
 }
 
 fn inject(store: &Store, h: &HookIn, mut b: Binding) -> Result<HookOut, String> {
-    let (msgs, end) = unread(&b, h.surface.agent())?;
+    // The session speaks as the room's agent on this harness (`[agents.sonnet]` on claude).
+    let me = crate::room::attached_handle(&b.room, h.surface.agent());
+    let (msgs, end) = unread(&b, &me)?;
     if end == b.cursor {
         return Ok(HookOut::Continue);
     }
@@ -370,7 +373,7 @@ fn inject(store: &Store, h: &HookIn, mut b: Binding) -> Result<HookOut, String> 
     if msgs.is_empty() {
         return Ok(HookOut::Continue);
     }
-    Ok(HookOut::AddContext(render_lines(&room_name(&b.room), h.surface.agent(), &msgs)))
+    Ok(HookOut::AddContext(render_lines(&room_name(&b.room), &me, &msgs)))
 }
 
 /// Messages after the cursor that this agent did not write, and the new cursor.
@@ -423,7 +426,7 @@ fn on_stop(store: &Store, h: &HookIn) -> Result<(), String> {
     }
     let Some((summary, detail)) = split_reply(reply) else { return Ok(()) };
     let room = crate::room::Room::open(&b.room).map_err(|e| e.to_string())?;
-    room.say(h.surface.agent(), &summary, detail)?;
+    room.say(&crate::room::attached_handle(&b.room, h.surface.agent()), &summary, detail)?;
     b.last_post = digest;
     b.last_turn = h.turn_id.clone();
     save(store, h, &b)?;
@@ -439,7 +442,7 @@ fn on_session_start(store: &Store, h: &HookIn) -> Result<HookOut, String> {
     Ok(HookOut::AddContext(format!(
         "[Trio: this session is in room \"{}\" as {}. New room lines arrive with each user message; your final answer each turn is posted to the room. The user can type `trio off` to leave.]",
         room_name(&b.room),
-        h.surface.agent()
+        crate::room::attached_handle(&b.room, h.surface.agent())
     )))
 }
 
