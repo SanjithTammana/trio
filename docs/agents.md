@@ -14,11 +14,11 @@ trio bind <room-dir> <handle> [--harness h] [--model m] [--roles r,..] [--accoun
 trio bind . claude                                   # Claude Code, roles build + review
 trio bind . codex --roles build                      # Codex, builds only
 trio bind . gemini --harness antigravity --roles review
-trio bind . oss --harness antigravity --model gpt-oss-120b --roles chores
+trio bind . oss --harness antigravity --model gpt-oss-120b-medium --roles chores
 trio bind . sonnet --harness claude --model sonnet --roles review
 ```
 
-A handle is letters, digits, `-` and `_`. It cannot be `both`, `all`, `trio` or `github`, and it should not be one of the roles you use. When the handle names a harness (`claude`, `codex`, `antigravity`), `--harness` can be left out.
+A handle is letters, digits, `-` and `_`. It cannot be your own handle, `both`, `all`, `trio` or `github`, and it should not be one of the roles you use. A mention is the whole word: `@claude-mini` does not wake `claude`, and `me@claude.dev` wakes no one. When the handle names a harness (`claude`, `codex`, `antigravity`), `--harness` can be left out.
 
 ## Harnesses
 
@@ -29,7 +29,7 @@ A handle is letters, digits, `-` and `_`. It cannot be `both`, `all`, `trio` or 
 | `antigravity` | `agy -p --output-format json --mode plan` | gemini-4-hydrogen-high | its error replies only | no |
 | `command` | anything you write | none | its error replies only | no |
 
-Antigravity agents run in plan mode, so they do not edit files, with the repository added as a folder they can read (`--add-dir`), and resume their conversation by id. The prompt goes in as an argument, so a turn over 30,000 characters is refused. Install `agy` and sign in once before binding.
+Antigravity agents run in plan mode, so they do not edit files, with the repository added as a folder they can read (`--add-dir`), and resume their conversation by id. The prompt goes in as an argument, so a turn over 30,000 characters is refused. Install `agy` and sign in once before binding; `agy models` lists the model ids your account can use (for example `gemini-4-hydrogen-high`, `claude-sonnet-4-6`, `gpt-oss-120b-medium`).
 
 ### Any other CLI: the `command` harness
 
@@ -53,7 +53,7 @@ The wake is an argument list, never a shell line. Trio substitutes:
 | `{session}` | `session` from the config (a wake that uses it needs one) |
 | `{out}` | a reply file in `cwd`; when it is non-empty after the run, it is the reply |
 
-Without `{out}`, the reply is stdout. Claude-style JSON (`result`, `is_error`, `total_cost_usd`) and Antigravity JSON (`status`, `response`) are recognised; anything else is used as plain text. The first line of the reply is the chat summary.
+Without `{out}`, the reply is stdout. Claude-style JSON (`result`, `is_error`, `total_cost_usd`), Codex JSON lines (`item.completed`, `turn.completed`, `turn.failed`) and Antigravity JSON (`status`, `response`) are recognised; anything else is used as plain text. The first line of the reply is the chat summary.
 
 ## Roles
 
@@ -87,7 +87,7 @@ Preset { name: "mycli", label: "My CLI", attach: false, model: Some("default-mod
 ```
 
 - `bind` creates the session and returns `(session id, wake argv)`. It receives the handle, model, working folder, the repository to read, and an intro prompt; see `bind_antigravity` for a CLI that prints its own session id.
-- `usage`, when the CLI exposes its limits, returns the current windows; it is read once per refresh for each account.
+- `usage`, when the CLI exposes its limits, returns the current windows of the account the CLI is signed in to; it is read once per refresh for each harness and applies to that harness's default account.
 - If the CLI's output is JSON that is neither shape above, add a branch to `usage::parse_output` so replies, costs and limit errors are read from it.
 
 Add a test that `bind` builds the argv you expect, and a room test with a `command` stand-in, as the tests in `src/room.rs` do.

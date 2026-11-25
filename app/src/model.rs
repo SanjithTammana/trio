@@ -204,7 +204,7 @@ pub struct AgentState {
     pub running: bool,
     #[serde(default)]
     pub attached: Option<String>,
-    /// The shape it is drawn with: claude, codex, or hex, down, pent, plus, bar, ring by position.
+    /// The shape it is drawn with: claude, codex, or diamond, down, plus, ring, bar, pent, hex by position.
     #[serde(default)]
     pub glyph: Option<String>,
     #[serde(default)]
@@ -241,6 +241,11 @@ pub fn glyph_of(who: &str) -> String {
 pub fn agent_names() -> Vec<String> {
     let r = ROSTER.read().map(|r| r.iter().map(|e| e.name.clone()).collect::<Vec<_>>()).unwrap_or_default();
     if r.is_empty() { vec!["claude".into(), "codex".into()] } else { r }
+}
+
+/// The roles an agent holds; a `@<role>` mention addresses each of them.
+pub fn roles_of(who: &str) -> Vec<String> {
+    ROSTER.read().ok().and_then(|r| r.iter().find(|e| e.name == who).map(|e| e.roles.clone())).unwrap_or_default()
 }
 
 /// Every role some agent holds, for `@<role>` mentions.

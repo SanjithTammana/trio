@@ -55,6 +55,7 @@ pub fn who(p: &Painter, rect: Rect, who: &str, me: &str, to: bool, c: Color32) {
         "claude" => b.circle(p, 5.0, 5.0, 4.2, filled, c),
         "codex" => b.shape(p, &[(5.0, 0.8), (9.4, 9.0), (0.6, 9.0)], filled, c),
         "trio" => b.circle(p, 5.0, 5.0, 2.4, false, c),
+        "diamond" => b.shape(p, &[(5.0, 0.4), (9.6, 5.0), (5.0, 9.6), (0.4, 5.0)], filled, c),
         "hex" => b.shape(p, &[(2.7, 1.0), (7.3, 1.0), (9.6, 5.0), (7.3, 9.0), (2.7, 9.0), (0.4, 5.0)], filled, c),
         "down" => b.shape(p, &[(0.6, 1.0), (9.4, 1.0), (5.0, 9.2)], filled, c),
         "pent" => b.shape(p, &[(5.0, 0.6), (9.4, 3.8), (7.7, 9.2), (2.3, 9.2), (0.6, 3.8)], filled, c),

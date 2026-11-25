@@ -602,7 +602,7 @@ impl Room {
         if self.release_held() {
             changed = true;
         }
-        let usage = ["claude", "codex"].map(|a| serde_json::to_string(&self.usage(a)).unwrap_or_default()).join("|");
+        let usage = self.order.iter().map(|a| serde_json::to_string(&self.usage(a)).unwrap_or_default()).collect::<Vec<_>>().join("|");
         if usage != self.usage_shown {
             self.usage_shown = usage;
             changed = true;
@@ -1038,11 +1038,13 @@ impl Room {
         crate::hook::attached(&self.root, h.name)
     }
 
-    /// Lower is better: available before out, idle before busy, ok before low, then list order.
-    fn rank(&self, a: &str) -> (u8, u8, u8, usize) {
+    /// Lower is better: available before out, headless before attached (which waits for your
+    /// next message there), idle before busy, ok before low, then list order.
+    fn rank(&self, a: &str) -> (u8, u8, u8, u8, usize) {
         let u = self.usage(a);
         let idle = self.agents.get(a).is_some_and(|x| x.ready());
-        (u8::from(u.out()), u8::from(!idle), u8::from(u.state == "low"), self.order.iter().position(|n| n == a).unwrap_or(usize::MAX))
+        let attached = self.attached_to(a).is_some();
+        (u8::from(u.out()), u8::from(attached), u8::from(!idle), u8::from(u.state == "low"), self.order.iter().position(|n| n == a).unwrap_or(usize::MAX))
     }
 
     /// The agent `@<role>` reaches: the best-ranked enabled holder of it that did not write the
@@ -1115,6 +1117,10 @@ impl Room {
         if let Some(a) = self.attached_to(t) {
             self.record("trio", Body::Status { text: format!("{t} is attached: waiting on you in {}", a.surface.label()) });
             self.deliver(&e.id, t);
+            return;
+        }
+        if !self.enabled(t) {
+            let _ = self.wake(t, e, recent, detail, &[]); // records "not woken: Disabled"
             return;
         }
         let u = self.usage(t);
@@ -1531,13 +1537,16 @@ impl Room {
             m.insert(n.clone(), serde_json::json!({
                 "enabled": a.cfg.enabled, "running": a.is_running(), "hue": crate::agent::Participant::hue(a),
                 "glyph": glyph, "harness": h.label, "model": a.cfg.model, "roles": a.cfg.roles(), "order": i,
+                "attached": self.attached_to(n).map(|x| x.surface),
             }));
         }
-        // Attached sessions show up whether or not a headless agent is configured.
+        // An attached session on a harness no configured agent runs on shows as its own lane.
         for n in ["claude", "codex"] {
+            if self.order.iter().any(|o| self.agents[o.as_str()].cfg.harness(o).name == n) || m.contains_key(n) {
+                continue;
+            }
             let attached = crate::hook::attached(&self.root, n).map(|a| a.surface);
-            let entry = m.entry(n.to_string()).or_insert_with(|| serde_json::json!({ "enabled": false, "running": false, "hue": "dusk", "glyph": n, "roles": crate::agent::DEFAULT_ROLES, "order": 1000 }));
-            entry["attached"] = serde_json::json!(attached);
+            m.insert(n.to_string(), serde_json::json!({ "enabled": false, "running": false, "hue": "dusk", "glyph": n, "roles": crate::agent::DEFAULT_ROLES, "order": 1000, "attached": attached }));
         }
         serde_json::Value::Object(m)
     }
@@ -2699,6 +2708,26 @@ mod tests {
         room.tick();
         settle(&mut room).await;
         assert_eq!(woken(&root), ["codex"], "Gemini only reviews; Codex also builds");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn a_role_prefers_a_free_headless_holder_to_an_attached_one() {
+        let (root, mut room) = room_with_cfg("role-attached", &[
+            ("sonnet", "Done.", 0, "harness = 'claude'\nroles = ['build', 'review']"),
+            ("gemini", "Looked.", 0, "harness = 'command'\nroles = ['review']"),
+        ]);
+        let a = crate::hook::Attachment { surface: crate::hook::Surface::Claude, session: "s".into(), since: "t".into() };
+        std::fs::create_dir_all(root.join(".trio").join("attached")).unwrap();
+        std::fs::write(root.join(".trio").join("attached").join("claude.json"), serde_json::to_string(&a).unwrap()).unwrap();
+        room.tick();
+        let states = room.agent_states();
+        assert!(states["sonnet"]["attached"].is_string(), "the attached Claude Code session is Sonnet's: {states}");
+        assert!(states.get("claude").is_none(), "no second lane for the same session");
+        room.say(&room.me(), "@review look at XF5", None).unwrap();
+        room.tick();
+        settle(&mut room).await;
+        assert_eq!(woken(&root), ["gemini"], "Sonnet would wait for your next message in Claude Code");
         let _ = std::fs::remove_dir_all(root);
     }
 

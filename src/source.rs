@@ -447,8 +447,12 @@ pub fn mentions_in(text: &str, human: &str) -> Vec<String> {
         .filter(|(w, _)| !w.is_empty())
         .filter_map(|(w, name)| {
             let tag = format!("@{w}");
-            // A whole handle: `@codex` but not `@codexbot`.
-            lower.match_indices(&tag).find(|(i, _)| !lower[i + tag.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')).map(|(i, _)| (i, name.to_string()))
+            // A whole handle: `@codex` but not `@codexbot`, `@codex-mini` or `me@codex.dev`.
+            let word = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+            lower
+                .match_indices(&tag)
+                .find(|(i, _)| !lower[i + tag.len()..].starts_with(word) && !lower[..*i].ends_with(|c: char| word(c) || c == '.'))
+                .map(|(i, _)| (i, name.to_string()))
         })
         .collect();
     found.sort();
@@ -459,6 +463,15 @@ pub fn mentions_in(text: &str, human: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mention_is_the_whole_handle() {
+        add_handles(&["claude-mini".to_string(), "all-team".to_string()]);
+        assert_eq!(mentions_in("@claude-mini look at XF1", "sanjith"), ["claude-mini"], "not claude too");
+        assert_eq!(mentions_in("@all-team heads up", "sanjith"), ["all-team"], "not all");
+        assert!(mentions_in("mail me@claude.dev or x.@codex", "sanjith").is_empty(), "inside a word is no mention");
+        assert_eq!(mentions_in("thanks @claude. (@codex)", "sanjith"), ["claude", "codex"]);
+    }
 
     fn tmp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("trio-test-{}-{name}", std::process::id()));

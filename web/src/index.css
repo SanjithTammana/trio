@@ -172,17 +172,15 @@ button.bar:hover .lbl { text-decoration: underline; text-decoration-color: var(-
 .chat { display: grid; grid-template-rows: minmax(0, 1fr) auto; height: 100%; }
 .log { overflow: auto; padding: 0 0 20px; }
 .lanes-head, .msg, .sys {
-  display: grid; grid-template-columns: 60px minmax(0, 1fr); column-gap: 12px;
+  display: grid; grid-template-columns: calc(var(--lanes, 3) * 20px) minmax(0, 1fr); column-gap: 12px;
   max-width: 880px; margin: 0 auto; padding: 0 16px;
 }
 .lanes-head { position: sticky; top: 0; background: var(--bg); padding-top: 10px; padding-bottom: 6px; z-index: 1; font-size: 11px; color: var(--ink-3); align-items: center; }
 .lanes-head .gut > span { padding-top: 0; color: var(--ink-3); }
-.gut { display: grid; grid-template-columns: repeat(3, 20px); position: relative; align-self: stretch; }
+.gut { display: grid; grid-template-columns: repeat(var(--lanes, 3), 20px); position: relative; align-self: stretch; }
 /* lane hairlines run through every row, so a conversation reads as threads between columns */
 .msg .gut, .sys .gut { --lane: color-mix(in srgb, var(--line) 40%, var(--line-2)); background:
-  linear-gradient(var(--lane), var(--lane)) 9.5px 0 / 1px 100% no-repeat,
-  linear-gradient(var(--lane), var(--lane)) 29.5px 0 / 1px 100% no-repeat,
-  linear-gradient(var(--lane), var(--lane)) 49.5px 0 / 1px 100% no-repeat; }
+  repeating-linear-gradient(to right, transparent 0 9.5px, var(--lane) 9.5px 10.5px, transparent 10.5px 20px); }
 .gut > span { display: grid; justify-items: center; align-content: start; padding-top: 8px; color: var(--ink); }
 .gut > span .g { background: var(--bg); box-shadow: 0 0 0 3px var(--bg); }
 .gut > span.to { color: var(--ink-3); }

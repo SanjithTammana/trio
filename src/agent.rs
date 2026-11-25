@@ -188,7 +188,7 @@ struct Run {
     tree: crate::proctree::Tree,
     /// Captured stdout: its first `OUT_CAP` bytes, whether that was all of it, and (when it was
     /// not) its last `OUT_TAIL` bytes, where structured output puts the turn's outcome.
-    out: tokio::task::JoinHandle<(String, bool, String)>,
+    out: tokio::task::JoinHandle<(String, bool, String, bool)>,
     /// The last ERR_TAIL bytes of stderr, read only for usage-limit messages.
     err: tokio::task::JoinHandle<String>,
     file: Option<PathBuf>,
@@ -213,9 +213,13 @@ const OUT_TAIL: usize = 16 * 1024;
 
 /// What structured output is parsed from: all of it, or for truncated output the head plus the
 /// whole lines of the tail, so a final `turn.completed`, `turn.failed` or `error` is still seen.
-fn parse_text(head: &str, complete: bool, tail: &str) -> String {
+/// `contiguous`: the tail starts right where the head ended (nothing between was dropped).
+fn parse_text(head: &str, complete: bool, tail: &str, contiguous: bool) -> String {
     if complete || tail.is_empty() {
         return head.to_string();
+    }
+    if contiguous {
+        return format!("{head}{tail}");
     }
     let whole = tail.split_once('\n').map(|(_, rest)| rest).unwrap_or("");
     format!("{head}\n{whole}")
@@ -293,11 +297,11 @@ impl CliAgent {
         };
         // Structured output (`--output-format json`, `--json`) carries the reply, the cost and
         // any error; plain output is the reply itself.
-        let text: String = stdout.as_ref().map(|(t, _, _)| t.clone()).unwrap_or_default();
+        let text: String = stdout.as_ref().map(|(t, _, _, _)| t.clone()).unwrap_or_default();
         let complete = stdout.as_ref().is_none_or(|s| s.1);
-        let tail = stdout.as_ref().map(|(_, _, t)| t.as_str()).unwrap_or("");
-        let parsed = crate::usage::parse_output(&parse_text(&text, complete, tail), crate::usage::model_of(&self.cfg.wake).as_deref().and_then(crate::usage::codex_rates));
-        let stdout = stdout.map(|(t, c, _)| (t, c));
+        let (tail, contiguous) = stdout.as_ref().map(|(_, _, t, c)| (t.as_str(), *c)).unwrap_or(("", true));
+        let parsed = crate::usage::parse_output(&parse_text(&text, complete, tail, contiguous), crate::usage::model_of(&self.cfg.wake).as_deref().and_then(crate::usage::codex_rates));
+        let stdout = stdout.map(|(t, c, _, _)| (t, c));
         let stdout = if parsed.structured { parsed.reply.clone().map(|r| (r, complete)) } else { stdout };
         let code = if parsed.error && code == 0 { 1 } else { code };
         let reply = run.file.as_deref().and_then(read_reply_file).or(stdout);
@@ -424,7 +428,8 @@ impl Agent for CliAgent {
                 }
             }
             let cut = tail.len().saturating_sub(OUT_TAIL);
-            (String::from_utf8_lossy(&buf).into_owned(), rest == 0, String::from_utf8_lossy(&tail[cut..]).into_owned())
+            let kept = tail.len() - cut;
+            (String::from_utf8_lossy(&buf).into_owned(), rest == 0, String::from_utf8_lossy(&tail[cut..]).into_owned(), kept == rest)
         });
         self.run = Some(Run { child, tree, out, err, file: if uses_file { file } else { None }, exit: None });
         Ok(())
@@ -518,10 +523,14 @@ mod tests {
     fn truncated_output_still_parses_the_outcome_at_its_end() {
         let head = "{\"type\":\"thread.started\"}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"half";
         let tail = "partial line\n{\"type\":\"turn.failed\",\"error\":{\"message\":\"You've hit your usage limit\"}}\n";
-        let parsed = crate::usage::parse_output(&super::parse_text(head, false, tail), None);
+        let parsed = crate::usage::parse_output(&super::parse_text(head, false, tail, false), None);
         assert!(parsed.error, "the failure in the tail is seen");
         assert!(parsed.error_text.contains("usage limit"));
-        assert_eq!(super::parse_text("all", true, "ignored"), "all");
+        assert_eq!(super::parse_text("all", true, "ignored", true), "all");
+        // Only just over the cap: the tail is the one line after a head that ended on a newline.
+        let head = "{\"type\":\"thread.started\"}\n";
+        let tail = "{\"type\":\"turn.failed\",\"error\":{\"message\":\"usage limit\"}}\n";
+        assert!(crate::usage::parse_output(&super::parse_text(head, false, tail, true), None).error, "a one-line tail is kept whole");
     }
 
     use super::*;

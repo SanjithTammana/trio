@@ -221,6 +221,10 @@ fn cmd_bind(args: &[String]) -> Result<(), String> {
     let cfg_path = dir.join(".trio").join("room.toml");
     let text = std::fs::read_to_string(&cfg_path).map_err(|e| format!("{}: {e} (run trio init first)", cfg_path.display()))?;
     let cfg: room::RoomCfg = toml::from_str(&text).map_err(|e| e.to_string())?;
+    let human = room::human(&cfg);
+    if agent == human {
+        return Err(format!("{agent} is you in this room (me = {human}); pick another handle"));
+    }
     let existing = cfg.agents.get(&agent);
     let harness_name = flag(args, "--harness").or_else(|| existing.and_then(|a| a.harness.clone()));
     let preset = harness::of(&agent, harness_name.as_deref());
@@ -232,6 +236,9 @@ fn cmd_bind(args: &[String]) -> Result<(), String> {
     let bind = preset.bind.ok_or_else(|| format!("{agent} runs on `command`: set `wake = [..]` under [agents.{agent}] in room.toml yourself (see docs/agents.md)"))?;
     let model = flag(args, "--model").or_else(|| existing.and_then(|a| a.model.clone()));
     let roles: Option<Vec<String>> = flag(args, "--roles").map(|r| r.split(',').map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()).collect());
+    if let Some(r) = roles.as_ref().and_then(|r| r.iter().find(|r| **r == human || ["both", "all", "trio", "github"].contains(&r.as_str()))) {
+        return Err(format!("{r} cannot be a role: it is you or a word Trio uses"));
+    }
     let account = flag(args, "--account");
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from).ok_or("no home dir")?;
     let cwd = home.join(".trio").join("sessions").join(room_key(&dir)).join(&agent);

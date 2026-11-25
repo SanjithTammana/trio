@@ -249,6 +249,11 @@ export function agentNames(): string[] {
   return ROSTER.length > 0 ? ROSTER.map((r) => r.name) : ['claude', 'codex'];
 }
 
+/** The roles an agent holds; a `@<role>` mention addresses each of them. */
+export function rolesOf(who: string): string[] {
+  return ROSTER.find((r) => r.name === who)?.roles ?? [];
+}
+
 /** Every role some agent holds, for `@<role>` mentions. */
 export function roleNames(): string[] {
   return [...new Set(ROSTER.flatMap((r) => r.roles))];

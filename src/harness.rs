@@ -144,7 +144,7 @@ pub fn run(argv: &[String], cwd: &Path, stdin: Option<&str>) -> Result<String, S
 
 /// Shapes for agents beyond Claude (circle) and Codex (triangle), in the order agents are listed.
 /// The clients draw each by name; you are the square.
-pub const GLYPHS: &[&str] = &["hex", "down", "pent", "plus", "bar", "ring"];
+pub const GLYPHS: &[&str] = &["diamond", "down", "plus", "ring", "bar", "pent", "hex"];
 
 #[cfg(test)]
 mod tests {

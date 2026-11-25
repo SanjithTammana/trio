@@ -12,6 +12,7 @@ function shape(kind: string, filled: boolean): ReactNode {
     case 'codex': return <path className={c} d="M5 0.8 L9.4 9 L0.6 9 Z" />;
     case 'trio': return <circle className="s" cx={5} cy={5} r={2.4} />;
     case 'both': case 'all': return <><circle className={c} cx={3.2} cy={5} r={2.6} /><path className={c} d="M7.2 2.2 L9.6 7.8 L4.8 7.8 Z" /></>;
+    case 'diamond': return <path className={c} d="M5 0.4 L9.6 5 L5 9.6 L0.4 5 Z" />;
     case 'hex': return <path className={c} d="M2.7 1 L7.3 1 L9.6 5 L7.3 9 L2.7 9 L0.4 5 Z" />;
     case 'down': return <path className={c} d="M0.6 1 L9.4 1 L5 9.2 Z" />;
     case 'pent': return <path className={c} d="M5 0.6 L9.4 3.8 L7.7 9.2 L2.3 9.2 L0.6 3.8 Z" />;

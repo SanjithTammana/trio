@@ -12,7 +12,10 @@ use std::sync::{Arc, Mutex};
 
 const MAX: usize = 140;
 const COL: f32 = 880.0;
-const GUT: f32 = 60.0;
+/// Gutter width: 20 px per lane (you, then each agent).
+fn gut(me: &str) -> f32 {
+    20.0 * lanes(me).len() as f32
+}
 const GAP: f32 = 12.0;
 const HEAD: f32 = 32.0;
 
@@ -31,13 +34,13 @@ pub struct ChatState {
 #[allow(clippy::too_many_arguments)]
 fn gutter(p: &Painter, rect: Rect, from: &str, to: &[String], me: &str, t: &Tokens, top: f32, sys: bool) {
     let lane_c = mix(t.line, 0.4, t.line2);
-    for i in 0..3 {
+    for i in 0..lanes(me).len() {
         let x = rect.left() + 9.5 + 20.0 * i as f32;
         p.line_segment([pos2(x, rect.top()), pos2(x, rect.bottom())], Stroke::new(1.0, lane_c));
     }
     for (i, l) in lanes(me).iter().enumerate() {
         let sender = from == l;
-        let addressed = !sender && (to.iter().any(|w| w == l) || (to.iter().any(|w| w == "both" || w == "all") && l != me));
+        let addressed = !sender && (to.iter().any(|w| w == l) || (l != me && (to.iter().any(|w| w == "both" || w == "all") || crate::model::roles_of(l).iter().any(|r| to.contains(r)))));
         if !(sender || addressed) {
             continue;
         }
@@ -79,8 +82,9 @@ pub fn show(ui: &mut egui::Ui, app: &mut TrioApp, snap: &Snapshot, t: &Tokens, d
         let col_w = COL.min(full.width());
         let left = full.center().x - col_w / 2.0 + 16.0;
         let width = col_w - 32.0;
-        let text_x = left + GUT + GAP;
-        let text_w = width - GUT - GAP;
+        let gw = gut(me);
+        let text_x = left + gw + GAP;
+        let text_w = width - gw - GAP;
         ui.allocate_exact_size(vec2(full.width(), HEAD), egui::Sense::hover());
         if rows.is_empty() {
             let (r, _) = ui.allocate_exact_size(vec2(full.width(), 120.0), egui::Sense::hover());
@@ -101,7 +105,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut TrioApp, snap: &Snapshot, t: &Tokens, d
                 let (r, _) = ui.allocate_exact_size(vec2(full.width(), h), egui::Sense::hover());
                 if ui.is_rect_visible(r) {
                     let p = ui.painter();
-                    gutter(p, Rect::from_min_size(pos2(left, r.top()), vec2(GUT, h)), &m.from, to, me, t, 7.0, true);
+                    gutter(p, Rect::from_min_size(pos2(left, r.top()), vec2(gw, h)), &m.from, to, me, t, 7.0, true);
                     p.galley(pos2(text_x, r.top() + 3.0), g, t.ink3);
                 }
                 continue;
@@ -131,7 +135,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut TrioApp, snap: &Snapshot, t: &Tokens, d
             let label = format!("{}: {}. Open detail", name_of(&m.from, me), m.summary);
             let hit = Hit::new(ui, body_rect, Id::unique(("msg", &m.id, i)), &label);
             let p = ui.painter();
-            gutter(p, Rect::from_min_size(pos2(left, r.top()), vec2(GUT, h)), &m.from, to, me, t, if head { 21.0 } else { 8.0 }, false);
+            gutter(p, Rect::from_min_size(pos2(left, r.top()), vec2(gw, h)), &m.from, to, me, t, if head { 21.0 } else { 8.0 }, false);
             if head {
                 let ng = paint::line(ui, &name_of(&m.from, me), theme::bold(12.5), t.ink, 300.0);
                 let tg = paint::line(ui, &time_label(&m.at, day), theme::mono(11.0), t.ink3, 120.0);
@@ -193,7 +197,12 @@ pub fn show(ui: &mut egui::Ui, app: &mut TrioApp, snap: &Snapshot, t: &Tokens, d
     // Tools: @mentions and the length counter.
     let mut x = inner.left();
     let tools_y = start_y;
-    let chips: Vec<String> = crate::model::agent_names().into_iter().chain(crate::model::role_names()).chain(["all".to_string()]).collect();
+    let mut chips: Vec<String> = Vec::new();
+    for w in crate::model::agent_names().into_iter().chain(crate::model::role_names()).chain(["all".to_string()]) {
+        if !chips.contains(&w) {
+            chips.push(w);
+        }
+    }
     for w in chips.iter().map(String::as_str) {
         let label = format!("@{w}");
         let g = paint::line(&cu, &label, theme::mono(12.0), t.ink2, 100.0);

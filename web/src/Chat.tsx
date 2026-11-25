@@ -3,7 +3,7 @@
 // talking to whom reads down the page without colour. Click a line for its detail.
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent } from 'react';
 import { Who } from './glyph';
-import { agentNames, lanes, nameOf, roleNames, send, timeLabel, type Message, type Snapshot } from './api';
+import { agentNames, lanes, nameOf, roleNames, rolesOf, send, timeLabel, type Message, type Snapshot } from './api';
 
 const MAX = 140;
 
@@ -12,7 +12,7 @@ function Gutter({ from, to, me }: { from: string; to: string[]; me: string }) {
     <div className="gut" aria-hidden>
       {lanes(me).map((l) => {
         const sender = from === l;
-        const addressed = !sender && (to.includes(l) || ((to.includes('both') || to.includes('all')) && l !== me));
+        const addressed = !sender && (to.includes(l) || (l !== me && (to.includes('both') || to.includes('all') || rolesOf(l).some((r) => to.includes(r)))));
         return <span key={l} className={addressed ? 'to' : ''}>{(sender || addressed) && <Who who={l} me={me} to={addressed} />}</span>;
       })}
     </div>
@@ -64,7 +64,7 @@ export function Chat({ snap, onOpen, composerRef }: {
   const open = (m: Message) => (e: MouseEvent<HTMLButtonElement>) => onOpen(m, e.currentTarget, e.detail > 0);
 
   return (
-    <div className="chat">
+    <div className="chat" style={{ '--lanes': lanes(me).length } as React.CSSProperties}>
       <div className="log" ref={log} aria-live="polite">
         <div className="lanes-head">
           <div className="gut">
@@ -104,7 +104,7 @@ export function Chat({ snap, onOpen, composerRef }: {
       <div className="composer">
         <div className="composer-in">
           <div className="tools">
-            {[...agentNames(), ...roleNames(), 'all'].map((w) => (
+            {[...new Set([...agentNames(), ...roleNames(), 'all'])].map((w) => (
               <button key={w} onClick={() => mention(w)} title={`Mention ${nameOf(w, me)}`}>@{w}</button>
             ))}
             <span className={`count ${draft.length > MAX ? 'over' : ''}`}>

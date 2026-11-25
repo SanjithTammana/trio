@@ -606,7 +606,7 @@ impl TrioApp {
                     let extra = usage.map(|u| format!(" \u{b7} {}", u.why())).unwrap_or_default();
                     hit.resp.clone().on_hover_text(format!("{}: {text}{extra}", name_of(wn, me)));
                 }
-                x += if i < 2 { 12.0 } else { 0.0 };
+                x += if i + 1 < lane.len() { 12.0 } else { 0.0 };
             }
             x += 12.0;
             p.line_segment([pos2(x, capsule.center().y - 7.0), pos2(x, capsule.center().y + 7.0)], Stroke::new(1.0, fade(ink_on(0.25), content_alpha)));

@@ -328,7 +328,7 @@ pub fn parse_output(stdout: &str, rates: Option<(f64, f64, f64)>) -> RunOut {
             structured: true,
             // An error payload may carry `errors: [..]` instead of a `result` string.
             error_text: if error {
-                result.clone().unwrap_or_else(|| {
+                result.clone().filter(|r| !r.trim().is_empty()).unwrap_or_else(|| {
                     let errs = v.get("errors").and_then(|e| e.as_array()).map(|a| a.iter().map(|e| e.as_str().map(str::to_string).unwrap_or_else(|| e.to_string())).collect::<Vec<_>>().join("; "));
                     errs.unwrap_or_default()
                 })
