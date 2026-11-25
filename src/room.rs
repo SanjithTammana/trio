@@ -2535,7 +2535,8 @@ mod tests {
             #[cfg(windows)]
             let wake = ["cmd".to_string(), "/C".into(), format!("echo {reply}& exit {code}")];
             #[cfg(unix)]
-            let wake = ["sh".to_string(), "-c".into(), format!("echo '{reply}'; exit {code}")];
+            // A reply may hold an apostrophe ("You've hit..."): close, escape, reopen the quote.
+            let wake = ["sh".to_string(), "-c".into(), format!("echo '{}'; exit {code}", reply.replace('\'', "'\\''"))];
             cfg.push_str(&format!(
                 "[agents.{agent}]\nenabled = true\nsession = \"s\"\ncwd = {}\nwake = [{}]\n{extra}\n",
                 q(&root.join(format!("cw-{agent}")).display().to_string()),
