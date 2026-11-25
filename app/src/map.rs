@@ -849,7 +849,10 @@ fn catchup(ui: &mut egui::Ui, body: Rect, app: &mut TrioApp, snap: &Snapshot, c:
         p.galley(pos2(tx, cy - tg.size().y / 2.0), tg, t.ink);
         paint::focus_ring(&p, &hit.resp, t, 6.0);
         if hit.clicked() {
-            open = Some(Open { panel: Panel::Pick(Pick::Item(m.id.clone())), from: r, pointer: hit.pointer() });
+            // An unlinked branch moves too: open it as the branch it is.
+            let branch = snap.graph.items.iter().any(|n| n.id == m.id && n.kind == "branch");
+            let pick = if branch { Pick::Branch(m.id.clone()) } else { Pick::Item(m.id.clone()) };
+            open = Some(Open { panel: Panel::Pick(pick), from: r, pointer: hit.pointer() });
         }
     }
     if c.more > 0 {

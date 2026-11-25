@@ -156,7 +156,7 @@ function Projects({ room, token }: { room: string; token: string }) {
   useEffect(() => {
     if (!open) return;
     let live = true;
-    fetchRooms().then((r) => live && setRooms(r));
+    fetchRooms().then((r) => live && setRooms(r), (e) => { if (live) { setRooms([]); setError(String((e as Error).message)); } });
     const away = (e: MouseEvent) => { if (!box.current?.contains(e.target as Node)) setOpen(false); };
     const esc = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
     document.addEventListener('mousedown', away);

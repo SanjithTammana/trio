@@ -416,11 +416,16 @@ impl TrioApp {
                             let text = egui::RichText::new(format!("{name}\n{}", facts.join("  \u{b7}  "))).size(12.5).color(if r.waiting_on_you > 0 { t.accent } else { t.ink });
                             let b = ui.add_sized([348.0, 34.0], egui::Button::new(text).fill(if r.current { t.sunk } else { t.surface }).stroke(Stroke::NONE)).on_hover_text(&r.path);
                             if b.clicked() {
-                                close = true;
+                                // Another room opens in its own window; if it cannot, the menu says why.
+                                close = r.current;
                                 if !r.current {
                                     let client = self.client.clone();
-                                    let (token, path) = (token.to_string(), r.path.clone());
-                                    crate::net::background(move || client.open_room(&token, &path), |_| ());
+                                    let (token, path, name, slot) = (token.to_string(), r.path.clone(), r.name.clone(), slot.clone());
+                                    crate::net::background(move || client.open_room(&token, &path), move |res| {
+                                        if let Err(e) = res {
+                                            *slot.lock().expect("rooms") = Some(Err(format!("Could not open {name}: {e}")));
+                                        }
+                                    });
                                 }
                             }
                         }

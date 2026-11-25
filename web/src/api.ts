@@ -199,7 +199,8 @@ export interface RoomSummary {
 
 export async function fetchRooms(): Promise<RoomSummary[]> {
   const r = await fetch('/api/rooms');
-  return r.ok ? r.json() : [];
+  if (!r.ok) throw new Error(`could not read your rooms (${r.status})`);
+  return r.json();
 }
 
 /** Start (or find) another room's server; resolves to its URL. */

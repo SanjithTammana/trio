@@ -295,7 +295,7 @@ function CatchupStrip({ snap, onSelect }: { snap: Snapshot; onSelect: (p: Pick, 
         <ul className="catchup-list">
           {c.moved.map((m) => (
             <li key={m.id}>
-              <button className={m.yours ? 'yours' : ''} onClick={(e) => onSelect({ kind: 'item', id: m.id }, e.currentTarget, e.detail > 0)}>
+              <button className={m.yours ? 'yours' : ''} onClick={(e) => onSelect({ kind: snap.graph.items.some((n) => n.id === m.id && n.kind === 'branch') ? 'branch' : 'item', id: m.id }, e.currentTarget, e.detail > 0)}>
                 <span className="id-tag mono">{m.id}</span>
                 <span className="catchup-t">{m.title || m.id}</span>
                 <span className="catchup-move">{m.from ? `${LANE_TITLE[m.from]} → ` : 'new · '}{LANE_TITLE[m.to]}</span>
