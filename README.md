@@ -1,6 +1,6 @@
 # Trio
 
-A local group chat for you, Claude and Codex, plus a graph of the work in flight.
+A local group chat for you and your coding agents (Claude Code, Codex, Antigravity, or any CLI), plus a graph of the work in flight.
 
 One room per project, kept as a plain file (`.trio/room.jsonl`) next to your code. You read it in a native window (or a browser tab at `127.0.0.1`). Claude Code and Codex sessions join it from wherever you already run them.
 
@@ -50,7 +50,7 @@ The room has two views.
 
 Come back after working elsewhere, and a strip at the top says what moved since you last looked.
 
-Every agent is ok, low or out of its usage limits or daily budget. A message for an agent that is out goes to the other one, with a handoff note. A review of an agent's own work waits for the other agent instead. Claude's limits come from its status line: set Claude Code's `statusLine` command to `trio statusline`, or `trio statusline -- "<your command>"` to keep your own. Codex's limits come from its session logs.
+Every agent is ok, low or out of its usage limits or daily budget. A message for an agent that is out goes to an available agent that shares one of its roles, with a handoff note. A review of an agent's own work never goes to that agent. Claude's limits come from its status line: set Claude Code's `statusLine` command to `trio statusline`, or `trio statusline -- "<your command>"` to keep your own. Codex's limits come from its session logs.
 
 Keys: `/` message, `c` chat, `g` map, `Esc` close.
 
@@ -59,10 +59,12 @@ Keys: `/` message, `c` chat, `g` map, `Esc` close.
 | | Attached | Headless |
 |---|---|---|
 | What runs | your own session, desktop app or CLI | a session Trio owns, under `~/.trio/sessions/` |
-| How it joins | type `trio` in the session | `trio bind <room> claude\|codex` |
+| How it joins | type `trio` in the session | `trio bind <room> <handle> [--harness h] [--roles r,..]` |
 | Room lines reach it | with each message you send there | when someone mentions it |
 | Its reply | posted when its turn ends | posted when its run ends |
 | A mention of it | waits for your next message there | wakes it, read-only, with a pinned model |
+
+A room can have any number of headless agents on any harness, each allocated to roles: `@review` wakes the best available reviewer, `@all` wakes everyone. See [docs/agents.md](docs/agents.md).
 
 Trio never resumes your own session from outside. Resuming a session from another process forks its transcript, so attached sessions only pull: each turn brings what is new.
 

@@ -29,7 +29,7 @@ Trio is a few small parts joined by one event format. Everything a room shows co
 1. **Stable ids.** The same fact always gets the same id: `gh:owner/name#12`, or `git:<branch>:tip:<sha>:...`. Re-emitting an id replaces what it said before. That is how a pull request's ask is withdrawn when it merges, and why live tailing and a cold replay agree.
 2. **Durable or derived, never both.** A fact you cannot read again later, such as a merge seen once or a pull request's state on a given day, goes to the ledger with `source::append`. Append a row only when it differs from the last one recorded for that id. A fact you can always recompute stays out of the ledger.
 3. **Never block the room.** Network and process calls run on a worker thread. The room collects finished results on its next tick.
-4. **Never wake an agent by accident.** Only `mentions` wake agents, so an integration should not mention `claude` or `codex` unless the user asked it to.
+4. **Never wake an agent by accident.** Only `mentions` wake agents, so an integration should not mention an agent handle, a role or `all` unless the user asked it to.
 5. **Times are local `YYYY-MM-DDTHH:MM`.** Convert at the edge; see `github::local`.
 6. **Say how a file source changes.** The catch-up must know what arrived while Trio was closed. An append-only file returns each event's byte offset from `Source::offsets`, as the ledger does. A file people edit in place returns true from `FileSource::rewrites`, as posts files do. An edit that is not an append then replays the room.
 
@@ -81,8 +81,15 @@ codex_usd_day = 3.0
 file = "codex-posts.md"
 from = "codex"
 
-[agents.claude]                # written by `trio bind <room> claude`
+[agents.claude]                # written by `trio bind <room> claude`; any number of agents
 enabled = true
 session = "..."
 wake = ["claude", "..."]
+harness = "claude"             # claude, codex, antigravity or command (docs/agents.md)
+model = "opus"
+roles = ["build", "review"]    # @build / @review wake the best available holder
+account = "claude"             # agents on one account share its usage limits
+usd_day = 5.0                  # this agent's daily cap
 ```
+
+Agents, harnesses, roles and accounts are described in [agents.md](agents.md). A new harness is one entry in `PRESETS` in `src/harness.rs`.
