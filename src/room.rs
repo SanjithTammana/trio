@@ -1168,7 +1168,13 @@ impl Room {
         let mut since = handoff.to_vec();
         since.extend(crate::seen::digest(self.activity(), t));
         let others: Vec<String> = self.order.iter().filter(|o| *o != t).cloned().collect();
-        let prompt = wake_prompt(t, &me, &room, &others, recent, &since, detail);
+        // A wake held while more than eight lines followed would lose the message it is for.
+        let line = format!("{}: {}", e.from, e.summary());
+        let mut recent = recent.to_vec();
+        if !recent.contains(&line) {
+            recent.insert(0, line);
+        }
+        let prompt = wake_prompt(t, &me, &room, &others, &recent, &since, detail);
         let decision = match self.agents.get_mut(t) {
             Some(a) => a.wake_if_allowed(&prompt, &guard),
             None => WakeDecision::Disabled,
