@@ -3,6 +3,7 @@
 
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::RwLock;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Snapshot {
@@ -203,6 +204,56 @@ pub struct AgentState {
     pub running: bool,
     #[serde(default)]
     pub attached: Option<String>,
+    /// The shape it is drawn with: claude, codex, or hex, down, pent, plus, bar, ring by position.
+    #[serde(default)]
+    pub glyph: Option<String>,
+    #[serde(default)]
+    pub roles: Vec<String>,
+    /// Its place in room.toml; 1000 for a legacy attached entry.
+    #[serde(default)]
+    pub order: Option<u32>,
+}
+
+struct RosterEntry {
+    name: String,
+    glyph: String,
+    roles: Vec<String>,
+}
+
+/// The room's agents in room.toml order, set from each snapshot (as `setRoster` in api.ts).
+static ROSTER: RwLock<Vec<RosterEntry>> = RwLock::new(Vec::new());
+
+pub fn set_roster(agents: &BTreeMap<String, AgentState>) {
+    let mut list: Vec<(&String, &AgentState)> = agents.iter().filter(|(_, a)| a.enabled || a.attached.is_some() || a.order.is_some_and(|o| o < 1000)).collect();
+    list.sort_by(|(an, a), (bn, b)| a.order.unwrap_or(1000).cmp(&b.order.unwrap_or(1000)).then(an.cmp(bn)));
+    let roster = list.into_iter().map(|(n, a)| RosterEntry { name: n.clone(), glyph: a.glyph.clone().unwrap_or_else(|| n.clone()), roles: a.roles.clone() }).collect();
+    if let Ok(mut r) = ROSTER.write() {
+        *r = roster;
+    }
+}
+
+/// The shape an agent is drawn with; the handle itself when the roster does not name it.
+pub fn glyph_of(who: &str) -> String {
+    ROSTER.read().ok().and_then(|r| r.iter().find(|e| e.name == who).map(|e| e.glyph.clone())).unwrap_or_else(|| who.to_string())
+}
+
+/// The room's agent handles in order; Claude and Codex until a snapshot names the agents.
+pub fn agent_names() -> Vec<String> {
+    let r = ROSTER.read().map(|r| r.iter().map(|e| e.name.clone()).collect::<Vec<_>>()).unwrap_or_default();
+    if r.is_empty() { vec!["claude".into(), "codex".into()] } else { r }
+}
+
+/// Every role some agent holds, for `@<role>` mentions.
+pub fn role_names() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Ok(r) = ROSTER.read() {
+        for role in r.iter().flat_map(|e| e.roles.iter()) {
+            if !out.contains(role) {
+                out.push(role.clone());
+            }
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -316,13 +367,18 @@ pub fn name_of(who: &str, me: &str) -> String {
         "codex" => "Codex".into(),
         "trio" => "Trio".into(),
         "both" => "Both".into(),
-        _ => who.into(),
+        "all" => "All".into(),
+        "github" => "GitHub".into(),
+        _ => {
+            let mut c = who.chars();
+            c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+        }
     }
 }
 
-/// Lane order for the chat gutter, the island and the time strip: you, Claude, Codex.
-pub fn lanes(me: &str) -> [String; 3] {
-    [me.to_string(), "claude".into(), "codex".into()]
+/// Lane order for the chat gutter, the island and the time strip: you, then the agents.
+pub fn lanes(me: &str) -> Vec<String> {
+    std::iter::once(me.to_string()).chain(agent_names()).collect()
 }
 
 pub fn state_label(state: &str) -> &str {

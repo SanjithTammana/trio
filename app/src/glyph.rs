@@ -49,13 +49,25 @@ impl Box10 {
 pub fn who(p: &Painter, rect: Rect, who: &str, me: &str, to: bool, c: Color32) {
     let b = Box10::at(rect);
     let filled = !to;
-    let kind = if who == me { "me" } else { who };
-    match kind {
+    let kind = if who == me { "me".to_string() } else { crate::model::glyph_of(who) };
+    match kind.as_str() {
         "me" => b.shape(p, &[(1.0, 1.0), (9.0, 1.0), (9.0, 9.0), (1.0, 9.0)], filled, c),
         "claude" => b.circle(p, 5.0, 5.0, 4.2, filled, c),
         "codex" => b.shape(p, &[(5.0, 0.8), (9.4, 9.0), (0.6, 9.0)], filled, c),
         "trio" => b.circle(p, 5.0, 5.0, 2.4, false, c),
-        "both" => {
+        "hex" => b.shape(p, &[(2.7, 1.0), (7.3, 1.0), (9.6, 5.0), (7.3, 9.0), (2.7, 9.0), (0.4, 5.0)], filled, c),
+        "down" => b.shape(p, &[(0.6, 1.0), (9.4, 1.0), (5.0, 9.2)], filled, c),
+        "pent" => b.shape(p, &[(5.0, 0.6), (9.4, 3.8), (7.7, 9.2), (2.3, 9.2), (0.6, 3.8)], filled, c),
+        "plus" => {
+            b.shape(p, &[(3.6, 0.8), (6.4, 0.8), (6.4, 9.2), (3.6, 9.2)], filled, c);
+            b.shape(p, &[(0.8, 3.6), (9.2, 3.6), (9.2, 6.4), (0.8, 6.4)], filled, c);
+        }
+        "bar" => b.shape(p, &[(0.8, 3.0), (9.2, 3.0), (9.2, 7.0), (0.8, 7.0)], filled, c),
+        "ring" => {
+            b.circle(p, 5.0, 5.0, 4.2, false, c);
+            b.circle(p, 5.0, 5.0, 1.8, filled, c);
+        }
+        "both" | "all" => {
             b.circle(p, 3.2, 5.0, 2.6, filled, c);
             b.shape(p, &[(7.2, 2.2), (9.6, 7.8), (4.8, 7.8)], filled, c);
         }

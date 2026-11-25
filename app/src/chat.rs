@@ -37,7 +37,7 @@ fn gutter(p: &Painter, rect: Rect, from: &str, to: &[String], me: &str, t: &Toke
     }
     for (i, l) in lanes(me).iter().enumerate() {
         let sender = from == l;
-        let addressed = !sender && (to.iter().any(|w| w == l) || (to.iter().any(|w| w == "both") && l != me));
+        let addressed = !sender && (to.iter().any(|w| w == l) || (to.iter().any(|w| w == "both" || w == "all") && l != me));
         if !(sender || addressed) {
             continue;
         }
@@ -176,7 +176,7 @@ pub fn show(ui: &mut egui::Ui, app: &mut TrioApp, snap: &Snapshot, t: &Tokens, d
             tip.on_hover_text(name_of(l, me));
         }
         if !rows.is_empty() {
-            let lg = paint::line(ui, &format!("{} · Claude · Codex", name_of(me, me)), theme::sans(11.0), t.ink3, text_w);
+            let lg = paint::line(ui, &lanes(me).iter().map(|l| name_of(l, me)).collect::<Vec<_>>().join(" · "), theme::sans(11.0), t.ink3, text_w);
             p.galley(pos2(text_x, head.top() + 18.0 - lg.size().y / 2.0), lg, t.ink3);
         }
     });
@@ -193,7 +193,8 @@ pub fn show(ui: &mut egui::Ui, app: &mut TrioApp, snap: &Snapshot, t: &Tokens, d
     // Tools: @mentions and the length counter.
     let mut x = inner.left();
     let tools_y = start_y;
-    for w in ["claude", "codex", "both"] {
+    let chips: Vec<String> = crate::model::agent_names().into_iter().chain(crate::model::role_names()).chain(["all".to_string()]).collect();
+    for w in chips.iter().map(String::as_str) {
         let label = format!("@{w}");
         let g = paint::line(&cu, &label, theme::mono(12.0), t.ink2, 100.0);
         let r = Rect::from_min_size(pos2(x, tools_y), g.size() + vec2(14.0, 2.0));

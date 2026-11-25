@@ -103,7 +103,10 @@ impl Client {
             return Err(format!("server answered {code}").into());
         }
         match serde_json::from_slice::<Snapshot>(&body) {
-            Ok(snap) if snap.room_id == self.id => Ok((conn, snap)),
+            Ok(snap) if snap.room_id == self.id => {
+                crate::model::set_roster(&snap.agents);
+                Ok((conn, snap))
+            }
             Ok(_) => Err(RequestError::WrongRoom(target.port)),
             Err(error) => {
                 // A partial state reply can still explicitly identify a different room.

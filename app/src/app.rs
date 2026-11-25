@@ -486,6 +486,7 @@ impl TrioApp {
                 let app = match app.as_str() {
                     "codex" => "Codex",
                     "claude" => "Claude Code",
+                    "antigravity" => "Antigravity",
                     other => other,
                 };
                 return (false, format!("attached in {app}{}", if text.is_empty() { String::new() } else { format!(" · {text}") }));
@@ -505,7 +506,7 @@ impl TrioApp {
         // A short bar after each agent with a usage reading: its fullest window.
         const METER: f32 = 18.0;
         let meters = lane.iter().filter(|w| snap.usage.contains_key(w.as_str())).count() as f32;
-        let parts: f32 = names.iter().map(|g| 10.0 + if narrow { 0.0 } else { 5.0 + g.size().x }).sum::<f32>() + meters * (4.0 + METER) + 12.0 * 3.0 + 1.0 + 12.0 + hop_g.size().x;
+        let parts: f32 = names.iter().map(|g| 10.0 + if narrow { 0.0 } else { 5.0 + g.size().x }).sum::<f32>() + meters * (4.0 + METER) + 12.0 * lane.len() as f32 + 1.0 + 12.0 + hop_g.size().x;
         let w = parts + 28.0;
         let cx = center_x.unwrap_or(top.left() + 16.0 + w / 2.0);
         let capsule = Rect::from_center_size(pos2(cx, top.center().y), vec2(w, 32.0));

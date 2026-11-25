@@ -290,7 +290,9 @@ pub fn show(ui: &mut egui::Ui, app: &mut TrioApp, snap: &Snapshot, t: &Tokens, d
         }
     }
     // Legend, right-aligned: who is who on every lens, plus the lens's own marks.
-    let mut legend: Vec<(&str, &str, bool)> = vec![("@me", "you", false), ("@claude", "Claude", false), ("@codex", "Codex", false)];
+    let agents: Vec<(String, String)> = crate::model::agent_names().into_iter().map(|a| (format!("@{a}"), crate::model::name_of(&a, &snap.me))).collect();
+    let mut legend: Vec<(&str, &str, bool)> = vec![("@me", "you", false)];
+    legend.extend(agents.iter().map(|(m, n)| (m.as_str(), n.as_str(), false)));
     match lens {
         Lens::Code => legend.extend([("open", "open", false), ("claimed", "claimed", false), ("review", "review", false), ("changes", "changes", false), ("pass", "pass", false), ("branch", "branch", false), ("component", "hot spot", true)]),
         Lens::Work => legend.push(("|you", "waiting on you", false)),
