@@ -1839,6 +1839,43 @@ mod tests {
     }
 
     #[test]
+    fn a_reopened_remote_pull_request_replays_as_the_live_room_shows_it() {
+        use crate::github::{Link, Login, Pr};
+        let root = temp_room("reopen");
+        std::fs::write(root.join(".trio/room.toml"), "me = 'sanjith'\nrepo = ''\n").unwrap();
+        let link = Link { repo: "o/r".into(), label: None, remote_only: true, me: "sanjith".into(), my_login: None, agents: Vec::new() };
+        let mut pr = Pr {
+            number: 12, title: "Add the login form".into(), head_ref_name: "feature/login".into(), head_ref_oid: "abc".into(),
+            state: "OPEN".into(), is_draft: false, created_at: "2026-11-24T15:00:00Z".into(), updated_at: "2026-11-24T15:00:00Z".into(),
+            merged_at: None, url: String::new(), author: Some(Login { login: "bo".into() }), review_requests: vec![], latest_reviews: vec![],
+        };
+        let mut room = Room::open(&root).unwrap();
+        let push = |room: &mut Room, pr: &Pr| {
+            for e in link.events(pr) {
+                if room.gh_rows.get(&e.id) != Some(&e) {
+                    append(&room.ledger, &e).unwrap();
+                }
+            }
+            room.tick();
+            room.graph.items.contains_key("feature/login")
+        };
+        assert!(push(&mut room, &pr));
+        pr.state = "CLOSED".into();
+        pr.updated_at = "2026-11-24T16:00:00Z".into();
+        assert!(!push(&mut room, &pr), "closing retires the branch");
+        pr.state = "OPEN".into();
+        pr.updated_at = "2026-11-24T17:00:00Z".into();
+        assert!(push(&mut room, &pr), "reopening brings it back");
+        let live = crate::work::all(&room.graph, &room.me())["feature/login"].lane.to_string();
+        drop(room);
+        let mut cold = Room::open(&root).unwrap();
+        cold.tick();
+        let w = crate::work::all(&cold.graph, &cold.me());
+        assert_eq!(w.get("feature/login").map(|w| w.lane.to_string()), Some(live), "the stale close row does not delete it on replay");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn an_import_continued_while_closed_is_the_catch_up() {
         let root = temp_room("grow-away");
         std::fs::write(root.join(".trio/room.toml"), "me = 'sanjith'\nrepo = ''\n[[import]]\nfile = 'claude-posts.md'\nfrom = 'claude'\n").unwrap();

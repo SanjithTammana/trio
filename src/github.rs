@@ -180,6 +180,10 @@ impl Link {
             if pr.state == "CLOSED" {
                 let at = local(&pr.updated_at).unwrap_or(opened);
                 out.push(Event { id: format!("{id}:gone"), at, from: author, body: Body::Commit { branch, sha: pr.head_ref_oid.clone(), subject: String::new(), touches: Vec::new(), merged: false, gone: true } });
+            } else if !merged {
+                // An open PR replaces any `:gone` row from before it was reopened, so a cold
+                // replay does not delete the branch the live room shows.
+                out.push(Event { id: format!("{id}:gone"), at: opened, from: author, body: Body::Commit { branch, sha: pr.head_ref_oid.clone(), subject: pr.title.clone(), touches: Vec::new(), merged: false, gone: false } });
             }
         }
         out

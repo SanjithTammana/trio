@@ -202,7 +202,9 @@ pub fn claude_reading(path: &Path) -> Option<Reading> {
 /// three directory levels newest first, so the cost does not grow with history.
 pub fn codex_latest_log(sessions: &Path) -> Option<PathBuf> {
     let newest_dir = |p: &Path| -> Option<PathBuf> {
-        let mut v: Vec<PathBuf> = std::fs::read_dir(p).ok()?.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+        // Only the dated YYYY / MM / DD folders: anything else would sort after the digits.
+        let dated = |p: &Path| p.file_name().is_some_and(|n| !n.is_empty() && n.to_string_lossy().bytes().all(|b| b.is_ascii_digit()));
+        let mut v: Vec<PathBuf> = std::fs::read_dir(p).ok()?.flatten().map(|e| e.path()).filter(|p| p.is_dir() && dated(p)).collect();
         v.sort();
         v.pop()
     };
@@ -324,7 +326,15 @@ pub fn parse_output(stdout: &str, rates: Option<(f64, f64, f64)>) -> RunOut {
         let result = v.get("result").and_then(|x| x.as_str()).map(str::to_string);
         return RunOut {
             structured: true,
-            error_text: if error { result.clone().unwrap_or_default() } else { String::new() },
+            // An error payload may carry `errors: [..]` instead of a `result` string.
+            error_text: if error {
+                result.clone().unwrap_or_else(|| {
+                    let errs = v.get("errors").and_then(|e| e.as_array()).map(|a| a.iter().map(|e| e.as_str().map(str::to_string).unwrap_or_else(|| e.to_string())).collect::<Vec<_>>().join("; "));
+                    errs.unwrap_or_default()
+                })
+            } else {
+                String::new()
+            },
             reply: result.filter(|_| !error),
             cost: v.get("total_cost_usd").and_then(serde_json::Value::as_f64),
             error,
@@ -375,7 +385,7 @@ pub fn parse_output(stdout: &str, rates: Option<(f64, f64, f64)>) -> RunOut {
 /// lasts COOLDOWN_MIN minutes.
 pub fn limit_stop(text: &str, now: DateTime<Local>) -> Option<Stop> {
     let lower = text.to_ascii_lowercase();
-    let hit = lower.contains("usage limit") || (lower.contains("hit your") && lower.contains("limit")) || lower.contains("limit reached") || lower.contains("rate_limit_exceeded") || lower.contains("quota exceeded") || lower.contains("resource_exhausted") || lower.contains("resource has been exhausted");
+    let hit = lower.contains("usage limit") || (lower.contains("hit your") && lower.contains("limit")) || lower.contains("limit reached") || lower.contains("rate_limit_exceeded") || lower.contains("rate limit exceeded") || lower.contains("quota exceeded") || lower.contains("resource_exhausted") || lower.contains("resource has been exhausted");
     if !hit {
         return None;
     }
@@ -397,8 +407,20 @@ fn reset_time(s: &str, now: DateTime<Local>) -> Option<DateTime<Local>> {
         w = words.next()?.trim_end_matches([',', '.', ')']);
     } else if let Ok(month) = w.parse::<chrono::Month>() {
         let d = words.next()?.trim_end_matches(',').trim_end_matches(|c: char| c.is_ascii_alphabetic()).parse::<u32>().ok()?;
-        let y = words.next()?.trim_end_matches(',').parse::<i32>().ok()?;
-        on = Some(chrono::NaiveDate::from_ymd_opt(y, month.number_from_month(), d)?);
+        w = words.next()?.trim_end_matches([',', '.', ')']);
+        // "Dec 1 2026 9am", or with no year "Dec 1, 9am": this year, else next if it has passed.
+        let year = w.parse::<i32>().ok().filter(|y| *y > 1000);
+        if year.is_some() {
+            w = words.next()?.trim_end_matches([',', '.', ')']);
+        }
+        let y = year.unwrap_or(now.year());
+        let mut date = chrono::NaiveDate::from_ymd_opt(y, month.number_from_month(), d)?;
+        if year.is_none() && date < now.date_naive() {
+            date = chrono::NaiveDate::from_ymd_opt(y + 1, month.number_from_month(), d)?;
+        }
+        on = Some(date);
+    }
+    if w == "at" {
         w = words.next()?.trim_end_matches([',', '.', ')']);
     }
     let mut t = w.to_string();
@@ -465,6 +487,13 @@ mod tests {
         assert_eq!(clock(s.until), "2026-11-25T00:05", "a reset on another day names its date");
         let s = limit_stop("You\u{2019}ve hit your usage limit. Try again at Dec 1st, 2026 9:30 AM.", now).unwrap();
         assert_eq!(clock(s.until), "2026-12-01T09:30");
+        let s = limit_stop("You've hit your weekly limit \u{b7} resets Dec 1, 9am", now).unwrap();
+        assert_eq!(clock(s.until), "2026-12-01T09:00", "no year: this year");
+        let s = limit_stop("Usage limit reached; resets Nov 25 at 2pm", now).unwrap();
+        assert_eq!(clock(s.until), "2026-11-25T14:00", "'at' before the time");
+        let s = limit_stop("Usage limit reached; resets Jan 3, 9am", now).unwrap();
+        assert_eq!(clock(s.until), "2027-01-03T09:00", "a date already past this year is next year's");
+        assert!(limit_stop("429: Rate limit exceeded", now).is_some());
         let s = limit_stop("stream error: usage limit exceeded", now).unwrap();
         assert_eq!(s.until, now.timestamp() + 3600, "no time named: a cooldown");
         assert!(s.reason.contains("retry in 60 min"));

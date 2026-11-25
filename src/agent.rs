@@ -186,8 +186,9 @@ struct Run {
     child: tokio::process::Child,
     /// The run's whole process tree; dropping the run kills whatever is still in it.
     tree: crate::proctree::Tree,
-    /// Captured stdout and whether it ended within `OUT_CAP` (false: truncated).
-    out: tokio::task::JoinHandle<(String, bool)>,
+    /// Captured stdout: its first `OUT_CAP` bytes, whether that was all of it, and (when it was
+    /// not) its last `OUT_TAIL` bytes, where structured output puts the turn's outcome.
+    out: tokio::task::JoinHandle<(String, bool, String)>,
     /// The last ERR_TAIL bytes of stderr, read only for usage-limit messages.
     err: tokio::task::JoinHandle<String>,
     file: Option<PathBuf>,
@@ -208,6 +209,17 @@ pub struct Reaped {
 }
 
 const ERR_TAIL: usize = 8 * 1024;
+const OUT_TAIL: usize = 16 * 1024;
+
+/// What structured output is parsed from: all of it, or for truncated output the head plus the
+/// whole lines of the tail, so a final `turn.completed`, `turn.failed` or `error` is still seen.
+fn parse_text(head: &str, complete: bool, tail: &str) -> String {
+    if complete || tail.is_empty() {
+        return head.to_string();
+    }
+    let whole = tail.split_once('\n').map(|(_, rest)| rest).unwrap_or("");
+    format!("{head}\n{whole}")
+}
 
 impl Reaped {
     fn judge(exit: i32, reply: Option<(String, bool)>) -> Self {
@@ -281,9 +293,11 @@ impl CliAgent {
         };
         // Structured output (`--output-format json`, `--json`) carries the reply, the cost and
         // any error; plain output is the reply itself.
-        let text: String = stdout.as_ref().map(|(t, _)| t.clone()).unwrap_or_default();
+        let text: String = stdout.as_ref().map(|(t, _, _)| t.clone()).unwrap_or_default();
         let complete = stdout.as_ref().is_none_or(|s| s.1);
-        let parsed = crate::usage::parse_output(&text, crate::usage::model_of(&self.cfg.wake).as_deref().and_then(crate::usage::codex_rates));
+        let tail = stdout.as_ref().map(|(_, _, t)| t.as_str()).unwrap_or("");
+        let parsed = crate::usage::parse_output(&parse_text(&text, complete, tail), crate::usage::model_of(&self.cfg.wake).as_deref().and_then(crate::usage::codex_rates));
+        let stdout = stdout.map(|(t, c, _)| (t, c));
         let stdout = if parsed.structured { parsed.reply.clone().map(|r| (r, complete)) } else { stdout };
         let code = if parsed.error && code == 0 { 1 } else { code };
         let reply = run.file.as_deref().and_then(read_reply_file).or(stdout);
@@ -393,12 +407,24 @@ impl Agent for CliAgent {
         let stdout = child.stdout.take();
         let out = tokio::spawn(async move {
             let mut buf = Vec::new();
-            let mut rest = 0;
+            let mut tail: Vec<u8> = Vec::new();
+            let mut rest = 0usize;
             if let Some(mut so) = stdout {
                 let _ = (&mut so).take(OUT_CAP).read_to_end(&mut buf).await;
-                rest = tokio::io::copy(&mut so, &mut tokio::io::sink()).await.unwrap_or(0);
+                let mut chunk = [0u8; 8192];
+                while let Ok(n) = so.read(&mut chunk).await {
+                    if n == 0 {
+                        break;
+                    }
+                    rest += n;
+                    tail.extend_from_slice(&chunk[..n]);
+                    if tail.len() > 2 * OUT_TAIL {
+                        tail.drain(..tail.len() - OUT_TAIL);
+                    }
+                }
             }
-            (String::from_utf8_lossy(&buf).into_owned(), rest == 0)
+            let cut = tail.len().saturating_sub(OUT_TAIL);
+            (String::from_utf8_lossy(&buf).into_owned(), rest == 0, String::from_utf8_lossy(&tail[cut..]).into_owned())
         });
         self.run = Some(Run { child, tree, out, err, file: if uses_file { file } else { None }, exit: None });
         Ok(())
@@ -488,6 +514,16 @@ fn join_last(v: &[String], word: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn truncated_output_still_parses_the_outcome_at_its_end() {
+        let head = "{\"type\":\"thread.started\"}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"half";
+        let tail = "partial line\n{\"type\":\"turn.failed\",\"error\":{\"message\":\"You've hit your usage limit\"}}\n";
+        let parsed = crate::usage::parse_output(&super::parse_text(head, false, tail), None);
+        assert!(parsed.error, "the failure in the tail is seen");
+        assert!(parsed.error_text.contains("usage limit"));
+        assert_eq!(super::parse_text("all", true, "ignored"), "all");
+    }
+
     use super::*;
 
     fn agent(enabled: bool) -> CliAgent {
